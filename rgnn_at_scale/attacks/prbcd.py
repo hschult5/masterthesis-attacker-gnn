@@ -1,3 +1,4 @@
+import copy
 import logging
 
 from collections import defaultdict
@@ -16,6 +17,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from sklearn.metrics import roc_auc_score, average_precision_score
 import torch_sparse
 from torch_sparse import SparseTensor
 #from AttackerGNN.PreEdgeSelector import PRBCDSelectorGNN
@@ -32,6 +34,10 @@ from AttackerGNN.ShadowModelLinkPredictor import LinkPredictionGNN
 from rgnn_at_scale.helper import utils
 from rgnn_at_scale.attacks.base_attack import Attack, SparseAttack
 import os
+import csv
+from datetime import datetime
+
+from rgnn_at_scale.helper.csvLogger import CSVMetricLogger
 
 
 class PRBCD(SparseAttack):
@@ -163,8 +169,18 @@ class PRBCD(SparseAttack):
             self.sample_block_from_margin_loss_gcn(graph=graph)
         elif use_cert in ("accuracy_drop_selector",):
             print(use_cert, "-> sampling with accuracy drop selector")
-            self.n_candidates_k_sample=2000
-            cache_path = f"cache/selection_ads_{ads_mode}_k{self.n_candidates_k_sample}.pt"
+
+            self.n_candidates_k_sample=5000
+            self.acc_drop_threshold_k_samples=1e-3
+            self.loss_drop_threshold_k_samples=1e-3
+            self.k_samples_batch=10
+            self.ads_mode=ads_mode
+            self.drop_mode="acc"
+
+            if self.drop_mode == "acc": #TODO: logging für alle ads_modes+drop_modes
+                cache_path = f"cache/selection_ads_{ads_mode}_k{self.n_candidates_k_sample}_bt{self.k_samples_batch}_drpmd{self.drop_mode}_drp{self.acc_drop_threshold_k_samples}.pt"
+            elif self.drop_mode == "loss":
+                cache_path = f"cache/selection_ads_{ads_mode}_k{self.n_candidates_k_sample}_bt{self.k_samples_batch}_drpmd{self.drop_mode}_drp{self.loss_drop_threshold_k_samples}.pt"
 
             if os.path.exists(cache_path):
                 print("[CACHE] loading selection:", cache_path)
@@ -172,20 +188,24 @@ class PRBCD(SparseAttack):
                                                                                               device=self.device)
             else:
                 print("[CACHE] computing selection and saving:", cache_path)
-                self.n_candidates_k_sample = 2000
                 y_out, edge_index_lab, y_label, tried_set, harmful_set = self.label_edge_flips_prbcd_selfsample_fast(
                     mode=ads_mode,
+                    drop_mode=self.drop_mode,
                     n_candidates_k_sample=self.n_candidates_k_sample,
-                    drop_threshold_k_samples=3e-3
+                    acc_drop_threshold_k_samples=self.acc_drop_threshold_k_samples,
+                    loss_drop_threshold_k_samples=self.loss_drop_threshold_k_samples,
+                    k_samples_batch=self.k_samples_batch
                 )
                 meta = {
-                    "ads_mode": ads_mode,
+                    "ads_mode": self.ads_mode,
                     "n_candidates_k_sample": self.n_candidates_k_sample,
-                    "drop_threshold_k_samples": 3e-3,
+                    "acc_drop_threshold_k_samples": self.acc_drop_threshold_k_samples,
+                    "loss_drop_threshold_k_samples": self.loss_drop_threshold_k_samples,
                 }
                 PRBCD.save_selection(cache_path, y_out, edge_index_lab, y_label, tried_set, harmful_set, meta=meta)
 
             X, edge_index_struct = self.extract_X_and_edge_index_from_sparsegraph(graph)
+            '''
             self.lp_model = self.train_link_prediction_gnn(
                 x=X,
                 edge_index_struct=edge_index_struct,
@@ -196,6 +216,7 @@ class PRBCD(SparseAttack):
                 use_tqdm=True,
                 verbose=True,
             )
+            '''
             self.init_search_space_from_y_out(y_out=y_out,n_perturbations=n_perturbations)
             self.tried_set = tried_set
         else:
@@ -314,6 +335,10 @@ class PRBCD(SparseAttack):
                         self.resample_block_from_prior_gumbel(n_perturbations=n_perturbations, tau=1.0)
 
                     elif use_cert in ("accuracy_drop_selector",):
+                        print(use_cert, "run resampling with no certificate")
+                        self.resample_random_block(n_perturbations)
+                        pass
+                        '''
                         if epoch % 5 == 0:
                             print(use_cert, "-> resampling with accuracy drop selector")
                             y_out, edge_index_lab, y_label, tried_set, harmful_set = self.label_edge_flips_prbcd_selfsample_fast(mode=ads_mode,
@@ -323,7 +348,7 @@ class PRBCD(SparseAttack):
                             self.append_search_space_with_y_out(y_out=y_out)
                             self.tried_set = tried_set
                         else:
-                            pass
+                            pass'''
 
                     elif use_cert in ("selector_block", "selector_block_pgd"):
 
@@ -2472,13 +2497,17 @@ class PRBCD(SparseAttack):
             n_candidates_k_sample: int = 2000,
             p_add: float = 0.06,  # unused in uniform flip
             p_del: float = 0.1,  # unused in uniform flip
-            drop_threshold_one_sample: float = 3e-3,
-            drop_threshold_k_samples: float = -1,
-            drop_threshold_k_hop: float = 1e-2,
+            acc_drop_threshold_one_sample: float = 3e-3,
+            acc_drop_threshold_k_samples: float = -1,
+            acc_drop_threshold_k_hop: float = 1e-2,
+            drop_mode: str = "acc",  # "acc" | "loss" | "endpoint"
+            loss_drop_threshold_one_sample: float = 1e-3,
+            loss_drop_threshold_k_samples: float = 1e-3,
+            loss_drop_threshold_k_hop: float = 1e-3,
             rng_seed: int = 0,
             max_sampling_tries: int = 100_000,
-            mode: str = "k_hop",  # one_sample | k_action | k_hop
-            k_samples_batch: int = 20,  # only used in k_action
+            mode: str = "k_hop",  # # one_sample | k_action | k_action_individual | k_hop
+            k_samples_batch: int = 10,  # only used in k_action
             n_candidates_k_hop_sample: int = 2000,  # target # of harmful flips in k_hop mode
             k_hop: int = 2,  # hop radius for k_hop mode
             prev_tried_set: "Set[tuple[int, float]] | None" = None,
@@ -2510,15 +2539,40 @@ class PRBCD(SparseAttack):
         dir_pos = torch.full((n, n), -1, dtype=torch.int32, device=device)
         dir_pos[ei_base[0], ei_base[1]] = torch.arange(E, device=device, dtype=torch.int32)
 
-        # ---- clean accuracy once
+        # ---- clean forward once
         logits_clean = self.attacked_model(data=self.attr.to(device), adj=(ei_base, ew_base))
         acc_clean = utils.accuracy(logits_clean, self.labels.to(device), self.idx_attack)
+
+        # ---- clean loss once
+        idx_attack = self.idx_attack
+        labels_dev = self.labels.to(device)
+
+        loss_clean = F.cross_entropy(
+            logits_clean[idx_attack],
+            labels_dev[idx_attack],
+            reduction="mean",
+        )
+
+        # ---- clean pred once
+        pred_clean = logits_clean.argmax(dim=-1)
+        clean_correct = (pred_clean == labels_dev.to(device))
+
+        if drop_mode == "acc":
+            thr_one = acc_drop_threshold_one_sample
+            thr_k = acc_drop_threshold_k_samples
+            thr_khop = acc_drop_threshold_k_hop
+        elif drop_mode == "loss":
+            thr_one = loss_drop_threshold_one_sample
+            thr_k = loss_drop_threshold_k_samples
+            thr_khop = loss_drop_threshold_k_hop
+        else:
+            raise ValueError(f"Unknown drop_mode='{drop_mode}'. Use 'acc' or 'loss'.")
 
         # ---- outputs over *all* upper-tri pairs
         num_pairs = n * (n - 1) // 2
         y_out = torch.zeros(num_pairs, dtype=torch.uint8, device=device)
 
-        # ---- NEW: lists to collect labeled pairs (only tried pairs)
+        # ---- lists to collect labeled pairs (only tried pairs)
         lab_u: list[int] = []
         lab_v: list[int] = []
         lab_k: list[int] = []  # linear indices k_lin for those pairs
@@ -2542,6 +2596,41 @@ class PRBCD(SparseAttack):
         g.manual_seed(int(rng_seed))
 
         flips_done, tries = 0, 0
+
+        # ----- helper: compute drop for purturbation selection -----
+        def _endpoint_flipped_correct_to_incorrect(
+                u: int,
+                v: int,
+                logits_pert: torch.Tensor,
+        ) -> bool:
+            pred_pert = logits_pert.argmax(dim=-1)
+
+            u = int(u);
+            v = int(v)
+
+            u_flip = bool(clean_correct[u] and (pred_pert[u] != labels_dev[u].to(device)))
+            v_flip = bool(clean_correct[v] and (pred_pert[v] != labels_dev[v].to(device)))
+
+            # optional: only count flips if endpoint is in idx_attack
+            # u_flip = u_flip and bool(attack_mask[u])
+            # v_flip = v_flip and bool(attack_mask[v])
+
+            return u_flip or v_flip
+
+        # ----- helper: compute drop for purturbation selection -----
+        def _compute_drop(logits_pert: torch.Tensor) -> float:
+            if drop_mode == "acc":
+                acc_pert = utils.accuracy(logits_pert, labels_dev, idx_attack)
+                return float(acc_clean - acc_pert)
+            elif drop_mode == "loss":
+                loss_pert = F.cross_entropy(
+                    logits_pert[idx_attack],
+                    labels_dev[idx_attack],
+                    reduction="mean",
+                )
+                return float((loss_pert - loss_clean).item())
+            else:
+                raise ValueError(f"Unknown drop_mode='{drop_mode}'. Use 'acc' or 'loss'.")
 
         # ----- helper: build perturbed adjacency fresh from a batch of flips -----
         def _build_perturbed_adj(flips):
@@ -2605,9 +2694,8 @@ class PRBCD(SparseAttack):
 
                 with torch.no_grad():
                     logits_pert = self.attacked_model(data=self.attr.to(device), adj=(ei_use, ew_use))
-                    acc_pert = utils.accuracy(logits_pert, self.labels.to(device), self.idx_attack)
 
-                drop = float(acc_clean - acc_pert)
+                drop = _compute_drop(logits_pert)
                 tried_set.add((int(k_lin), drop))
 
                 # record this pair as labeled (harmful or not)
@@ -2615,7 +2703,7 @@ class PRBCD(SparseAttack):
                 lab_v.append(int(v))
                 lab_k.append(int(k_lin))
 
-                if drop > drop_threshold_one_sample:
+                if drop > thr_one:
                     y_out[k_lin] = 1
                     harmful_set.add((int(k_lin), drop))
                     flips_done += 1
@@ -2641,9 +2729,8 @@ class PRBCD(SparseAttack):
 
                 with torch.no_grad():
                     logits_pert = self.attacked_model(data=self.attr.to(device), adj=(ei_use, ew_use))
-                    acc_pert = utils.accuracy(logits_pert, self.labels.to(device), self.idx_attack)
 
-                drop = float(acc_clean - acc_pert)
+                drop = _compute_drop(logits_pert)
 
                 for (u, v, _action, k_lin) in batch:
                     tried_set.add((int(k_lin), drop))
@@ -2653,11 +2740,67 @@ class PRBCD(SparseAttack):
                     lab_v.append(int(v))
                     lab_k.append(int(k_lin))
 
-                if drop > drop_threshold_k_samples:
+                if drop > thr_k:
                     for (_u, _v, _action, k_lin) in batch:
                         y_out[k_lin] = 1
                         harmful_set.add((int(k_lin), drop))
                     flips_done += len(batch)
+
+        elif mode == "k_action_individual":
+            while (flips_done == 0 or flips_done < n_candidates_k_sample) and tries < max_sampling_tries:
+                batch = PRBCD._sample_k_flips(
+                    n=n,
+                    present=present,
+                    g=g,
+                    device=device,
+                    k=int(k_samples_batch),
+                    seen=seen,
+                )
+                if not batch:
+                    break
+
+                # mark seen + count tries (same as k_action)
+                for (u, v, _action, k_lin) in batch:
+                    seen[k_lin] = True
+                    tries += 1
+
+                # --- evaluate batch ---
+                ei_use, ew_use = _build_perturbed_adj(batch)
+
+                with torch.no_grad():
+                    logits_pert = self.attacked_model(data=self.attr.to(device), adj=(ei_use, ew_use))
+
+                drop_batch = _compute_drop(logits_pert)
+
+                # --- if batch is NOT harmful enough, record batch drop (weak labels) ---
+                if drop_batch <= thr_k:
+                    for (u, v, _action, k_lin) in batch:
+                        tried_set.add((int(k_lin), drop_batch))
+                        lab_u.append(int(u))
+                        lab_v.append(int(v))
+                        lab_k.append(int(k_lin))
+                    continue
+
+                # --- if batch IS harmful, re-evaluate each edge individually ---
+                for (u, v, action, k_lin) in batch:
+                    single = [(u, v, action, k_lin)]
+                    ei_s, ew_s = _build_perturbed_adj(single)
+
+                    with torch.no_grad():
+                        logits_s = self.attacked_model(data=self.attr.to(device), adj=(ei_s, ew_s))
+
+                    drop_ind = _compute_drop(logits_s)
+
+                    tried_set.add((int(k_lin), drop_ind))
+                    lab_u.append(int(u))
+                    lab_v.append(int(v))
+                    lab_k.append(int(k_lin))
+
+                    # label harmful edges using INDIVIDUAL drop
+                    if drop_ind > thr_k/k_samples_batch: #TODO: hier individual drop festlegen
+                        y_out[k_lin] = 1
+                        harmful_set.add((int(k_lin), drop_ind))
+                        flips_done += 1
 
         elif mode == "k_hop":
             if adj_list is None:
@@ -2687,9 +2830,8 @@ class PRBCD(SparseAttack):
 
                 with torch.no_grad():
                     logits_pert = self.attacked_model(data=self.attr.to(device), adj=(ei_use, ew_use))
-                    acc_pert = utils.accuracy(logits_pert, self.labels.to(device), self.idx_attack)
 
-                drop = float(acc_clean - acc_pert)
+                drop = _compute_drop(logits_pert)
 
                 for (u, v, _action, k_lin) in batch:
                     tried_set.add((int(k_lin), drop))
@@ -2699,13 +2841,12 @@ class PRBCD(SparseAttack):
                     lab_v.append(int(v))
                     lab_k.append(int(k_lin))
 
-                if drop > drop_threshold_k_hop:
+                if drop > thr_khop:
                     for (_u, _v, _action, k_lin) in batch:
                         y_out[k_lin] = 1
                         harmful_set.add((int(k_lin), drop))
                     flips_done += len(batch)
 
-            # enforce exact n_candidates_k_hop_sample harmful entries if we overshoot
             if flips_done > n_candidates_k_hop_sample:
                 harmful_idx = torch.nonzero(y_out, as_tuple=False).flatten()
                 keep = harmful_idx[:n_candidates_k_hop_sample]
@@ -2720,7 +2861,7 @@ class PRBCD(SparseAttack):
             raise ValueError(f"Unknown mode '{mode}'. Use 'one_sample', 'k_action' or 'k_hop'.")
 
 
-        # ---- NEW: build edge_index_lab and y_label by picking lowest/highest drops ----
+        # ---- build edge_index_lab and y_label by picking lowest/highest drops ----
         # create mapping from k_lin -> (u, v) for all actually evaluated pairs
         k_to_uv = {k: (u, v) for u, v, k in zip(lab_u, lab_v, lab_k)}
 
@@ -3259,6 +3400,7 @@ class PRBCD(SparseAttack):
         self._margin_trained = True
         logging.info("[Selector] Pretraining finished.")
 
+    '''
     def train_link_prediction_gnn(
             self,
             x: torch.Tensor,
@@ -3379,6 +3521,301 @@ class PRBCD(SparseAttack):
         if verbose:
             print("\n[LP-GNN] Training complete.")
             print(f"[LP-GNN] Final Val Loss={val_loss.item():.4f}, Val Acc={acc_val.item():.4f}")
+
+        return model
+    '''
+
+    def train_link_prediction_gnn(
+            self,
+            x: torch.Tensor,
+            edge_index_struct: torch.Tensor,
+            edge_index_lab: torch.Tensor,
+            y_label: torch.Tensor,
+            device: str = "cpu",
+            num_epochs: int = 200,
+            hidden_dim: int = 64,
+            out_dim: int = 64,
+            lr: float = 5e-4,
+            weight_decay: float = 5e-4,
+            use_tqdm: bool = True,
+            verbose: bool = True,
+            log_every: int = 20,
+            log_grad_norm: bool = False,
+            csv_path: str | None = None,
+            csv_append: bool = False,
+            # ---- early stopping / best checkpoint ----
+            early_stop: bool = True,
+            early_stop_metric: str = "auc",  # "auc" | "ap" | "val_loss" | "val_acc"
+            early_stop_patience: int = 15,
+            early_stop_min_delta: float = 1e-4,
+            restore_best: bool = True,
+    ):
+        x = x.to(device)
+        edge_index_struct = edge_index_struct.to(device)
+        edge_index_lab = edge_index_lab.to(device)
+        y_label = y_label.float().to(device)
+
+        M = edge_index_lab.size(1)
+        if M == 0:
+            print("[LP-GNN] No labeled pairs. Returning untrained model.")
+            model = LinkPredictionGNN(
+                in_dim=x.size(1),
+                hidden_dim=hidden_dim,
+                out_dim=out_dim,
+            ).to(device)
+            return model
+
+        assert M == y_label.numel(), "edge_index_lab and y_label must have the same number of examples"
+
+        y_int = y_label.long()
+        if verbose:
+            print(
+                f"[LP-GNN] Labeled pairs: M={M} | "
+                f"pos={(y_int == 1).sum().item()} | neg={(y_int == 0).sum().item()}"
+            )
+
+        # ---- split ----
+        assert M % 2 == 0, "Expected equal number of negatives/positives (M must be even)."
+        half = M // 2
+
+        neg_idx_all = torch.arange(0, half, device=device)
+        pos_idx_all = torch.arange(half, M, device=device)
+
+        neg_perm = neg_idx_all[torch.randperm(half, device=device)]
+        pos_perm = pos_idx_all[torch.randperm(half, device=device)]
+
+        train_size_per_class = int(0.8 * half)
+
+        train_idx = torch.cat([neg_perm[:train_size_per_class], pos_perm[:train_size_per_class]])
+        val_idx = torch.cat([neg_perm[train_size_per_class:], pos_perm[train_size_per_class:]])
+
+        train_idx = train_idx[torch.randperm(train_idx.numel(), device=device)]
+        val_idx = val_idx[torch.randperm(val_idx.numel(), device=device)]
+
+        # ---- model ----
+        num_layers: int = 4
+        dropout: float = 0.3
+
+        model = LinkPredictionGNN(
+            in_dim=x.size(1),
+            hidden_dim=hidden_dim,
+            out_dim=out_dim,
+            num_layers=num_layers,
+            dropout=dropout,
+        ).to(device)
+
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+        pos_weight = (len(neg_idx_all) / len(pos_idx_all)) if len(pos_idx_all) > 0 else 1.0
+        loss_fn = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pos_weight, device=device))
+
+        # ---- CSV logger ----
+        csv_fields = [
+            "epoch",
+            "train_loss",
+            "val_loss",
+            "val_acc",
+            "acc_pos",
+            "acc_neg",
+            "auc",
+            "ap",
+            "tp",
+            "fp",
+            "tn",
+            "fn",
+            "p_min",
+            "p_mean",
+            "p_max",
+            "grad_norm",
+            "best_metric",
+            "is_best",
+        ]
+
+        if csv_path is None:
+            csv_path = PRBCD.make_selector_gnn_log_path(
+                ads_mode=self.ads_mode,
+                drop_mode=self.drop_mode,
+                k_samples_batch=self.k_samples_batch,
+                n_candidates_k_sample=self.n_candidates_k_sample,
+                acc_drop_threshold_k_samples=self.acc_drop_threshold_k_samples,
+                loss_drop_threshold_k_samples=self.loss_drop_threshold_k_samples,
+            )
+
+        logger = CSVMetricLogger(
+            path=csv_path,
+            fieldnames=csv_fields,
+            append=csv_append,
+        )
+
+        # ---- helpers for early stopping ----
+        metric_mode = {
+            "auc": "max",
+            "ap": "max",
+            "val_acc": "max",
+            "val_loss": "min",
+        }
+        if early_stop_metric not in metric_mode:
+            raise ValueError(f"early_stop_metric must be one of {list(metric_mode.keys())}")
+
+        want = metric_mode[early_stop_metric]
+        best_metric = -float("inf") if want == "max" else float("inf")
+        best_epoch = -1
+        best_state = None
+
+        def _is_improvement(curr: float, best: float) -> bool:
+            if want == "max":
+                return curr > best + early_stop_min_delta
+            else:
+                return curr < best - early_stop_min_delta
+
+        patience_left = int(early_stop_patience)
+
+        epoch_iter = tqdm(range(num_epochs), desc="[LP-GNN] Training") if use_tqdm else range(num_epochs)
+
+        for epoch in epoch_iter:
+            # ---- train ----
+            model.train()
+            optimizer.zero_grad()
+
+            logits_train = model(x, edge_index_struct, edge_index_lab[:, train_idx]).view(-1)
+
+            if torch.isnan(logits_train).any() or torch.isinf(logits_train).any():
+                print(f"[LP-GNN][ERROR] NaN/Inf in train logits at epoch {epoch + 1}")
+                break
+
+            loss = loss_fn(logits_train, y_label[train_idx])
+            loss.backward()
+
+            grad_norm_val = None
+            if log_grad_norm:
+                total_norm = 0.0
+                for p in model.parameters():
+                    if p.grad is not None:
+                        total_norm += p.grad.data.norm(2).item() ** 2
+                grad_norm_val = total_norm ** 0.5
+
+            optimizer.step()
+
+            # ---- validation ----
+            model.eval()
+            with torch.no_grad():
+                logits_val = model(x, edge_index_struct, edge_index_lab[:, val_idx]).view(-1)
+
+                if torch.isnan(logits_val).any() or torch.isinf(logits_val).any():
+                    print(f"[LP-GNN][ERROR] NaN/Inf in val logits at epoch {epoch + 1}")
+                    break
+
+                val_loss = loss_fn(logits_val, y_label[val_idx])
+
+                probs_val = torch.sigmoid(logits_val)
+                preds_val = (probs_val >= 0.5).long()
+                yv = y_int[val_idx]
+
+                acc_val = float((preds_val == yv).float().mean().item())
+                acc_pos = float((preds_val[yv == 1] == 1).float().mean().item()) if (yv == 1).any() else float("nan")
+                acc_neg = float((preds_val[yv == 0] == 0).float().mean().item()) if (yv == 0).any() else float("nan")
+
+                tp, fp, tn, fn = PRBCD._confusion_counts(preds_val, yv)
+                auc, ap = PRBCD._safe_auc_ap_sklearn(probs_val, yv)
+
+                pmin = float(probs_val.min().item())
+                pmean = float(probs_val.mean().item())
+                pmax = float(probs_val.max().item())
+
+            metric_val = None
+            if early_stop_metric == "auc":
+                metric_val = auc
+            elif early_stop_metric == "ap":
+                metric_val = ap
+            elif early_stop_metric == "val_acc":
+                metric_val = acc_val
+            elif early_stop_metric == "val_loss":
+                metric_val = float(val_loss.item())
+
+            is_best = False
+            if metric_val is not None:
+                if _is_improvement(float(metric_val), float(best_metric)):
+                    best_metric = float(metric_val)
+                    best_epoch = epoch + 1
+                    best_state = copy.deepcopy(model.state_dict())
+                    patience_left = int(early_stop_patience)
+                    is_best = True
+                else:
+                    patience_left -= 1
+
+            # ---- CSV log ----
+            logger.log({
+                "epoch": epoch + 1,
+                "train_loss": float(loss.item()),
+                "val_loss": float(val_loss.item()),
+                "val_acc": acc_val,
+                "acc_pos": acc_pos,
+                "acc_neg": acc_neg,
+                "auc": auc,
+                "ap": ap,
+                "tp": tp,
+                "fp": fp,
+                "tn": tn,
+                "fn": fn,
+                "p_min": pmin,
+                "p_mean": pmean,
+                "p_max": pmax,
+                "grad_norm": grad_norm_val,
+                "best_metric": float(best_metric) if best_epoch != -1 else float("nan"),
+                "is_best": 1 if is_best else 0,
+            })
+
+            # ---- tqdm ----
+            if use_tqdm:
+                postfix = {
+                    "tr_loss": f"{loss.item():.4f}",
+                    "va_loss": f"{val_loss.item():.4f}",
+                    "va_acc": f"{acc_val:.3f}",
+                }
+                if auc is not None:
+                    postfix["auc"] = f"{auc:.3f}"
+                if ap is not None:
+                    postfix["ap"] = f"{ap:.3f}"
+                postfix["pat"] = patience_left if metric_val is not None else "n/a"
+                epoch_iter.set_postfix(postfix)
+
+            # ---- print ----
+            if verbose and ((epoch + 1) % log_every == 0 or epoch == 0 or (epoch + 1) == num_epochs):
+                msg = (
+                    f"[LP-GNN] Epoch {epoch + 1:03d}/{num_epochs} | "
+                    f"train_loss={loss.item():.4f} | val_loss={val_loss.item():.4f} | "
+                    f"val_acc={acc_val:.4f} | acc_pos={acc_pos:.4f} | acc_neg={acc_neg:.4f} | "
+                    f"TP/FP/TN/FN={tp}/{fp}/{tn}/{fn} | "
+                    f"p(min/mean/max)={pmin:.3f}/{pmean:.3f}/{pmax:.3f}"
+                )
+                if auc is not None:
+                    msg += f" | AUC={auc:.4f}"
+                if ap is not None:
+                    msg += f" | AP={ap:.4f}"
+                if metric_val is not None:
+                    msg += f" | best_{early_stop_metric}={best_metric:.4f} (epoch {best_epoch})"
+                if grad_norm_val is not None:
+                    msg += f" | grad_norm={grad_norm_val:.3e}"
+                print(msg)
+
+            # ---- early stop ----
+            if early_stop and metric_val is not None and patience_left <= 0:
+                if verbose:
+                    print(
+                        f"[LP-GNN] Early stopping at epoch {epoch + 1}. "
+                        f"Best {early_stop_metric}={best_metric:.4f} at epoch {best_epoch}."
+                    )
+                break
+
+        logger.close()
+
+        # ---- restore best ----
+        if restore_best and best_state is not None:
+            model.load_state_dict(best_state)
+            if verbose:
+                print(f"[LP-GNN] Restored best model from epoch {best_epoch} ({early_stop_metric}={best_metric:.4f}).")
+
+        if verbose:
+            print(f"[LP-GNN] Training complete. Metrics saved to '{csv_path}'")
 
         return model
 
@@ -3853,3 +4290,61 @@ class PRBCD(SparseAttack):
         mask = row_idx != col_idx
         # returns directed matrix (diagonal is cut)
         return matrix[:, mask]
+
+    @staticmethod
+    def _confusion_counts(preds: torch.Tensor, y: torch.Tensor):
+        tp = int(((preds == 1) & (y == 1)).sum().item())
+        tn = int(((preds == 0) & (y == 0)).sum().item())
+        fp = int(((preds == 1) & (y == 0)).sum().item())
+        fn = int(((preds == 0) & (y == 1)).sum().item())
+        return tp, fp, tn, fn
+
+    @staticmethod
+    def _safe_auc_ap_sklearn(probs: torch.Tensor, y: torch.Tensor):
+        y_np = y.detach().cpu().numpy()
+        p_np = probs.detach().cpu().numpy()
+
+        if len(set(y_np.tolist())) < 2:
+            return None, None
+
+        try:
+            auc = float(roc_auc_score(y_np, p_np))
+            ap = float(average_precision_score(y_np, p_np))
+            return auc, ap
+        except Exception:
+            return None, None
+
+    @staticmethod
+    def make_selector_gnn_log_path(
+            base_dir: str = "Plotting_Data/SelectorGNNLogs",
+            ads_mode: str | None = None,
+            drop_mode: str | None = None,
+            n_candidates_k_sample: int | None = None,
+            k_samples_batch: int | None = None,
+            acc_drop_threshold_k_samples: float | None = None,
+            loss_drop_threshold_k_samples: float | None = None,
+            ext: str = ".csv",
+    ):
+        os.makedirs(base_dir, exist_ok=True)
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        parts = ["selector_gnn"]
+
+        if ads_mode:
+            parts.append(f"ads-{ads_mode}")
+        if n_candidates_k_sample is not None:
+            parts.append(f"k{n_candidates_k_sample}")
+        if k_samples_batch is not None:
+            parts.append(f"kb{k_samples_batch}")
+        if drop_mode is not None:
+            parts.append(f"drpmd{drop_mode}")
+        if drop_mode == "acc":
+            if acc_drop_threshold_k_samples is not None:
+                parts.append(f"drp{acc_drop_threshold_k_samples}")
+        if drop_mode == "loss":
+            if loss_drop_threshold_k_samples is not None:
+                parts.append(f"drp{loss_drop_threshold_k_samples}")
+
+        filename = "_".join(parts) + f"_{timestamp}{ext}"
+        return os.path.join(base_dir, filename)
