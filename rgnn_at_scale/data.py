@@ -238,7 +238,7 @@ class SparseGraph:
     ) -> 'SparseGraph':
         """Perform common preprocessing steps: remove self-loops, make unweighted/undirected, select LCC.
 
-        All changes are done inplace.
+        All changes are split_by_eps inplace.
 
         Parameters
         ----------
