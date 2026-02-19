@@ -33,7 +33,7 @@ from datetime import datetime
 from rgnn_at_scale.helper.csvLogger import CSVMetricLogger
 
 
-class PRBCD(SparseAttack):
+class SelectorAttack(SparseAttack):
     """Sampled and hence scalable PGD attack for graph data.
     """
 
@@ -139,232 +139,75 @@ class PRBCD(SparseAttack):
 
         # For collecting attack statistics
         self.attack_statistics = defaultdict(list)
-
-        #tried_mask for selector exclusion
+        self.n_perturbations = n_perturbations
         self.tried_mask = torch.zeros(self.n_possible_edges, device=self.device, dtype=torch.bool)
 
-        # Sample initial search space (Algorithm 1, line 3-4)
+        if use_cert in ("random_direct",):
+            self.current_search_space = torch.randint(
+                self.n_possible_edges, (self.block_size,), device=self.device)
+            self.current_search_space = torch.unique(self.current_search_space, sorted=True)
+            self.perturbed_edge_weight = torch.ones_like(self.current_search_space, dtype=torch.float32)
+            # modified edge index?
 
-        if use_cert in ("sampling_with_prior",):
-            print(use_cert, "run sampling_with_prior")
-            self.sample_block_from_prior_gumbel(n_perturbations=n_perturbations, tau=1.0)
-        elif use_cert in ("selector_block",):  # here is my selector
-            print(use_cert, "-> using selector to build the initial block")
-            self.sample_block_from_selector(n_perturbations=n_perturbations, k_nodes=350)
-        elif use_cert in ("selector_block_pgd",):  # here is my selector
-            print(use_cert, "-> using selector to build the initial block")
-            self.sample_block_from_pgdtopk_direct()
-        elif use_cert in ("selector_block_linkpred",):
-            print(use_cert, "-> using selector link pred")
-            self.sample_block_from_linkpred_gnn(graph=graph,n_perturbations=n_perturbations)
-        elif use_cert in ("selector_block_linkpred_all",):
-            print(use_cert, "-> using selector link pred all")
-            self.sample_block_from_linkpred_gnn_all_pairs(graph=graph, b=50000)
-        elif use_cert in ("selector_block_linkpred_gcn",):
-            print(use_cert, "-> using selector link pred gcn")
-            self.sample_block_from_linkpred_gcn(graph=graph)
-        elif use_cert in ("selector_block_gradient_gcn",):
-            print(use_cert, "-> using selector gradient gcn")
-            self.sample_block_from_margin_loss_gcn(graph=graph)
-        elif use_cert in ("accuracy_drop_selector",):
-            print(use_cert, "-> sampling with accuracy drop selector")
+            with torch.no_grad():
 
-            self.n_candidates_k_sample=2000
-            self.n_candidates_one_sample=5000
-            self.acc_drop_threshold_k_samples=1e-3
-            self.loss_drop_threshold_k_samples=1e-3
-            self.k_samples_batch=10
-            self.ads_mode=ads_mode
-            self.drop_mode="endpoint"
+                logits = self._get_logits(self.attr, self.edge_index, self.edge_weight)
+                loss = self.calculate_loss(logits[self.idx_attack], self.labels[self.idx_attack])
+                accuracy = utils.accuracy(logits, self.labels, self.idx_attack)
 
-            if self.drop_mode == "acc": #TODO: logging für alle ads_modes+drop_modes
-                cache_path = f"cache/selection_dataset{self.dataset}_seed{self.seed}_ads_{ads_mode}_k{self.n_candidates_k_sample}_bt{self.k_samples_batch}_drpmd{self.drop_mode}_drp{self.acc_drop_threshold_k_samples}.pt"
-            elif self.drop_mode == "loss":
-                cache_path = f"cache/selection_dataset{self.dataset}_seed{self.seed}_ads_{ads_mode}_k{self.n_candidates_k_sample}_bt{self.k_samples_batch}_drpmd{self.drop_mode}_drp{self.loss_drop_threshold_k_samples}.pt"
-            elif self.drop_mode == "endpoint":
-                cache_path = f"cache/selection_dataset{self.dataset}_seed{self.seed}_ads_{ads_mode}_k{self.n_candidates_one_sample}_drpmd{self.drop_mode}.pt"
+                logging.info(f'\nBefore the attack - Loss: {loss.item()} Accuracy: {100 * accuracy:.3f} %\n')
 
-            if os.path.exists(cache_path):
-                print("[CACHE] loading selection:", cache_path)
-                (
-                    y_out,
-                    edge_index_lab,
-                    y_label,
-                    tried_set,
-                    harmful_set,
-                    sub_nodes,
-                    edge_index_sub,
-                    edge_weight_sub,
-                    edge_index_lab_local,
-                    X_sub,
-                    edge_index_struct_local,
-                    meta,
-                ) = PRBCD.load_selection(
-                    cache_path,
-                    device=self.device,
-                )
-            else:
-                print("[CACHE] computing selection and saving:", cache_path)
-                y_out, edge_index_lab, y_label, tried_set, harmful_set = self.label_edge_flips_prbcd_selfsample_fast(
-                    mode=ads_mode,
-                    drop_mode=self.drop_mode,
-                    n_candidates_k_sample=self.n_candidates_k_sample,
-                    n_candidates_one_sample=self.n_candidates_one_sample,
-                    acc_drop_threshold_k_samples=self.acc_drop_threshold_k_samples,
-                    loss_drop_threshold_k_samples=self.loss_drop_threshold_k_samples,
-                    k_samples_batch=self.k_samples_batch
-                )
-                meta = {
-                    "ads_mode": self.ads_mode,
-                    "n_candidates_k_sample": self.n_candidates_k_sample,
-                    "acc_drop_threshold_k_samples": self.acc_drop_threshold_k_samples,
-                    "loss_drop_threshold_k_samples": self.loss_drop_threshold_k_samples,
-                }
-                PRBCD.save_selection(cache_path, y_out, edge_index_lab, y_label, tried_set, harmful_set, meta=meta)
+                self._append_attack_statistics(loss.item(), accuracy, 0., 0.)
 
-            X, edge_index_struct = self.extract_X_and_edge_index_from_sparsegraph(graph)
-            stats = PRBCD.tried_add_del_proportion(tried_set, edge_index_struct, n=int(self.n))
-            print(stats)
+                del logits, loss
 
-            self.lp_model = self.train_link_prediction_gnn(
-                x=X,
-                edge_index_struct=edge_index_struct,
-                edge_index_lab=edge_index_lab,
-                y_label=y_label,
-                device=self.device,
-                num_epochs=200,
-                use_tqdm=True,
-                verbose=True,
-            )
-            self.sample_block_from_linkpred_threshold(graph=graph, n_perturbations=n_perturbations)
-            #self.init_search_space_from_y_out(y_out=y_out,n_perturbations=n_perturbations)
-            self.tried_set = tried_set
-        elif use_cert in ("accuracy_drop_selector_subgraph_random", "accuracy_drop_selector_subgraph_khop", "accuracy_drop_selector_subgraph_growhop"):
-            print(use_cert, "-> sampling with accuracy drop selector subgraph")
+            self.n_perturbations_epoch = int(self.n_perturbations / self.epochs)
 
-            self.n_candidates_one_sample = 5000
-            self.n_candidates_k_sample = 2000
-            self.k_subgraph = 3
-            self.subgraph_size = int(self.n/2)
-            self.drop_mode = "endpoint"
-            self.k_samples_batch = 10
-            self.acc_drop_threshold_k_samples = 1e-3
-            self.loss_drop_threshold_k_samples = 1e-3
+            for epoch in tqdm(range(self.epochs)):
+                perturbed_edges = self.sample_direct_attack_random_uniform(self.n_perturbations_epoch)
+                self.edge_index = self.addXOR(self.edge_index, perturbed_edges)
+                #self.apply_edge_toggles(perturbed_edges)
+                self.attr_adversary = self.attr
 
-            if use_cert in ("accuracy_drop_selector_subgraph_random",):
-                self.ads_mode = "random_subgraph"
-            elif use_cert in ("accuracy_drop_selector_subgraph_khop",):
-                self.ads_mode = "khop_subgraph"
-            else:
-                self.ads_mode = "growhop_subgraph"
+                #current_search_space = SelectorAttack.edges_as_matrix_idx_to_current_search_space(self.n,
+                                                                                                  #self.edge_index)
+                #self.perturbed_edge_weight = torch.ones_like(current_search_space, dtype=torch.float32)
+                #self.current_search_space = current_search_space
 
-            if self.ads_mode == "random_subgraph":
-                cache_path = f"cache/selection_dataset{self.dataset}_seed{self.seed}_{self.ads_mode}_n{self.n_candidates_one_sample}_m{self.subgraph_size}.pt"
-            elif self.ads_mode == "khop_subgraph":
-                cache_path = f"cache/selection_dataset{self.dataset}_seed{self.seed}_{self.ads_mode}_n{self.n_candidates_one_sample}_k{self.k_subgraph}.pt"
-            elif self.ads_mode == "growhop_subgraph":
-                cache_path = f"cache/selection_dataset{self.dataset}_seed{self.seed}_{self.ads_mode}_n{self.n_candidates_one_sample}_m{self.subgraph_size}.pt"
-            else:
-                raise ValueError("ads_mode Unknown")
+                self.edge_weight = torch.ones_like(self.edge_index[0], dtype=torch.float32)
 
-            X, edge_index_struct = self.extract_X_and_edge_index_from_sparsegraph(graph)
+                with torch.no_grad():
+                    logits = self._get_logits(self.attr, self.edge_index, self.edge_weight)
+                    loss = self.calculate_loss(logits[self.idx_attack], self.labels[self.idx_attack])
+                    accuracy = utils.accuracy(logits, self.labels, self.idx_attack)
 
-            if os.path.exists(cache_path):
-                print("[CACHE] loading selection:", cache_path)
-                (
-                    y_out,
-                    edge_index_lab,
-                    y_label,
-                    tried_set,
-                    harmful_set,
-                    sub_nodes,
-                    edge_index_sub,
-                    edge_weight_sub,
-                    edge_index_lab_local,
-                    X_sub,
-                    edge_index_struct_local,
-                    meta,
-                ) = PRBCD.load_selection(
-                    cache_path,
-                    device=self.device,
-                )
-            else:
-                print("[CACHE] computing selection and saving:", cache_path)
-                if self.ads_mode == "random_subgraph":
-                    sub_nodes, edge_index_sub, edge_weight_sub, g2l, l2g = PRBCD.extract_random_induced_subgraph(
-                        edge_index_struct,
-                        self.n,
-                        subgraph_size=self.subgraph_size,
-                    )
-                elif self.ads_mode == "khop_subgraph": #no local values
-                    sub_nodes, edge_index_sub, edge_weight_sub, g2l, l2g = PRBCD.extract_k_hop_induced_subgraph_of_random_node(
-                        edge_index_struct,
-                        self.n,
-                        k=self.k_subgraph,
-                    )
-                elif self.ads_mode == "growhop_subgraph":
-                    sub_nodes, edge_index_sub, edge_weight_sub, g2l, l2g, hops_used = PRBCD.extract_growing_hop_subgraph_of_random_node(
-                        edge_index_struct,
-                        self.n,
-                        subgraph_size=self.subgraph_size
-                    )
-                else:
-                    raise ValueError("ads_mode Unknown")
+                    logging.info(f'\nBefore the attack - Loss: {loss.item()} Accuracy: {100 * accuracy:.3f} %\n')
 
-                y_out, edge_index_lab, y_label, edge_index_lab_local, tried_set, harmful_set = self.label_edge_flips_prbcd_subgraph_endpoint_one_sample(
-                    n_candidates_one_sample=self.n_candidates_one_sample,
-                    sub_nodes=sub_nodes,
-                )
+                    self._append_attack_statistics(loss.item(), accuracy, 0., 0.)
 
-                X_sub, edge_index_struct_local = PRBCD.build_lp_struct_for_subgraph(
-                    X=X,
-                    edge_index_struct=edge_index_struct,
-                    sub_nodes=sub_nodes,
-                    device=self.device,
-                )
+                    del logits, loss
 
-                meta = {
-                    "n_candidates_one_sample": self.n_candidates_one_sample,
-                }
-                PRBCD.save_selection(cache_path, y_out, edge_index_lab, y_label, tried_set, harmful_set, sub_nodes, edge_index_sub, edge_weight_sub, edge_index_lab_local, X_sub, edge_index_struct_local, meta=meta)
-
-            stats = PRBCD.tried_add_del_proportion(tried_set, edge_index_struct, n=int(self.n))
-            print(stats)
-
-            self.sub_nodes = sub_nodes
-            self.X_sub = X_sub
-            self.edge_index_struct_local = edge_index_struct_local
-
-            self.lp_model = self.train_link_prediction_gnn(
-                x=X_sub,
-                edge_index_struct=edge_index_struct_local,
-                edge_index_lab=edge_index_lab_local,
-                y_label=y_label,
-                device=self.device,
-                num_epochs=200,
-                use_tqdm=True,
-                verbose=True,
-            )
-            #self.sample_block_from_linkpred_threshold_subgraph(n_perturbations=n_perturbations, tau=0.8)
-            self.sample_block_from_linkpred_threshold(graph=graph, n_perturbations=n_perturbations)
-            # self.init_search_space_from_y_out(y_out=y_out,n_perturbations=n_perturbations)
-            self.tried_set = tried_set
-        elif use_cert in ("direct_selector",):
+            #self.adj_adversary = SparseTensor.from_edge_index(
+            #    self.edge_index,
+            #    torch.ones_like(self.edge_index[0], dtype=torch.float32),
+            #    (self.n, self.n),
+            #).coalesce().detach()
+        else:
 
             self.n_candidates_k_sample = 2000
             self.n_candidates_one_sample = 5000
             self.acc_drop_threshold_k_samples = 1e-3
             self.loss_drop_threshold_k_samples = 1e-3
             self.k_samples_batch = 10
-            self.ads_mode = ads_mode
+            self.ads_mode = "one_sample"
             self.drop_mode = "endpoint"
 
             if self.drop_mode == "acc":  # TODO: logging für alle ads_modes+drop_modes
-                cache_path = f"cache/selection_dataset{self.dataset}_seed{self.seed}_ads_{ads_mode}_k{self.n_candidates_k_sample}_bt{self.k_samples_batch}_drpmd{self.drop_mode}_drp{self.acc_drop_threshold_k_samples}.pt"
+                cache_path = f"cache/selection_dataset{self.dataset}_seed{self.seed}_ads_{self.ads_mode}_k{self.n_candidates_k_sample}_bt{self.k_samples_batch}_drpmd{self.drop_mode}_drp{self.acc_drop_threshold_k_samples}.pt"
             elif self.drop_mode == "loss":
-                cache_path = f"cache/selection_dataset{self.dataset}_seed{self.seed}_ads_{ads_mode}_k{self.n_candidates_k_sample}_bt{self.k_samples_batch}_drpmd{self.drop_mode}_drp{self.loss_drop_threshold_k_samples}.pt"
+                cache_path = f"cache/selection_dataset{self.dataset}_seed{self.seed}_ads_{self.ads_mode}_k{self.n_candidates_k_sample}_bt{self.k_samples_batch}_drpmd{self.drop_mode}_drp{self.loss_drop_threshold_k_samples}.pt"
             elif self.drop_mode == "endpoint":
-                cache_path = f"cache/selection_dataset{self.dataset}_seed{self.seed}_ads_{ads_mode}_k{self.n_candidates_one_sample}_drpmd{self.drop_mode}.pt"
+                cache_path = f"cache/selection_dataset{self.dataset}_seed{self.seed}_ads_{self.ads_mode}_k{self.n_candidates_one_sample}_drpmd{self.drop_mode}.pt"
 
             if os.path.exists(cache_path):
                 print("[CACHE] loading selection:", cache_path)
@@ -381,14 +224,14 @@ class PRBCD(SparseAttack):
                     X_sub,
                     edge_index_struct_local,
                     meta,
-                ) = PRBCD.load_selection(
+                ) = SelectorAttack.load_selection(
                     cache_path,
                     device=self.device,
                 )
             else:
                 print("[CACHE] computing selection and saving:", cache_path)
                 y_out, edge_index_lab, y_label, tried_set, harmful_set = self.label_edge_flips_prbcd_selfsample_fast(
-                    mode=ads_mode,
+                    mode=self.ads_mode,
                     drop_mode=self.drop_mode,
                     n_candidates_k_sample=self.n_candidates_k_sample,
                     n_candidates_one_sample=self.n_candidates_one_sample,
@@ -402,10 +245,10 @@ class PRBCD(SparseAttack):
                     "acc_drop_threshold_k_samples": self.acc_drop_threshold_k_samples,
                     "loss_drop_threshold_k_samples": self.loss_drop_threshold_k_samples,
                 }
-                PRBCD.save_selection(cache_path, y_out, edge_index_lab, y_label, tried_set, harmful_set, meta=meta)
+                SelectorAttack.save_selection(cache_path, y_out, edge_index_lab, y_label, tried_set, harmful_set, meta=meta)
 
             X, edge_index_struct = self.extract_X_and_edge_index_from_sparsegraph(graph)
-            stats = PRBCD.tried_add_del_proportion(tried_set, edge_index_struct, n=int(self.n))
+            stats = SelectorAttack.tried_add_del_proportion(tried_set, edge_index_struct, n=int(self.n))
             print(stats)
 
             self.lp_model = self.train_link_prediction_gnn(
@@ -421,23 +264,66 @@ class PRBCD(SparseAttack):
 
             # ------ Start LP-Model attack loop ------
 
+            current_search_space = SelectorAttack.edges_as_matrix_idx_to_current_search_space(self.n, self.edge_index)
+            self.perturbed_edge_weight = torch.ones_like(current_search_space, dtype=torch.float32)
+            self.current_search_space = current_search_space
 
-        else:
-            print(use_cert, "run sampling with no certificate")
-            self.sample_random_block(n_perturbations)
-        # Accuracy and attack statistics before the attack even started
-        with torch.no_grad():
+            with torch.no_grad():
 
-            logits = self._get_logits(self.attr, self.edge_index, self.edge_weight)
-            loss = self.calculate_loss(logits[self.idx_attack], self.labels[self.idx_attack])
-            accuracy = utils.accuracy(logits, self.labels, self.idx_attack)
+                logits = self._get_logits(self.attr, self.edge_index, self.edge_weight)
+                loss = self.calculate_loss(logits[self.idx_attack], self.labels[self.idx_attack])
+                accuracy = utils.accuracy(logits, self.labels, self.idx_attack)
 
-            logging.info(f'\nBefore the attack - Loss: {loss.item()} Accuracy: {100 * accuracy:.3f} %\n')
+                logging.info(f'\nBefore the attack - Loss: {loss.item()} Accuracy: {100 * accuracy:.3f} %\n')
 
-            self._append_attack_statistics(loss.item(), accuracy, 0., 0.)
+                self._append_attack_statistics(loss.item(), accuracy, 0., 0.)
 
-            del logits, loss
+                del logits, loss
 
+            self.n_perturbations_epoch = int(self.n_perturbations / self.epochs)
+
+            for epoch in tqdm(range(self.epochs)):
+
+                perturbed_edges = self.sample_direct_attack_from_linkpred_topk(
+                    self.attr, self.edge_index, self.n_perturbations_epoch)
+
+                if perturbed_edges.size(1) < self.n_perturbations_epoch:
+                    raise RuntimeError(
+                        f"sample_direct_attack_from_linkpred_topk returned only "
+                        f"{perturbed_edges.size(1)} edges, but "
+                        f"{self.n_perturbations_epoch} were required."
+                    )
+
+                #self.edge_index = self.addXOR(self.edge_index, perturbed_edges)
+
+                # self.apply_edge_toggles(perturbed_edges)
+                self.attr_adversary = self.attr
+
+                current_search_space = SelectorAttack.edges_as_matrix_idx_to_current_search_space(self.n ,self.edge_index)
+                self.perturbed_edge_weight = torch.ones_like(current_search_space,dtype=torch.float32)
+                self.current_search_space = current_search_space
+
+                edge_weight = torch.ones_like(self.edge_index[0],dtype=torch.float32)
+
+                with torch.no_grad():
+
+                    logits = self.attacked_model(self.attr_adversary, adj=(self.edge_index,edge_weight))
+                    loss = self.calculate_loss(logits[self.idx_attack], self.labels[self.idx_attack])
+                    accuracy = utils.accuracy(logits, self.labels, self.idx_attack)
+
+                    logging.info(f'\nBefore the attack - Loss: {loss.item()} Accuracy: {100 * accuracy:.3f} %\n')
+
+                    self._append_attack_statistics(loss.item(), accuracy, 0., 0.)
+
+                    del logits, loss
+
+            #self.adj_adversary = SparseTensor.from_edge_index(
+            #    self.edge_index,
+            #    torch.ones_like(self.edge_index[0], dtype=torch.float32),
+            #    (self.n, self.n),
+            #).coalesce().detach()
+
+        '''
         # Loop over the epochs (Algorithm 1, line 5)
         for epoch in tqdm(range(self.epochs)):
             self.perturbed_edge_weight.requires_grad = True
@@ -500,13 +386,13 @@ class PRBCD(SparseAttack):
 
                     elif use_cert in ("accuracy_drop_selector", "accuracy_drop_selector_subgraph"):
                         print(use_cert, "run resampling with no certificate")
-                        if epoch % 50 == 0:
-                            self.resample_block_from_linkpred_threshold(graph=graph, n_perturbations=n_perturbations)
+                        if epoch % 5 == 0:
+                            #self.resample_block_from_linkpred_threshold(graph=graph, n_perturbations=n_perturbations)
                             self.resample_random_block(n_perturbations=n_perturbations)
                         else:
                             self.resample_random_block(n_perturbations=n_perturbations)
                         pass
-                        '''
+                        
                         if epoch % 5 == 0:
                             print(use_cert, "-> resampling with accuracy drop selector")
                             y_out, edge_index_lab, y_label, tried_set, harmful_set = self.label_edge_flips_prbcd_selfsample_fast(mode=ads_mode,
@@ -516,7 +402,7 @@ class PRBCD(SparseAttack):
                             self.append_search_space_with_y_out(y_out=y_out)
                             self.tried_set = tried_set
                         else:
-                            pass'''
+                            pass
 
                     elif use_cert in ("selector_block", "selector_block_pgd"):
 
@@ -594,9 +480,83 @@ class PRBCD(SparseAttack):
             torch.ones_like(edge_index[0], dtype=torch.float32),
             (self.n, self.n)
         ).coalesce().detach()
-        self.attr_adversary = self.attr
+        self.attr_adversary = self.attr'''
 
         # TODO: Don't we want to switch to returning things? Haha yeah me too
+
+    def _canonicalize_edges(self, edge_index: torch.Tensor) -> torch.Tensor:
+        """
+        Ensures a canonical representation for edge comparison.
+        Undirected: (u, v) with u < v
+        Directed: unchanged
+        """
+        if self.make_undirected:
+            return torch.stack([
+                torch.minimum(edge_index[0], edge_index[1]),
+                torch.maximum(edge_index[0], edge_index[1]),
+            ], dim=0)
+        return edge_index
+
+    def apply_edge_toggles(self, perturbed_edges: torch.Tensor):
+        """
+        Toggles edges in self.edge_index using perturbed_edges.
+
+        If an edge exists → remove it
+        If it does not exist → add it
+
+        perturbed_edges: (2, P)
+        """
+
+        # Canonicalize both
+        edge_idx = self._canonicalize_edges(self.edge_index)
+        perturbed_edges = self._canonicalize_edges(perturbed_edges)
+
+        # Convert to set of tuples (CPU for hashing)
+        edge_set = {
+            (int(u), int(v)) for u, v in edge_idx.t().cpu().tolist()
+        }
+
+        for u, v in perturbed_edges.t().cpu().tolist():
+            key = (int(u), int(v))
+            if key in edge_set:
+                edge_set.remove(key)  # remove existing edge
+            else:
+                edge_set.add(key)  # add new edge
+
+        if len(edge_set) == 0:
+            raise RuntimeError("All edges removed – graph became empty.")
+
+        # Rebuild edge_idx
+        new_edge_idx = torch.tensor(
+            list(edge_set),
+            device=self.edge_index.device,
+            dtype=torch.long
+        ).t().contiguous()
+
+        self.edge_index = new_edge_idx
+
+    def addXOR(self, edge_index, modified_edge_index):
+        e1 = edge_index.t()
+        e2 = modified_edge_index.t()
+
+        # Convert edges to tuples via hashing
+        e1_set = {tuple(e.tolist()) for e in e1}
+        e2_set = {tuple(e.tolist()) for e in e2}
+
+        xor_set = e1_set ^ e2_set  # symmetric difference
+
+        xor_edges = torch.tensor(list(xor_set), dtype=edge_index.dtype)
+        return xor_edges.t()
+
+    @staticmethod
+    def edges_as_matrix_idx_to_current_search_space(n: int, edges_as_matrix_idx):
+        # first we cut edges so that index build a triu matrix
+        # (function triu_idx_to_linear only support triu matrix idx)
+        edges_as_triu_matrix_idx = SelectorAttack.flip_matrix_idx_to_triu_idx(edges_as_matrix_idx)
+        # we then build linear idx which is the current_search_space
+        lin_idx = SelectorAttack.triu_idx_to_linear_idx(n, edges_as_triu_matrix_idx)
+        lin_idx = torch.unique(lin_idx, sorted=True)
+        return lin_idx
 
     def _get_logits(self, x, edge_index, edge_weight):
         return self.attacked_model(
@@ -770,9 +730,9 @@ class PRBCD(SparseAttack):
                 self.n_possible_edges, (self.block_size,), device=self.device)
             self.current_search_space = torch.unique(self.current_search_space, sorted=True)
             if self.make_undirected:
-                self.modified_edge_index = PRBCD.linear_to_triu_idx(self.n, self.current_search_space)
+                self.modified_edge_index = SelectorAttack.linear_to_triu_idx(self.n, self.current_search_space)
             else:
-                self.modified_edge_index = PRBCD.linear_to_full_idx(self.n, self.current_search_space)
+                self.modified_edge_index = SelectorAttack.linear_to_full_idx(self.n, self.current_search_space)
                 is_not_self_loop = self.modified_edge_index[0] != self.modified_edge_index[1]
                 self.current_search_space = self.current_search_space[is_not_self_loop]
                 self.modified_edge_index = self.modified_edge_index[:, is_not_self_loop]
@@ -841,9 +801,9 @@ class PRBCD(SparseAttack):
 
             # 2) decode to pairs exactly like PRBCD does
             if self.make_undirected:
-                cand_ei = PRBCD.linear_to_triu_idx(self.n, cand_lin)  # (2, M)
+                cand_ei = SelectorAttack.linear_to_triu_idx(self.n, cand_lin)  # (2, M)
             else:
-                cand_ei = PRBCD.linear_to_full_idx(self.n, cand_lin)  # (2, M)
+                cand_ei = SelectorAttack.linear_to_full_idx(self.n, cand_lin)  # (2, M)
                 is_not_self_loop = cand_ei[0] != cand_ei[1]
                 cand_lin = cand_lin[is_not_self_loop]
                 cand_ei = cand_ei[:, is_not_self_loop]
@@ -892,9 +852,9 @@ class PRBCD(SparseAttack):
 
             # 5) initialize modified_edge_index EXACTLY like sample_random_block
             if self.make_undirected:
-                self.modified_edge_index = PRBCD.linear_to_triu_idx(self.n, self.current_search_space)
+                self.modified_edge_index = SelectorAttack.linear_to_triu_idx(self.n, self.current_search_space)
             else:
-                self.modified_edge_index = PRBCD.linear_to_full_idx(self.n, self.current_search_space)
+                self.modified_edge_index = SelectorAttack.linear_to_full_idx(self.n, self.current_search_space)
                 is_not_self_loop = self.modified_edge_index[0] != self.modified_edge_index[1]
                 self.current_search_space = self.current_search_space[is_not_self_loop]
                 self.modified_edge_index = self.modified_edge_index[:, is_not_self_loop]
@@ -915,135 +875,6 @@ class PRBCD(SparseAttack):
         )
 
     def sample_block_from_linkpred_threshold(
-            self,
-            graph,
-            n_perturbations: int = 0,
-            tau: float = 0.8,  # kept for compatibility but NOT used for acceptance anymore
-            max_sampling_tries: int = 2_000_000,
-            score_batch_size: int = 100000,
-            rng_seed: int = 0,
-            exclude_tried: bool = False,  # optional: never reuse edges across resamples
-            q_lo: float = 0.70,  # NEW: lower quantile
-            q_hi: float = 0.98,  # NEW: upper quantile (exclude saturated top tail)
-    ):
-        if not hasattr(self, "lp_model") or self.lp_model is None:
-            raise RuntimeError("self.lp_model is not set.")
-
-        if not (0.0 <= q_lo < q_hi <= 1.0):
-            raise ValueError(f"q_lo and q_hi must satisfy 0 <= q_lo < q_hi <= 1, got {q_lo}, {q_hi}")
-
-        # optional global tried mask
-        if exclude_tried and (not hasattr(self, "tried_mask") or self.tried_mask is None):
-            self.tried_mask = torch.zeros(self.n_possible_edges, device=self.device, dtype=torch.bool)
-
-        # prep features/structure + embeddings once
-        X, edge_index_struct = self.extract_X_and_edge_index_from_sparsegraph(graph)
-        X = X.to(self.device)
-        edge_index_struct = edge_index_struct.to(self.device)
-
-        self.lp_model = self.lp_model.to(self.device).eval()
-        with torch.no_grad():
-            h = self.lp_model.encoder(X, edge_index_struct)
-
-        g = torch.Generator(device=self.device)
-        g.manual_seed(int(rng_seed))
-
-        accepted = []
-        accepted_mask = torch.zeros(self.n_possible_edges, device=self.device, dtype=torch.bool)
-
-        tries = 0
-        while len(accepted) < int(self.block_size) and tries < int(max_sampling_tries):
-            tries += 1
-
-            # sample a batch of candidate linear indices
-            cand_lin = torch.randint(
-                self.n_possible_edges, (int(score_batch_size),), device=self.device, generator=g
-            )
-            cand_lin = torch.unique(cand_lin, sorted=False)
-
-            # exclude duplicates within this block
-            cand_lin = cand_lin[~accepted_mask[cand_lin]]
-
-            # optionally exclude globally tried
-            if exclude_tried:
-                cand_lin = cand_lin[~self.tried_mask[cand_lin]]
-
-            if cand_lin.numel() == 0:
-                continue
-
-            # decode to pairs for scoring
-            if self.make_undirected:
-                cand_ei = PRBCD.linear_to_triu_idx(self.n, cand_lin)
-            else:
-                cand_ei = PRBCD.linear_to_full_idx(self.n, cand_lin)
-                is_not_self = cand_ei[0] != cand_ei[1]
-                cand_lin = cand_lin[is_not_self]
-                cand_ei = cand_ei[:, is_not_self]
-                if cand_lin.numel() == 0:
-                    continue
-
-            # score
-            with torch.no_grad():
-                logits = self.lp_model.edge_head(h, cand_ei).view(-1)
-                scores = torch.sigmoid(logits)
-
-            if scores.numel() == 0:
-                continue
-
-            # --- NEW: accept those within the per-batch quantile band ---
-            # NOTE: computed on this batch's score distribution
-            lo = torch.quantile(scores, float(q_lo))
-            hi = torch.quantile(scores, float(q_hi))
-
-            keep = (scores >= lo) & (scores <= hi)
-            cand_keep = cand_lin[keep]
-
-            # fallback: if the band is empty (can happen if scores are very concentrated)
-            if cand_keep.numel() == 0:
-                # try just "above lo" (i.e., high-score tail without excluding top)
-                keep = scores >= lo
-                cand_keep = cand_lin[keep]
-
-            if cand_keep.numel() == 0:
-                continue
-
-            # add until block is full
-            need = int(self.block_size) - len(accepted)
-            cand_keep = cand_keep[:need]
-
-            accepted.extend(cand_keep.tolist())
-            accepted_mask[cand_keep] = True
-
-        if len(accepted) < int(self.block_size):
-            raise RuntimeError(
-                f"Could not fill block_size={self.block_size} with quantile band q_lo={q_lo}, q_hi={q_hi}. "
-                f"Got {len(accepted)} after {tries} tries. Increase score_batch_size/max_sampling_tries or widen the band."
-            )
-
-        # finalize current_search_space exactly like PRBCD
-        self.current_search_space = torch.tensor(accepted, device=self.device, dtype=torch.long)
-        self.current_search_space = torch.unique(self.current_search_space, sorted=True)
-
-        if self.make_undirected:
-            self.modified_edge_index = PRBCD.linear_to_triu_idx(self.n, self.current_search_space)
-        else:
-            self.modified_edge_index = PRBCD.linear_to_full_idx(self.n, self.current_search_space)
-            is_not_self = self.modified_edge_index[0] != self.modified_edge_index[1]
-            self.current_search_space = self.current_search_space[is_not_self]
-            self.modified_edge_index = self.modified_edge_index[:, is_not_self]
-
-        self.perturbed_edge_weight = torch.full_like(
-            self.current_search_space, self.eps, dtype=torch.float32, requires_grad=True
-        )
-
-        if exclude_tried:
-            self.tried_mask[self.current_search_space] = True
-
-        if self.current_search_space.size(0) < n_perturbations:
-            raise RuntimeError("Block has fewer unique edges than n_perturbations. Widen band or increase sampling.")
-
-
-    '''def sample_block_from_linkpred_threshold(
             self,
             graph,
             n_perturbations: int = 0,
@@ -1097,9 +928,9 @@ class PRBCD(SparseAttack):
 
             # decode to pairs for scoring
             if self.make_undirected:
-                cand_ei = PRBCD.linear_to_triu_idx(self.n, cand_lin)
+                cand_ei = SelectorAttack.linear_to_triu_idx(self.n, cand_lin)
             else:
-                cand_ei = PRBCD.linear_to_full_idx(self.n, cand_lin)
+                cand_ei = SelectorAttack.linear_to_full_idx(self.n, cand_lin)
                 is_not_self = cand_ei[0] != cand_ei[1]
                 cand_lin = cand_lin[is_not_self]
                 cand_ei = cand_ei[:, is_not_self]
@@ -1136,9 +967,9 @@ class PRBCD(SparseAttack):
         self.current_search_space = torch.unique(self.current_search_space, sorted=True)
 
         if self.make_undirected:
-            self.modified_edge_index = PRBCD.linear_to_triu_idx(self.n, self.current_search_space)
+            self.modified_edge_index = SelectorAttack.linear_to_triu_idx(self.n, self.current_search_space)
         else:
-            self.modified_edge_index = PRBCD.linear_to_full_idx(self.n, self.current_search_space)
+            self.modified_edge_index = SelectorAttack.linear_to_full_idx(self.n, self.current_search_space)
             is_not_self = self.modified_edge_index[0] != self.modified_edge_index[1]
             self.current_search_space = self.current_search_space[is_not_self]
             self.modified_edge_index = self.modified_edge_index[:, is_not_self]
@@ -1152,7 +983,6 @@ class PRBCD(SparseAttack):
 
         if self.current_search_space.size(0) < n_perturbations:
             raise RuntimeError("Block has fewer unique edges than n_perturbations. Lower tau or increase sampling.")
-            '''
 
     def sample_block_from_linkpred_threshold_subgraph(
             self,
@@ -1242,12 +1072,12 @@ class PRBCD(SparseAttack):
 
             # decode LOCAL lin -> LOCAL pairs for scoring
             if self.make_undirected:
-                cand_ei_local = PRBCD.linear_to_triu_idx(m, cand_lin_local)  # (2, B) local ids
+                cand_ei_local = SelectorAttack.linear_to_triu_idx(m, cand_lin_local)  # (2, B) local ids
                 # convert to GLOBAL lin to optionally exclude tried
                 u_l = cand_ei_local[0]
                 v_l = cand_ei_local[1]
             else:
-                cand_ei_local = PRBCD.linear_to_full_idx(m, cand_lin_local)
+                cand_ei_local = SelectorAttack.linear_to_full_idx(m, cand_lin_local)
                 is_not_self = cand_ei_local[0] != cand_ei_local[1]
                 cand_lin_local = cand_lin_local[is_not_self]
                 cand_ei_local = cand_ei_local[:, is_not_self]
@@ -1266,10 +1096,10 @@ class PRBCD(SparseAttack):
                 uu = torch.minimum(u_g, v_g)
                 vv = torch.maximum(u_g, v_g)
                 cand_ei_global_uv = torch.stack([uu, vv], dim=0)  # (2,B)
-                cand_lin_global = PRBCD.triu_idx_to_linear_idx(int(self.n), cand_ei_global_uv).long()
+                cand_lin_global = SelectorAttack.triu_idx_to_linear_idx(int(self.n), cand_ei_global_uv).long()
             else:
                 cand_ei_global_uv = torch.stack([u_g, v_g], dim=0)
-                cand_lin_global = PRBCD.full_idx_to_linear_idx(int(self.n), cand_ei_global_uv).long()
+                cand_lin_global = SelectorAttack.full_idx_to_linear_idx(int(self.n), cand_ei_global_uv).long()
 
             # optionally exclude globally tried (GLOBAL)
             if exclude_tried:
@@ -1316,9 +1146,9 @@ class PRBCD(SparseAttack):
 
         # GLOBAL modified_edge_index for downstream perturbation code
         if self.make_undirected:
-            self.modified_edge_index = PRBCD.linear_to_triu_idx(int(self.n), self.current_search_space)
+            self.modified_edge_index = SelectorAttack.linear_to_triu_idx(int(self.n), self.current_search_space)
         else:
-            self.modified_edge_index = PRBCD.linear_to_full_idx(int(self.n), self.current_search_space)
+            self.modified_edge_index = SelectorAttack.linear_to_full_idx(int(self.n), self.current_search_space)
             is_not_self = self.modified_edge_index[0] != self.modified_edge_index[1]
             self.current_search_space = self.current_search_space[is_not_self]
             self.modified_edge_index = self.modified_edge_index[:, is_not_self]
@@ -1330,20 +1160,192 @@ class PRBCD(SparseAttack):
         if self.current_search_space.size(0) < int(n_perturbations):
             raise RuntimeError("Block has fewer unique edges than n_perturbations. Lower tau or increase sampling.")
 
-    def sample_direct_attack_from_linkpred_threshold(
+    def sample_direct_attack_from_linkpred_topk(
             self,
-            graph,
-            n_perturbations: int = 0,
-            tau: float = 0.8,  # acceptance threshold
-            max_sampling_tries: int = 2_000_000,
-            score_batch_size: int = 1000,
+            X,
+            edge_index_struct,
+            n_perturbations_epoch: int,
+            score_batch_size: int = 10_000,
             rng_seed: int = 0,
-            exclude_tried: bool = False,  # optional: never reuse edges across resamples
+            exclude_tried: bool = True,
     ):
+        """
+        New logic (no pool multiplier):
+          1) Sample score_batch_size random candidate edges (uniform).
+          2) Score them with lp_model.
+          3) Select top-k where k = n_perturbations_epoch.
+          4) Mark selected edges as tried (so they won't be picked again / flipped back).
+          5) Return edge_index_pairs (2, k).
+
+        Args:
+          X: (n, d) node features tensor
+          edge_index_struct: (2, E) graph structure edge_index tensor (for LP encoder)
+          n_perturbations_epoch: number of flips to return (k)
+          score_batch_size: number of random candidates to score
+          rng_seed: RNG seed for reproducible sampling
+          exclude_tried: if True, never sample edges already in self.tried_mask
+
+        Returns:
+          edge_index_pairs: (2, k) LongTensor
+        """
+        k = int(n_perturbations_epoch)
+        if k <= 0:
+            raise ValueError("n_perturbations_epoch must be > 0.")
+
         if not hasattr(self, "lp_model") or self.lp_model is None:
             raise RuntimeError("self.lp_model is not set.")
 
-        # optional global tried mask
+        # persistent tried mask (global across calls)
+        if exclude_tried and (not hasattr(self, "tried_mask") or self.tried_mask is None):
+            self.tried_mask = torch.zeros(self.n_possible_edges, device=self.device, dtype=torch.bool)
+
+        # move inputs to device
+        X = X.to(self.device)
+        edge_index_struct = edge_index_struct.to(self.device)
+
+        # compute node embeddings once
+        self.lp_model = self.lp_model.to(self.device).eval()
+        with torch.no_grad():
+            h = self.lp_model.encoder(X, edge_index_struct)
+
+        # build candidate linear indices (uniform, without replacement)
+        g = torch.Generator(device=self.device)
+        g.manual_seed(int(rng_seed))
+
+        if exclude_tried:
+            available = torch.nonzero(~self.tried_mask, as_tuple=False).view(-1)
+        else:
+            available = torch.arange(self.n_possible_edges, device=self.device)
+
+        if available.numel() < k:
+            raise RuntimeError(
+                f"Not enough available edges to sample k={k} (only {available.numel()} left)."
+            )
+
+        # we want up to score_batch_size candidates, but must have at least k
+        m = int(min(score_batch_size, available.numel()))
+        if m < k:
+            m = k
+
+        perm = torch.randperm(available.numel(), generator=g, device=self.device)
+        cand_lin = available[perm[:m]]  # (m,)
+
+        # decode candidate edges
+        if self.make_undirected:
+            cand_ei = SelectorAttack.linear_to_triu_idx(self.n, cand_lin)  # (2, m)
+        else:
+            # NOTE: this assumes self.n_possible_edges matches the linear space used here.
+            # If self.n_possible_edges == n*n, this includes self-loops; filter them out.
+            cand_ei = SelectorAttack.linear_to_full_idx(self.n, cand_lin)  # (2, m)
+            is_not_self = cand_ei[0] != cand_ei[1]
+            cand_lin = cand_lin[is_not_self]
+            cand_ei = cand_ei[:, is_not_self]
+            if cand_lin.numel() < k:
+                raise RuntimeError(
+                    f"After removing self-loops, only {cand_lin.numel()} candidates remain, need k={k}. "
+                    f"Increase score_batch_size or ensure self.n_possible_edges excludes diagonal."
+                )
+
+        # score candidates with LP head
+        with torch.no_grad():
+            logits = self.lp_model.edge_head(h, cand_ei).view(-1)  # (m',)
+            scores = torch.sigmoid(logits)
+
+        # pick top-k among the scored candidates
+        _, topk_idx = torch.topk(scores, k=k, largest=True, sorted=False)
+        edge_index_pairs = cand_ei[:, topk_idx]  # (2, k)
+
+        # mark selected as tried (prevents picking/flipping back later)
+        if exclude_tried:
+            if self.make_undirected:
+                lin_selected = SelectorAttack.triu_idx_to_linear_idx(self.n, edge_index_pairs)
+            else:
+                # if your directed linear space is n*n, use full_to_linear_idx
+                lin_selected = SelectorAttack.full_to_linear_idx(self.n, edge_index_pairs)
+            self.tried_mask[lin_selected] = True
+
+        if edge_index_pairs.size() != (2, k):
+            raise RuntimeError("Internal: output edge_index_pairs has wrong shape.")
+
+        return edge_index_pairs
+
+    def sample_direct_attack_random_uniform(
+            self,
+            n_perturbations_epoch: int,
+            rng_seed: int = 0,
+            exclude_tried: bool = True,
+    ):
+        """
+        Uniformly sample exactly k edge flips without replacement.
+        Already-tried edges are never sampled again (prevents flip-back).
+        """
+        k = int(n_perturbations_epoch)
+        if k <= 0:
+            raise ValueError("n_perturbations_epoch must be > 0.")
+
+        # persistent tried mask
+        if exclude_tried and (not hasattr(self, "tried_mask") or self.tried_mask is None):
+            self.tried_mask = torch.zeros(self.n_possible_edges, device=self.device, dtype=torch.bool)
+
+        g = torch.Generator(device=self.device)
+        g.manual_seed(int(rng_seed))
+
+        # available linear indices
+        if exclude_tried:
+            available = torch.nonzero(~self.tried_mask, as_tuple=False).view(-1)
+        else:
+            available = torch.arange(self.n_possible_edges, device=self.device)
+
+        if available.numel() < k:
+            raise RuntimeError(
+                f"Not enough available edges to sample {k} unique flips "
+                f"(only {available.numel()} left)."
+            )
+
+        # sample uniformly without replacement
+        perm = torch.randperm(available.numel(), generator=g, device=self.device)
+        chosen_lin = available[perm[:k]]
+
+        # decode
+        if self.make_undirected:
+            edge_index_pairs = SelectorAttack.linear_to_triu_idx(self.n, chosen_lin)
+            lin_for_tried = chosen_lin
+        else:
+            edge_index_pairs = SelectorAttack.linear_to_full_idx(self.n, chosen_lin)
+            lin_for_tried = chosen_lin
+
+        # remember flips (prevents flipping back)
+        if exclude_tried:
+            self.tried_mask[lin_for_tried] = 1
+
+        if edge_index_pairs.size() != (2, k):
+            raise RuntimeError("Internal: output edge_index_pairs has wrong shape.")
+
+        return edge_index_pairs
+
+    def sample_direct_attack_from_linkpred_threshold(
+            self,
+            graph,
+            tau: float = 0.8,
+            max_sampling_tries: int = 2_000_000,
+            score_batch_size: int = 1000,
+            rng_seed: int = 0,
+            exclude_tried: bool = False,
+    ):
+        """
+        Samples exactly n_perturbations edges whose LP score >= tau.
+
+        Returns:
+          edge_index_pairs: (2, n_perturbations) LongTensor
+        """
+        target = int(self.n_perturbations)
+        if target <= 0:
+            raise ValueError("n_perturbations must be > 0.")
+
+        if not hasattr(self, "lp_model") or self.lp_model is None:
+            raise RuntimeError("self.lp_model is not set.")
+
+        # optional global tried mask (still linear-index based internally)
         if exclude_tried and (not hasattr(self, "tried_mask") or self.tried_mask is None):
             self.tried_mask = torch.zeros(self.n_possible_edges, device=self.device, dtype=torch.bool)
 
@@ -1359,20 +1361,20 @@ class PRBCD(SparseAttack):
         g = torch.Generator(device=self.device)
         g.manual_seed(int(rng_seed))
 
-        accepted = []
+        accepted_ei = []
         accepted_mask = torch.zeros(self.n_possible_edges, device=self.device, dtype=torch.bool)
 
         tries = 0
-        while len(accepted) < int(self.block_size) and tries < int(max_sampling_tries):
+        while len(accepted_ei) < target and tries < int(max_sampling_tries):
             tries += 1
 
-            # sample a batch of candidate linear indices
+            # sample linear indices (internal only)
             cand_lin = torch.randint(
                 self.n_possible_edges, (int(score_batch_size),), device=self.device, generator=g
             )
             cand_lin = torch.unique(cand_lin, sorted=False)
 
-            # exclude duplicates within this block
+            # exclude already accepted
             cand_lin = cand_lin[~accepted_mask[cand_lin]]
 
             # optionally exclude globally tried
@@ -1382,15 +1384,15 @@ class PRBCD(SparseAttack):
             if cand_lin.numel() == 0:
                 continue
 
-            # decode to pairs for scoring
+            # decode for scoring
             if self.make_undirected:
-                cand_ei = PRBCD.linear_to_triu_idx(self.n, cand_lin)
+                cand_ei = SelectorAttack.linear_to_triu_idx(self.n, cand_lin)
             else:
-                cand_ei = PRBCD.linear_to_full_idx(self.n, cand_lin)
+                cand_ei = SelectorAttack.linear_to_full_idx(self.n, cand_lin)
                 is_not_self = cand_ei[0] != cand_ei[1]
                 cand_lin = cand_lin[is_not_self]
                 cand_ei = cand_ei[:, is_not_self]
-                if cand_lin.numel() == 0:
+                if cand_ei.numel() == 0:
                     continue
 
             # score
@@ -1398,47 +1400,45 @@ class PRBCD(SparseAttack):
                 logits = self.lp_model.edge_head(h, cand_ei).view(-1)
                 scores = torch.sigmoid(logits)
 
-            # accept those above threshold
             keep = scores >= float(tau)
-            cand_keep = cand_lin[keep]
-
-            if cand_keep.numel() == 0:
+            if not bool(keep.any()):
                 continue
 
-            # add until block is full
-            need = int(self.block_size) - len(accepted)
-            cand_keep = cand_keep[:need]
+            cand_lin = cand_lin[keep]
+            cand_ei = cand_ei[:, keep]
 
-            accepted.extend(cand_keep.tolist())
-            accepted_mask[cand_keep] = True
+            need = target - len(accepted_ei)
+            cand_lin = cand_lin[:need]
+            cand_ei = cand_ei[:, :need]
 
-        if len(accepted) < int(self.block_size):
+            accepted_ei.append(cand_ei)
+            accepted_mask[cand_lin] = True
+
+        if len(accepted_ei) == 0:
+            raise RuntimeError("No edges accepted at all. Threshold tau too high?")
+
+        edge_index_pairs = torch.cat(accepted_ei, dim=1)
+
+        if edge_index_pairs.size(1) < target:
             raise RuntimeError(
-                f"Could not fill block_size={self.block_size} with threshold tau={tau}. "
-                f"Got {len(accepted)} after {tries} tries. Lower tau or increase max_sampling_tries."
+                f"Could not sample n_perturbations={target} edges with threshold tau={tau}. "
+                f"Got {edge_index_pairs.size(1)} after {tries} tries."
             )
 
-        # finalize current_search_space exactly like PRBCD
-        self.current_search_space = torch.tensor(accepted, device=self.device, dtype=torch.long)
-        self.current_search_space = torch.unique(self.current_search_space, sorted=True)
-
-        if self.make_undirected:
-            self.modified_edge_index = PRBCD.linear_to_triu_idx(self.n, self.current_search_space)
-        else:
-            self.modified_edge_index = PRBCD.linear_to_full_idx(self.n, self.current_search_space)
-            is_not_self = self.modified_edge_index[0] != self.modified_edge_index[1]
-            self.current_search_space = self.current_search_space[is_not_self]
-            self.modified_edge_index = self.modified_edge_index[:, is_not_self]
-
-        self.perturbed_edge_weight = torch.full_like(
-            self.current_search_space, self.eps, dtype=torch.float32, requires_grad=True
-        )
+        # final sanity
+        if edge_index_pairs.size() != (2, target):
+            raise RuntimeError("Internal: output edge_index_pairs has wrong shape.")
 
         if exclude_tried:
-            self.tried_mask[self.current_search_space] = True
+            # mark tried using the internally tracked linear indices
+            # (we need to recompute them once here)
+            if self.make_undirected:
+                lin = SelectorAttack.triu_idx_to_linear(self.n, edge_index_pairs)
+            else:
+                lin = SelectorAttack.full_idx_to_linear(self.n, edge_index_pairs)
+            self.tried_mask[lin] = True
 
-        if self.current_search_space.size(0) < n_perturbations:
-            raise RuntimeError("Block has fewer unique edges than n_perturbations. Lower tau or increase sampling.")
+        return edge_index_pairs
 
     def init_search_space_from_y_out(self, y_out: torch.Tensor, n_perturbations: int = 0):
         """
@@ -1462,9 +1462,9 @@ class PRBCD(SparseAttack):
 
         # ---- build modified edge index
         if self.make_undirected:
-            self.modified_edge_index = PRBCD.linear_to_triu_idx(self.n, self.current_search_space)
+            self.modified_edge_index = SelectorAttack.linear_to_triu_idx(self.n, self.current_search_space)
         else:
-            self.modified_edge_index = PRBCD.linear_to_full_idx(self.n, self.current_search_space)
+            self.modified_edge_index = SelectorAttack.linear_to_full_idx(self.n, self.current_search_space)
             is_not_self_loop = self.modified_edge_index[0] != self.modified_edge_index[1]
             self.current_search_space = self.current_search_space[is_not_self_loop]
             self.modified_edge_index = self.modified_edge_index[:, is_not_self_loop]
@@ -1961,9 +1961,9 @@ class PRBCD(SparseAttack):
 
         # build modified_edge_index for this augmented block
         if self.make_undirected:
-            self.modified_edge_index = PRBCD.linear_to_triu_idx(self.n, self.current_search_space)
+            self.modified_edge_index = SelectorAttack.linear_to_triu_idx(self.n, self.current_search_space)
         else:
-            self.modified_edge_index = PRBCD.linear_to_full_idx(self.n, self.current_search_space)
+            self.modified_edge_index = SelectorAttack.linear_to_full_idx(self.n, self.current_search_space)
             is_not_self_loop = self.modified_edge_index[0] != self.modified_edge_index[1]
             self.current_search_space = self.current_search_space[is_not_self_loop]
             self.modified_edge_index = self.modified_edge_index[:, is_not_self_loop]
@@ -2399,7 +2399,7 @@ class PRBCD(SparseAttack):
         full_idx = torch.stack([uu, vv], dim=0)  # (2, K')
 
         # convert to PRBCD's linear indexing
-        lin_idx = PRBCD.triu_idx_to_linear_idx(self.n, full_idx)
+        lin_idx = SelectorAttack.triu_idx_to_linear_idx(self.n, full_idx)
 
         self.current_search_space = lin_idx
         self.modified_edge_index = full_idx
@@ -2518,7 +2518,7 @@ class PRBCD(SparseAttack):
         topk_idx = torch.topk(edge_uncertainty_all, k=K, largest=True).indices
 
         block_pairs = all_edge_index[:, topk_idx].detach().cpu()  # (2, K)
-        block_lin = PRBCD.triu_idx_to_linear_idx(N, block_pairs)  # (K,), CPU
+        block_lin = SelectorAttack.triu_idx_to_linear_idx(N, block_pairs)  # (K,), CPU
 
         # IMPORTANT: match PR-BCD expectations
         self.current_search_space = block_lin.detach().to(device)  # (K,)
@@ -2587,9 +2587,9 @@ class PRBCD(SparseAttack):
 
         # --- 5) Set modified_edge_index exactly like sample_random_block ---
         if self.make_undirected:
-            self.modified_edge_index = PRBCD.linear_to_triu_idx(N, self.current_search_space)
+            self.modified_edge_index = SelectorAttack.linear_to_triu_idx(N, self.current_search_space)
         else:
-            self.modified_edge_index = PRBCD.linear_to_full_idx(N, self.current_search_space)
+            self.modified_edge_index = SelectorAttack.linear_to_full_idx(N, self.current_search_space)
             # drop self-loops in the directed/full case
             is_not_self_loop = self.modified_edge_index[0] != self.modified_edge_index[1]
             if not torch.all(is_not_self_loop):
@@ -2664,7 +2664,7 @@ class PRBCD(SparseAttack):
         chosen = topk.indices  # indices into iu/ju
 
         block_pairs = torch.stack([iu[chosen].cpu(), ju[chosen].cpu()], dim=0).contiguous()  # (2, K)
-        block_lin = PRBCD.triu_idx_to_linear_idx(N, block_pairs)  # (K,), CPU
+        block_lin = SelectorAttack.triu_idx_to_linear_idx(N, block_pairs)  # (K,), CPU
 
         self.current_search_space = block_lin.detach().to(device)  # (K,)
         self.modified_edge_index = block_pairs.detach().to(device)  # (2, K)
@@ -2732,9 +2732,9 @@ class PRBCD(SparseAttack):
 
         # --- 5) Set modified_edge_index exactly like sample_random_block ---
         if self.make_undirected:
-            self.modified_edge_index = PRBCD.linear_to_triu_idx(N, self.current_search_space)
+            self.modified_edge_index = SelectorAttack.linear_to_triu_idx(N, self.current_search_space)
         else:
-            self.modified_edge_index = PRBCD.linear_to_full_idx(N, self.current_search_space)
+            self.modified_edge_index = SelectorAttack.linear_to_full_idx(N, self.current_search_space)
             # drop self-loops in the directed/full case
             is_not_self_loop = self.modified_edge_index[0] != self.modified_edge_index[1]
             if not torch.all(is_not_self_loop):
@@ -2842,9 +2842,9 @@ class PRBCD(SparseAttack):
 
         # --- 5) Set modified_edge_index like sample_random_block ---
         if self.make_undirected:
-            self.modified_edge_index = PRBCD.linear_to_triu_idx(N, self.current_search_space)
+            self.modified_edge_index = SelectorAttack.linear_to_triu_idx(N, self.current_search_space)
         else:
-            self.modified_edge_index = PRBCD.linear_to_full_idx(N, self.current_search_space)
+            self.modified_edge_index = SelectorAttack.linear_to_full_idx(N, self.current_search_space)
             is_not_self_loop = self.modified_edge_index[0] != self.modified_edge_index[1]
             if not torch.all(is_not_self_loop):
                 self.current_search_space = self.current_search_space[is_not_self_loop]
@@ -2916,7 +2916,7 @@ class PRBCD(SparseAttack):
                 return torch.empty(0, dtype=torch.long, device=dev)
             uu, vv = uu[mask], vv[mask]
             full_idx = torch.stack([uu, vv], dim=0)
-            return PRBCD.triu_idx_to_linear_idx(N, full_idx)
+            return SelectorAttack.triu_idx_to_linear_idx(N, full_idx)
 
         # --- (3) candidate edges: intra-TopK and incident to outside ---
         # Intra-TopK
@@ -3009,7 +3009,7 @@ class PRBCD(SparseAttack):
 
         # --- finalize PR-BCD tensors ---
         self.current_search_space = sel_lin
-        self.modified_edge_index = PRBCD.linear_to_triu_idx(N, sel_lin)
+        self.modified_edge_index = SelectorAttack.linear_to_triu_idx(N, sel_lin)
         self.perturbed_edge_weight = torch.full(
             (sel_lin.numel(),), self.eps, dtype=torch.float32, device=dev, requires_grad=True
         )
@@ -3147,7 +3147,7 @@ class PRBCD(SparseAttack):
             if mask.sum() == 0:
                 return torch.empty(0, dtype=torch.long, device=dev)
             uu, vv = uu[mask], vv[mask]
-            return PRBCD.triu_idx_to_linear_idx(N, torch.stack([uu, vv], dim=0))
+            return SelectorAttack.triu_idx_to_linear_idx(N, torch.stack([uu, vv], dim=0))
 
         # 4) Pick k nodes — either greedy top‑k or Gumbel‑top‑k over softmax(node_score/τ)
         if k_nodes is None:
@@ -3156,7 +3156,7 @@ class PRBCD(SparseAttack):
 
         if gumbel_nodes:
             node_logits = torch.log_softmax(node_score / max(1e-6, float(tau_nodes)), dim=0)
-            topk_nodes = PRBCD._gumbel_topk(self ,node_logits, k).to(dev)
+            topk_nodes = SelectorAttack._gumbel_topk(self, node_logits, k).to(dev)
         else:
             topk_nodes = torch.topk(node_score, k=k, largest=True).indices.to(dev)
 
@@ -3255,7 +3255,7 @@ class PRBCD(SparseAttack):
 
         # 8) Finalize PR-BCD block tensors
         self.current_search_space = sel_lin
-        self.modified_edge_index = PRBCD.linear_to_triu_idx(N, sel_lin)
+        self.modified_edge_index = SelectorAttack.linear_to_triu_idx(N, sel_lin)
         self.perturbed_edge_weight = torch.full((sel_lin.numel(),), self.eps, dtype=torch.float32, device=dev,
                                                 requires_grad=True)
 
@@ -3313,7 +3313,7 @@ class PRBCD(SparseAttack):
             intra_u, intra_v = comb[:, 0], comb[:, 1]
             uu = torch.minimum(intra_u, intra_v)
             vv = torch.maximum(intra_u, intra_v)
-            intra_lin = PRBCD.triu_idx_to_linear_idx(N, torch.stack([uu, vv], dim=0))
+            intra_lin = SelectorAttack.triu_idx_to_linear_idx(N, torch.stack([uu, vv], dim=0))
             intra_scores = node_scores[intra_u] + node_scores[intra_v]
         else:
             intra_lin = torch.empty(0, dtype=torch.long, device=dev)
@@ -3360,7 +3360,7 @@ class PRBCD(SparseAttack):
                 uu = uu[uniq_idx];
                 vv = vv[uniq_idx];
                 ss = ss[uniq_idx]
-                inc_lin = PRBCD.triu_idx_to_linear_idx(N, torch.stack([uu, vv], dim=0))
+                inc_lin = SelectorAttack.triu_idx_to_linear_idx(N, torch.stack([uu, vv], dim=0))
                 inc_scores = ss
 
         # ---- assemble by quota ----
@@ -3408,8 +3408,8 @@ class PRBCD(SparseAttack):
 
         kept_lin = self.current_search_space[keep_idx].to(self.device)
         kept_w = self.perturbed_edge_weight[keep_idx].to(self.device)
-        kept_pairs = PRBCD.linear_to_triu_idx(self.n, kept_lin) if self.make_undirected \
-            else PRBCD.linear_to_full_idx(self.n, kept_lin)
+        kept_pairs = SelectorAttack.linear_to_triu_idx(self.n, kept_lin) if self.make_undirected \
+            else SelectorAttack.linear_to_full_idx(self.n, kept_lin)
 
         # --- selector update (PGD teacher) ---
         self._selector_online_step_pgd()
@@ -3436,8 +3436,8 @@ class PRBCD(SparseAttack):
                 all_lin = kept_lin
                 pos_kept = torch.arange(kept_lin.numel(), device=self.device, dtype=torch.long)
 
-            self.modified_edge_index = PRBCD.linear_to_triu_idx(self.n, all_lin) if self.make_undirected \
-                else PRBCD.linear_to_full_idx(self.n, all_lin)
+            self.modified_edge_index = SelectorAttack.linear_to_triu_idx(self.n, all_lin) if self.make_undirected \
+                else SelectorAttack.linear_to_full_idx(self.n, all_lin)
 
             new_w = torch.full((all_lin.numel(),), self.eps, dtype=torch.float32, device=self.device)
             new_w[pos_kept] = kept_w
@@ -3541,9 +3541,9 @@ class PRBCD(SparseAttack):
             )
 
             if self.make_undirected:
-                self.modified_edge_index = PRBCD.linear_to_triu_idx(self.n, self.current_search_space)
+                self.modified_edge_index = SelectorAttack.linear_to_triu_idx(self.n, self.current_search_space)
             else:
-                self.modified_edge_index = PRBCD.linear_to_full_idx(self.n, self.current_search_space)
+                self.modified_edge_index = SelectorAttack.linear_to_full_idx(self.n, self.current_search_space)
 
             # Merge existing weights with new edge weights
             perturbed_edge_weight_old = self.perturbed_edge_weight.clone()
@@ -3615,8 +3615,8 @@ class PRBCD(SparseAttack):
         # helper: decode lin -> edge_index for scoring
         def decode_lin(cand_lin: torch.Tensor) -> torch.Tensor:
             if self.make_undirected:
-                return PRBCD.linear_to_triu_idx(self.n, cand_lin)
-            ei = PRBCD.linear_to_full_idx(self.n, cand_lin)
+                return SelectorAttack.linear_to_triu_idx(self.n, cand_lin)
+            ei = SelectorAttack.linear_to_full_idx(self.n, cand_lin)
             is_not_self = ei[0] != ei[1]
             return ei[:, is_not_self], cand_lin[is_not_self]
 
@@ -3657,9 +3657,9 @@ class PRBCD(SparseAttack):
 
             # 3) decode and (optionally) filter self-loops
             if self.make_undirected:
-                cand_ei = PRBCD.linear_to_triu_idx(self.n, cand_lin)
+                cand_ei = SelectorAttack.linear_to_triu_idx(self.n, cand_lin)
             else:
-                cand_ei = PRBCD.linear_to_full_idx(self.n, cand_lin)
+                cand_ei = SelectorAttack.linear_to_full_idx(self.n, cand_lin)
                 is_not_self = cand_ei[0] != cand_ei[1]
                 cand_lin = cand_lin[is_not_self]
                 cand_ei = cand_ei[:, is_not_self]
@@ -3690,9 +3690,9 @@ class PRBCD(SparseAttack):
             )
 
             if self.make_undirected:
-                self.modified_edge_index = PRBCD.linear_to_triu_idx(self.n, self.current_search_space)
+                self.modified_edge_index = SelectorAttack.linear_to_triu_idx(self.n, self.current_search_space)
             else:
-                self.modified_edge_index = PRBCD.linear_to_full_idx(self.n, self.current_search_space)
+                self.modified_edge_index = SelectorAttack.linear_to_full_idx(self.n, self.current_search_space)
 
             self.perturbed_edge_weight = torch.full_like(
                 self.current_search_space, self.eps, dtype=torch.float32
@@ -3724,30 +3724,27 @@ class PRBCD(SparseAttack):
             n_perturbations: int,
             tau: float = 0.8,
             max_sampling_tries: int = 2_000_000,
-            score_batch_size: int = 125000,
+            score_batch_size: int = 1000,
             rng_seed: int = 0,
             exclude_tried: bool = True,
     ):
         """
-        Resampling function, that encodes the link-pred GNN on the *current perturbed graph*
+        Drop-in replacement that encodes the link-pred GNN on the *current perturbed graph*
         (via self.get_modified_adj()) instead of the unperturbed input `graph`.
 
         Notes:
           - We binarize the current attacked adjacency for the LP encoder by default:
                 keep edges with edge_weight > 0.5
             (Adjust the threshold below if your LP model expects something else.)
-          - Candidate sampling is done from a restricted "allowed pool" derived from a single
-            combined block mask (block + tried), rather than sampling from the full space
-            and then cutting.
+          - Everything else follows your original logic.
         """
-
         import torch
 
         if not hasattr(self, "lp_model") or self.lp_model is None:
             raise RuntimeError("self.lp_model is not set.")
 
         # -----------------------------
-        # tried_mask init
+        # tried_mask init (same intent)
         # -----------------------------
         if exclude_tried and (not hasattr(self, "tried_mask") or self.tried_mask is None):
             self.tried_mask = torch.zeros(self.n_possible_edges, device=self.device, dtype=torch.bool)
@@ -3782,11 +3779,9 @@ class PRBCD(SparseAttack):
             edge_index_mod = edge_index_mod.to(self.device)
             edge_weight_mod = edge_weight_mod.to(self.device).float()
 
-            edge_index_struct = edge_index_mod
-
-            '''# Binarize attacked adjacency for message passing
+            # Binarize attacked adjacency for message passing
             present = edge_weight_mod > 0.5
-            edge_index_struct = edge_index_mod[:, present]'''
+            edge_index_struct = edge_index_mod[:, present]
 
         # encode once
         self.lp_model = self.lp_model.to(self.device).eval()
@@ -3796,53 +3791,37 @@ class PRBCD(SparseAttack):
         g = torch.Generator(device=self.device)
         g.manual_seed(int(rng_seed))
 
-        # -----------------------------
         # masks for uniqueness within the block
-        # -----------------------------
         block_mask = torch.zeros(self.n_possible_edges, device=self.device, dtype=torch.bool)
-        if self.current_search_space.numel() > 0:
-            block_mask[self.current_search_space] = True
-
-        # Combine masks: "blocked" = in block OR (optionally) already tried
-        blocked_mask = block_mask.clone()
-        if exclude_tried:
-            blocked_mask |= self.tried_mask
-
-        # Allowed pool: indices we can sample from (NOT blocked)
-        allowed_pool = torch.nonzero(~blocked_mask, as_tuple=False).view(-1)
+        block_mask[self.current_search_space] = True
 
         accepted = []
         tries = 0
         n_needed = int(self.block_size - self.current_search_space.numel())
 
-        # If we already have enough, skip refill loop
-        if n_needed < 0:
-            n_needed = 0
-
         while len(accepted) < n_needed and tries < int(max_sampling_tries):
             tries += 1
 
-            # Nothing left to sample from -> cannot refill
-            if allowed_pool.numel() == 0:
-                break
-
-            # sample directly from allowed pool (restricted sampling)
-            k = min(int(score_batch_size), int(allowed_pool.numel()))
-            idx = torch.randint(allowed_pool.numel(), (k,), device=self.device, generator=g)
-            cand_lin = allowed_pool[idx]
+            cand_lin = torch.randint(
+                self.n_possible_edges, (int(score_batch_size),), device=self.device, generator=g
+            )
             cand_lin = torch.unique(cand_lin, sorted=False)
 
-            # Pool can be slightly stale because we accept edges and update block_mask.
-            # Filter out edges that have become blocked since pool creation.
+            # exclude already in block
             cand_lin = cand_lin[~block_mask[cand_lin]]
+
+            # optional exclude tried
+            if exclude_tried:
+                cand_lin = cand_lin[~self.tried_mask[cand_lin]]
+
             if cand_lin.numel() == 0:
                 continue
 
             # decode to pairs
             if self.make_undirected:
-                cand_ei = PRBCD.linear_to_triu_idx(self.n, cand_lin)
+                cand_ei = SelectorAttack.linear_to_triu_idx(self.n, cand_lin)
             else:
-                cand_ei = PRBCD.linear_to_full_idx(self.n, cand_lin)
+                cand_ei = SelectorAttack.linear_to_full_idx(self.n, cand_lin)
                 is_not_self = cand_ei[0] != cand_ei[1]
                 cand_lin = cand_lin[is_not_self]
                 cand_ei = cand_ei[:, is_not_self]
@@ -3861,19 +3840,8 @@ class PRBCD(SparseAttack):
 
             need = n_needed - len(accepted)
             cand_keep = cand_keep[:need]
-
             accepted.extend(cand_keep.tolist())
-
-            # update block_mask for uniqueness
             block_mask[cand_keep] = True
-
-            # also update blocked_mask + allowed_pool if you want to keep pool tight
-            # (this avoids repeatedly drawing now-blocked edges)
-            if cand_keep.numel() > 0:
-                blocked_mask[cand_keep] = True
-                # remove newly blocked edges from pool
-                # (cheap: just filter pool by blocked_mask)
-                allowed_pool = allowed_pool[~blocked_mask[allowed_pool]]
 
         if len(accepted) < n_needed:
             raise RuntimeError(
@@ -3905,9 +3873,9 @@ class PRBCD(SparseAttack):
 
         # rebuild modified_edge_index from new_space
         if self.make_undirected:
-            self.modified_edge_index = PRBCD.linear_to_triu_idx(self.n, self.current_search_space)
+            self.modified_edge_index = SelectorAttack.linear_to_triu_idx(self.n, self.current_search_space)
         else:
-            self.modified_edge_index = PRBCD.linear_to_full_idx(self.n, self.current_search_space)
+            self.modified_edge_index = SelectorAttack.linear_to_full_idx(self.n, self.current_search_space)
 
         self.perturbed_edge_weight = new_w
 
@@ -3998,10 +3966,10 @@ class PRBCD(SparseAttack):
             if self.make_undirected:
                 uu, vv = (u, v) if u < v else (v, u)
                 full = torch.tensor([[uu], [vv]], dtype=torch.long)
-                return int(PRBCD.triu_idx_to_linear_idx(self.n, full).item())
+                return int(SelectorAttack.triu_idx_to_linear_idx(self.n, full).item())
             else:
                 full = torch.tensor([[u], [v]], dtype=torch.long)
-                return int(PRBCD.full_to_linear_idx(self.n, full).item())
+                return int(SelectorAttack.full_to_linear_idx(self.n, full).item())
 
         # --- sample candidates and evaluate ---
         rng = np.random.default_rng(rng_seed)
@@ -4121,7 +4089,7 @@ class PRBCD(SparseAttack):
                    else torch.ones(ei_base.size(1), device=device, dtype=torch.float32)).contiguous()
 
         # ---- build undirected membership bitset
-        present = PRBCD._build_uppertri_bitset(ei_base, n)  # (num_pairs,) bool
+        present = SelectorAttack._build_uppertri_bitset(ei_base, n)  # (num_pairs,) bool
 
         E = ei_base.size(1)
         dir_pos = torch.full((n, n), -1, dtype=torch.int32, device=device)
@@ -4289,7 +4257,7 @@ class PRBCD(SparseAttack):
                 # compute linear indices (upper-tri)
                 # full_idx shape (2, m)
                 full_idx = torch.stack([uu, vv], dim=0)
-                k_all = PRBCD.triu_idx_to_linear_idx(n, full_idx).long()  # (m,)
+                k_all = SelectorAttack.triu_idx_to_linear_idx(n, full_idx).long()  # (m,)
 
                 # filter: not already seen
                 not_seen = ~seen[k_all]
@@ -4326,7 +4294,7 @@ class PRBCD(SparseAttack):
         # -------- switch: sampling mode --------
         if mode == "one_sample":
             while (flips_done == 0 or flips_done < n_candidates_one_sample) and tries < max_sampling_tries:
-                u, v, action, k_lin = PRBCD._sample_one_flip(n, present, g, device)
+                u, v, action, k_lin = SelectorAttack._sample_one_flip(n, present, g, device)
                 tries += 1
                 if seen[k_lin]:
                     continue
@@ -4397,7 +4365,7 @@ class PRBCD(SparseAttack):
 
         elif mode == "k_action":
             while (flips_done == 0 or flips_done < n_candidates_k_sample) and tries < max_sampling_tries:
-                batch = PRBCD._sample_k_flips(
+                batch = SelectorAttack._sample_k_flips(
                     n=n,
                     present=present,
                     g=g,
@@ -4435,7 +4403,7 @@ class PRBCD(SparseAttack):
 
         elif mode == "k_action_individual":
             while (flips_done == 0 or flips_done < n_candidates_k_sample) and tries < max_sampling_tries:
-                batch = PRBCD._sample_k_flips(
+                batch = SelectorAttack._sample_k_flips(
                     n=n,
                     present=present,
                     g=g,
@@ -4496,7 +4464,7 @@ class PRBCD(SparseAttack):
             max_root_tries = 100_000
 
             while (flips_done == 0 or flips_done < n_candidates_k_hop_sample) and tries < max_sampling_tries:
-                batch = PRBCD._sample_khop_flips(
+                batch = SelectorAttack._sample_khop_flips(
                     n=n,
                     present=present,
                     g=g,
@@ -4727,7 +4695,7 @@ class PRBCD(SparseAttack):
             dir_pos[ei_sub[0], ei_sub[1]] = torch.arange(E_sub, device=device, dtype=torch.int32)
 
         # membership bitset for local undirected presence
-        present = PRBCD._build_uppertri_bitset(ei_sub, m)  # (m*(m-1)//2,) bool
+        present = SelectorAttack._build_uppertri_bitset(ei_sub, m)  # (m*(m-1)//2,) bool
 
         # ---------------- clean forward on SUBGRAPH ONLY ----------------
         # IMPORTANT: This assumes your attacked_model can run on (attr_sub, adj_sub)
@@ -4810,7 +4778,7 @@ class PRBCD(SparseAttack):
         # ---------------- main loop: one_sample on SUBGRAPH, endpoint labels on SUBGRAPH ----------------
         while (flips_done == 0 or flips_done < n_candidates_one_sample) and tries < max_sampling_tries:
             # sample one flip in LOCAL subgraph index space
-            u_l, v_l, action, k_lin_local = PRBCD._sample_one_flip(m, present, g, device)
+            u_l, v_l, action, k_lin_local = SelectorAttack._sample_one_flip(m, present, g, device)
             tries += 1
 
             # map LOCAL endpoints -> GLOBAL endpoints
@@ -4935,7 +4903,7 @@ class PRBCD(SparseAttack):
                    else torch.ones(ei_base.size(1), device=device, dtype=torch.float32)).contiguous()
 
         # ---- undirected membership bitset
-        present = PRBCD._build_uppertri_bitset(ei_base, n)
+        present = SelectorAttack._build_uppertri_bitset(ei_base, n)
 
         E = ei_base.size(1)
         dir_pos = torch.full((n, n), -1, dtype=torch.int32, device=device)
@@ -5001,7 +4969,7 @@ class PRBCD(SparseAttack):
         # ---- k_action loop ----
         while (flips_done == 0 or flips_done < n_candidates_k_sample) and tries < max_sampling_tries:
 
-            batch = PRBCD._sample_k_flips(
+            batch = SelectorAttack._sample_k_flips(
                 n=n,
                 present=present,
                 g=g,
@@ -5048,7 +5016,7 @@ class PRBCD(SparseAttack):
         num_pairs = n * (n - 1) // 2
         if num_pairs == 0:
             return torch.zeros(0, dtype=torch.bool, device=edge_index.device)
-        lin = PRBCD.pairs_to_linear_uppertri(edge_index, n)  # (E',)
+        lin = SelectorAttack.pairs_to_linear_uppertri(edge_index, n)  # (E',)
         if lin.numel() > 0:
             lin = torch.unique(lin, sorted=False)
         present = torch.zeros(num_pairs, dtype=torch.bool, device=edge_index.device)
@@ -5099,7 +5067,7 @@ class PRBCD(SparseAttack):
         """
         num_pairs = n * (n - 1) // 2
         k = int(torch.randint(num_pairs, (1,), generator=g, device=device).item())
-        uv = PRBCD.linear_to_triu_idx(n, torch.tensor([k], device=device))  # (2,1)
+        uv = SelectorAttack.linear_to_triu_idx(n, torch.tensor([k], device=device))  # (2,1)
         u = int(uv[0, 0].item())
         v = int(uv[1, 0].item())
         action = "del" if present[k].item() else "add"
@@ -5135,7 +5103,7 @@ class PRBCD(SparseAttack):
             pick = mask[perm[:k]]
 
         # map linear -> (u,v) with u<v
-        uv = PRBCD.linear_to_triu_idx(n, pick.long())  # shape (2, m)
+        uv = SelectorAttack.linear_to_triu_idx(n, pick.long())  # shape (2, m)
         u = uv[0].to(torch.int64)
         v = uv[1].to(torch.int64)
 
@@ -5223,7 +5191,7 @@ class PRBCD(SparseAttack):
                 dim=0,
             )  # shape (2, m)
 
-            k_lin_all = PRBCD.pairs_to_linear_uppertri(pair_ei, n).long()  # (m,)
+            k_lin_all = SelectorAttack.pairs_to_linear_uppertri(pair_ei, n).long()  # (m,)
 
             # 5) keep only unseen pairs
             unseen_mask = (~seen[k_lin_all]).nonzero(as_tuple=False).flatten()
@@ -5604,7 +5572,7 @@ class PRBCD(SparseAttack):
         ]
 
         if csv_path is None:
-            csv_path = PRBCD.make_selector_gnn_log_path(
+            csv_path = SelectorAttack.make_selector_gnn_log_path(
                 ads_mode=self.ads_mode,
                 drop_mode=self.drop_mode,
                 k_samples_batch=self.k_samples_batch,
@@ -5688,8 +5656,8 @@ class PRBCD(SparseAttack):
                 acc_pos = float((preds_val[yv == 1] == 1).float().mean().item()) if (yv == 1).any() else float("nan")
                 acc_neg = float((preds_val[yv == 0] == 0).float().mean().item()) if (yv == 0).any() else float("nan")
 
-                tp, fp, tn, fn = PRBCD._confusion_counts(preds_val, yv)
-                auc, ap = PRBCD._safe_auc_ap_sklearn(probs_val, yv)
+                tp, fp, tn, fn = SelectorAttack._confusion_counts(preds_val, yv)
+                auc, ap = SelectorAttack._safe_auc_ap_sklearn(probs_val, yv)
 
                 pmin = float(probs_val.min().item())
                 pmean = float(probs_val.mean().item())
@@ -6084,16 +6052,16 @@ class PRBCD(SparseAttack):
         #self.current_search_space = self.current_search_space[
         #                                torch.randperm(self.current_search_space.size(0))[:self.block_size]
         #                                ]
-        self.modified_edge_index = PRBCD.linear_to_triu_idx(self.n, self.current_search_space)
+        self.modified_edge_index = SelectorAttack.linear_to_triu_idx(self.n, self.current_search_space)
         # if the new logic is usable this method is redundant
         return
 
     def edges_to_current_search_space(self, n: int):
         # first we cut edges so that index build a triu matrix
         # (function triu_idx_to_linear only support triu matrix idx)
-        self.edges_to_attack_index = PRBCD.flip_matrix_idx_to_triu_idx(self.edges_to_attack_index)
+        self.edges_to_attack_index = SelectorAttack.flip_matrix_idx_to_triu_idx(self.edges_to_attack_index)
         # we then build linear idx which is the current_search_space
-        lin_idx = PRBCD.triu_idx_to_linear_idx(n, self.edges_to_attack_index)
+        lin_idx = SelectorAttack.triu_idx_to_linear_idx(n, self.edges_to_attack_index)
         lin_idx = torch.unique(lin_idx, sorted=True)
         return lin_idx
 
@@ -6326,7 +6294,7 @@ class PRBCD(SparseAttack):
 
     @staticmethod
     def flip_matrix_idx_to_triu_idx(matrix: torch.tensor) -> torch.tensor:
-        matrix = PRBCD.cut_diagonal_entries(matrix)
+        matrix = SelectorAttack.cut_diagonal_entries(matrix)
         row_idx = matrix[0]
         col_idx = matrix[1]
         # flip all entries of matrix where the entry (x,y) holds x>y
@@ -6444,7 +6412,7 @@ class PRBCD(SparseAttack):
 
     @staticmethod
     def tried_add_del_proportion(tried_set, edge_index_struct, n):
-        undirected_edges = PRBCD._build_undirected_edge_set(edge_index_struct)
+        undirected_edges = SelectorAttack._build_undirected_edge_set(edge_index_struct)
 
         n_del_like = 0  # pair exists in graph -> would be a deletion candidate
         n_add_like = 0  # pair not in graph -> would be an addition candidate
@@ -6455,7 +6423,7 @@ class PRBCD(SparseAttack):
             if k_lin < 0 or k_lin >= n * (n - 1) // 2:
                 missing_decode += 1
                 continue
-            u, v = PRBCD._uppertri_decode(k_lin, n)
+            u, v = SelectorAttack._uppertri_decode(k_lin, n)
             if (u, v) in undirected_edges:
                 n_del_like += 1
             else:

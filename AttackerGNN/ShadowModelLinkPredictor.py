@@ -55,8 +55,6 @@ class LinkPredictionGNN(nn.Module):
         in_dim,
         hidden_dim,
         out_dim,
-        num_layers=4,
-        dropout=0.3,
     ):
         super().__init__()
 
@@ -64,8 +62,6 @@ class LinkPredictionGNN(nn.Module):
             in_dim=in_dim,
             hidden_dim=hidden_dim,
             out_dim=out_dim,
-            #num_layers=num_layers,
-            #dropout=dropout,
         )
 
         self.edge_head = EdgeMLP(out_dim)

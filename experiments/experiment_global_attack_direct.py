@@ -111,7 +111,7 @@ def run(ads_mode, graph, data_dir: str, dataset: str, attack: str, attack_params
             # run the attack (may load from cache or actually optimize)
             gradient = run_global_attack(ads_mode=ads_mode,graph=graph, dataset=dataset,
                 epsilon=epsilon, m=m, storage=storage, pert_adj_storage_type=pert_adj_storage_type, pert_attr_storage_type=pert_attr_storage_type,
-                pert_params=pert_params, adversary=adversary, model_label=model_label, semi=semi, use_cert=use_cert
+                pert_params=pert_params, adversary=adversary, model_label=model_label, semi=semi, use_cert=use_cert, seed=seed,
             )
             last_gradient = gradient  # keep for return
 

@@ -95,7 +95,7 @@ def prepare_attack_experiment(data_dir: str, dataset: str, attack: str, attack_p
 
 
 def run_global_attack(ads_mode, graph, dataset, epsilon, m, storage, pert_adj_storage_type, pert_attr_storage_type,
-                      pert_params, adversary, model_label,semi, use_cert):
+                      pert_params, adversary, model_label,semi, use_cert, seed):
 
     n_perturbations = int(round(epsilon * m))
 
@@ -118,6 +118,7 @@ def run_global_attack(ads_mode, graph, dataset, epsilon, m, storage, pert_adj_st
             semi=semi,
             use_cert=use_cert,
             dataset=dataset,
+            seed=seed,
         )
 
         if needs_graph:

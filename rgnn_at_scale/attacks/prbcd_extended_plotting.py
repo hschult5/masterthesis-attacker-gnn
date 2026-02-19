@@ -1,6 +1,8 @@
 import copy
 import logging
 
+import time
+
 from collections import defaultdict
 import math
 from typing import List, Tuple, Optional, Set, Dict
@@ -14,6 +16,7 @@ import torch.nn.functional as F
 from sklearn.metrics import roc_auc_score, average_precision_score
 import torch_sparse
 from torch_sparse import SparseTensor
+from scipy.stats import spearmanr
 #from AttackerGNN.PreEdgeSelector import PRBCDSelectorGNN
 from AttackerGNN.PriorSelector import PriorSelector
 from AttackerGNN.NodeBlockScorer import NodeBlockScorer
@@ -33,7 +36,7 @@ from datetime import datetime
 from rgnn_at_scale.helper.csvLogger import CSVMetricLogger
 
 
-class PRBCD(SparseAttack):
+class PRBCDExtendedPlotting(SparseAttack):
     """Sampled and hence scalable PGD attack for graph data.
     """
 
@@ -125,7 +128,8 @@ class PRBCD(SparseAttack):
             Number of edges to be perturbed (assuming an undirected graph)
         """
         self.semi = semi
-        self.use_cert = use_cert
+        plot_gen = use_cert
+        self.use_cert = plot_gen
         self.dataset = kwargs.get('dataset')
         self.seed = kwargs.get('seed')
 
@@ -145,44 +149,200 @@ class PRBCD(SparseAttack):
 
         # Sample initial search space (Algorithm 1, line 3-4)
 
-        if use_cert in ("sampling_with_prior",):
-            print(use_cert, "run sampling_with_prior")
-            self.sample_block_from_prior_gumbel(n_perturbations=n_perturbations, tau=1.0)
-        elif use_cert in ("selector_block",):  # here is my selector
-            print(use_cert, "-> using selector to build the initial block")
-            self.sample_block_from_selector(n_perturbations=n_perturbations, k_nodes=350)
-        elif use_cert in ("selector_block_pgd",):  # here is my selector
-            print(use_cert, "-> using selector to build the initial block")
-            self.sample_block_from_pgdtopk_direct()
-        elif use_cert in ("selector_block_linkpred",):
-            print(use_cert, "-> using selector link pred")
-            self.sample_block_from_linkpred_gnn(graph=graph,n_perturbations=n_perturbations)
-        elif use_cert in ("selector_block_linkpred_all",):
-            print(use_cert, "-> using selector link pred all")
-            self.sample_block_from_linkpred_gnn_all_pairs(graph=graph, b=50000)
-        elif use_cert in ("selector_block_linkpred_gcn",):
-            print(use_cert, "-> using selector link pred gcn")
-            self.sample_block_from_linkpred_gcn(graph=graph)
-        elif use_cert in ("selector_block_gradient_gcn",):
-            print(use_cert, "-> using selector gradient gcn")
-            self.sample_block_from_margin_loss_gcn(graph=graph)
-        elif use_cert in ("accuracy_drop_selector",):
-            print(use_cert, "-> sampling with accuracy drop selector")
+        if plot_gen in ("block_eval_random", "block_eval_selector"):
+            if plot_gen == "block_eval_selector":
+                print(plot_gen, "-> sampling with accuracy drop selector")
 
-            self.n_candidates_k_sample=2000
-            self.n_candidates_one_sample=5000
-            self.acc_drop_threshold_k_samples=1e-3
-            self.loss_drop_threshold_k_samples=1e-3
-            self.k_samples_batch=10
-            self.ads_mode=ads_mode
-            self.drop_mode="endpoint"
+                self.n_candidates_k_sample=2000
+                self.n_candidates_one_sample=5000
+                self.acc_drop_threshold_k_samples=1e-3
+                self.loss_drop_threshold_k_samples=1e-3
+                self.k_samples_batch=10
+                self.ads_mode="one_sample"
+                self.drop_mode="endpoint"
 
-            if self.drop_mode == "acc": #TODO: logging für alle ads_modes+drop_modes
+                out_dir="extendedPlotting/gradVsScores/selector"
+
+                if self.drop_mode == "acc": #TODO: logging für alle ads_modes+drop_modes
+                    cache_path = f"cache/selection_dataset{self.dataset}_seed{self.seed}_ads_{ads_mode}_k{self.n_candidates_k_sample}_bt{self.k_samples_batch}_drpmd{self.drop_mode}_drp{self.acc_drop_threshold_k_samples}.pt"
+                elif self.drop_mode == "loss":
+                    cache_path = f"cache/selection_dataset{self.dataset}_seed{self.seed}_ads_{ads_mode}_k{self.n_candidates_k_sample}_bt{self.k_samples_batch}_drpmd{self.drop_mode}_drp{self.loss_drop_threshold_k_samples}.pt"
+                elif self.drop_mode == "endpoint":
+                    cache_path = f"cache/selection_dataset{self.dataset}_seed{self.seed}_ads_{ads_mode}_k{self.n_candidates_one_sample}_drpmd{self.drop_mode}.pt"
+
+                if os.path.exists(cache_path):
+                    print("[CACHE] loading selection:", cache_path)
+                    (
+                        y_out,
+                        edge_index_lab,
+                        y_label,
+                        tried_set,
+                        harmful_set,
+                        sub_nodes,
+                        edge_index_sub,
+                        edge_weight_sub,
+                        edge_index_lab_local,
+                        X_sub,
+                        edge_index_struct_local,
+                        meta,
+                    ) = PRBCDExtendedPlotting.load_selection(
+                        cache_path,
+                        device=self.device,
+                    )
+                else:
+                    print("[CACHE] computing selection and saving:", cache_path)
+                    y_out, edge_index_lab, y_label, tried_set, harmful_set = self.label_edge_flips_prbcd_selfsample_fast(
+                        mode=ads_mode,
+                        drop_mode=self.drop_mode,
+                        n_candidates_k_sample=self.n_candidates_k_sample,
+                        n_candidates_one_sample=self.n_candidates_one_sample,
+                        acc_drop_threshold_k_samples=self.acc_drop_threshold_k_samples,
+                        loss_drop_threshold_k_samples=self.loss_drop_threshold_k_samples,
+                        k_samples_batch=self.k_samples_batch
+                    )
+                    meta = {
+                        "ads_mode": self.ads_mode,
+                        "n_candidates_k_sample": self.n_candidates_k_sample,
+                        "acc_drop_threshold_k_samples": self.acc_drop_threshold_k_samples,
+                        "loss_drop_threshold_k_samples": self.loss_drop_threshold_k_samples,
+                    }
+                    PRBCDExtendedPlotting.save_selection(cache_path, y_out, edge_index_lab, y_label, tried_set, harmful_set, meta=meta)
+
+                X, edge_index_struct = self.extract_X_and_edge_index_from_sparsegraph(graph)
+                stats = PRBCDExtendedPlotting.tried_add_del_proportion(tried_set, edge_index_struct, n=int(self.n))
+                print(stats)
+
+                self.lp_model = self.train_link_prediction_gnn(
+                    x=X,
+                    edge_index_struct=edge_index_struct,
+                    edge_index_lab=edge_index_lab,
+                    y_label=y_label,
+                    device=self.device,
+                    num_epochs=200,
+                    use_tqdm=True,
+                    verbose=True,
+                )
+                self.sample_block_from_linkpred_threshold(graph=graph, n_perturbations=n_perturbations)
+                self.sample_random_block(n_perturbations)
+
+                selftried_set = tried_set
+
+                with torch.no_grad():
+
+                    logits = self._get_logits(self.attr, self.edge_index, self.edge_weight)
+                    loss = self.calculate_loss(logits[self.idx_attack], self.labels[self.idx_attack])
+                    accuracy = utils.accuracy(logits, self.labels, self.idx_attack)
+
+                    logging.info(f'\nBefore the attack - Loss: {loss.item()} Accuracy: {100 * accuracy:.3f} %\n')
+
+                    self._append_attack_statistics(loss.item(), accuracy, 0., 0.)
+
+                    del logits, loss
+
+                # ------ Get model eval for block ------
+
+                h = self.lp_model.encoder(X, edge_index_struct)
+                logits = self.lp_model.edge_head(h, PRBCDExtendedPlotting.linear_to_triu_idx(self.n, self.current_search_space))
+                scores = torch.sigmoid(logits)
+
+                # ------ Get PRBCD Gradient For Block ------
+
+                grad_abs_cum = torch.zeros_like(self.perturbed_edge_weight)
+
+                # Loop over the epochs (Algorithm 1, line 5)
+                for epoch in tqdm(range(self.epochs)):
+                    self.perturbed_edge_weight.requires_grad = True
+
+                    # Retreive sparse perturbed adjacency matrix `A \oplus p_{t-1}` (Algorithm 1, line 6)
+                    edge_index, edge_weight = self.get_modified_adj()
+
+                    if torch.cuda.is_available() and self.do_synchronize:
+                        torch.cuda.empty_cache()
+                        torch.cuda.synchronize()
+
+                    # Calculate logits for each node (Algorithm 1, line 6)
+                    logits = self._get_logits(self.attr, edge_index, edge_weight)
+                    # Calculate loss combining all each node (Algorithm 1, line 7)
+                    loss = self.calculate_loss(logits[self.idx_attack], self.labels[
+                        self.idx_attack])  # Todo: Hier wird der loss und gradient für perturbed edge weight erzeugt.
+                    # Retreive gradient towards the current block (Algorithm 1, line 7)
+                    gradient = utils.grad_with_checkpoint(loss, self.perturbed_edge_weight)[0]
+                    grad_abs_cum += gradient.detach().abs()
+                    self.gradient = gradient
+
+                    if torch.cuda.is_available() and self.do_synchronize:
+                        torch.cuda.empty_cache()
+                        torch.cuda.synchronize()
+
+                    with torch.no_grad():
+                        # Gradient update step (Algorithm 1, line 7)
+                        edge_weight = self.update_edge_weights(n_perturbations, epoch, gradient)[1]
+                        # For monitoring
+                        probability_mass_update = self.perturbed_edge_weight.sum().item()
+                        # Projection to stay within relaxed `L_0` budget (Algorithm 1, line 8)
+                        self.perturbed_edge_weight = Attack.project(
+                            n_perturbations, self.perturbed_edge_weight, self.eps)
+                        # For monitoring
+                        probability_mass_projected = self.perturbed_edge_weight.sum().item()
+
+                        # Calculate accuracy after the current epoch (overhead for monitoring and early stopping)
+                        edge_index, edge_weight = self.get_modified_adj()
+                        logits = self.attacked_model(data=self.attr.to(self.device), adj=(edge_index, edge_weight))
+                        accuracy = utils.accuracy(logits, self.labels, self.idx_attack)
+
+                        del edge_index, edge_weight, logits
+
+                        if epoch % self.display_step == 0:
+                            logging.info(f'\nEpoch: {epoch} Loss: {loss} Accuracy: {100 * accuracy:.3f} %\n')
+
+                        # Save best epoch for early stopping (not explicitly covered by pesudo code)
+                        if self.with_early_stopping and best_accuracy > accuracy:
+                            best_accuracy = accuracy
+                            best_epoch = epoch
+                            best_search_space = self.current_search_space.clone().cpu()
+                            best_edge_index = self.modified_edge_index.clone().cpu()
+                            best_edge_weight_diff = self.perturbed_edge_weight.detach().clone().cpu()
+
+                        self._append_attack_statistics(loss, accuracy, probability_mass_update,
+                                                       probability_mass_projected)
+
+                if self.with_early_stopping:
+                    self.current_search_space = best_search_space.to(self.device)
+                    self.modified_edge_index = best_edge_index.to(self.device)
+                    self.perturbed_edge_weight = best_edge_weight_diff.to(self.device)
+
+                # Sample final discrete graph (Algorithm 1, line 16)
+                edge_index = self.sample_final_edges(n_perturbations)[0]
+
+                self.adj_adversary = SparseTensor.from_edge_index(
+                    edge_index,
+                    torch.ones_like(edge_index[0], dtype=torch.float32),
+                    (self.n, self.n)
+                ).coalesce().detach()
+                self.attr_adversary = self.attr
+
+                grad_abs_mean = grad_abs_cum / float(self.epochs)
+                self.save_block_scores_and_gradients_csv(scores, grad_abs_mean, out_dir)
+
+        elif plot_gen in ("accuracy_rejection_curve",):
+            print(plot_gen, "-> sampling with accuracy drop selector")
+
+            self.n_candidates_k_sample = 2000
+            self.n_candidates_one_sample = 5000
+            self.acc_drop_threshold_k_samples = 1e-3
+            self.loss_drop_threshold_k_samples = 1e-3
+            self.k_samples_batch = 10
+            self.ads_mode = "one_sample"
+            self.drop_mode = "endpoint"
+
+            out_dir = "extendedPlotting/gradVsScores/selector"
+
+            if self.drop_mode == "acc":  # TODO: logging für alle ads_modes+drop_modes
                 cache_path = f"cache/selection_dataset{self.dataset}_seed{self.seed}_ads_{ads_mode}_k{self.n_candidates_k_sample}_bt{self.k_samples_batch}_drpmd{self.drop_mode}_drp{self.acc_drop_threshold_k_samples}.pt"
             elif self.drop_mode == "loss":
                 cache_path = f"cache/selection_dataset{self.dataset}_seed{self.seed}_ads_{ads_mode}_k{self.n_candidates_k_sample}_bt{self.k_samples_batch}_drpmd{self.drop_mode}_drp{self.loss_drop_threshold_k_samples}.pt"
             elif self.drop_mode == "endpoint":
-                cache_path = f"cache/selection_dataset{self.dataset}_seed{self.seed}_ads_{ads_mode}_k{self.n_candidates_one_sample}_drpmd{self.drop_mode}.pt"
+                cache_path = f"cache/selection_dataset{self.dataset}_seed{self.seed}_ads_{self.ads_mode}_k{self.n_candidates_one_sample}_drpmd{self.drop_mode}.pt"
 
             if os.path.exists(cache_path):
                 print("[CACHE] loading selection:", cache_path)
@@ -199,14 +359,14 @@ class PRBCD(SparseAttack):
                     X_sub,
                     edge_index_struct_local,
                     meta,
-                ) = PRBCD.load_selection(
+                ) = PRBCDExtendedPlotting.load_selection(
                     cache_path,
                     device=self.device,
                 )
             else:
                 print("[CACHE] computing selection and saving:", cache_path)
                 y_out, edge_index_lab, y_label, tried_set, harmful_set = self.label_edge_flips_prbcd_selfsample_fast(
-                    mode=ads_mode,
+                    mode=self.ads_mode,
                     drop_mode=self.drop_mode,
                     n_candidates_k_sample=self.n_candidates_k_sample,
                     n_candidates_one_sample=self.n_candidates_one_sample,
@@ -220,10 +380,128 @@ class PRBCD(SparseAttack):
                     "acc_drop_threshold_k_samples": self.acc_drop_threshold_k_samples,
                     "loss_drop_threshold_k_samples": self.loss_drop_threshold_k_samples,
                 }
-                PRBCD.save_selection(cache_path, y_out, edge_index_lab, y_label, tried_set, harmful_set, meta=meta)
+                PRBCDExtendedPlotting.save_selection(cache_path, y_out, edge_index_lab, y_label, tried_set,
+                                                     harmful_set, meta=meta)
 
             X, edge_index_struct = self.extract_X_and_edge_index_from_sparsegraph(graph)
-            stats = PRBCD.tried_add_del_proportion(tried_set, edge_index_struct, n=int(self.n))
+            stats = PRBCDExtendedPlotting.tried_add_del_proportion(tried_set, edge_index_struct, n=int(self.n))
+            print(stats)
+
+            self.lp_model = self.train_link_prediction_gnn(
+                x=X,
+                edge_index_struct=edge_index_struct,
+                edge_index_lab=edge_index_lab,
+                y_label=y_label,
+                device=self.device,
+                num_epochs=200,
+                use_tqdm=True,
+                verbose=True,
+            )
+
+            self.lp_model = self.lp_model.to(self.device).eval()
+
+            with torch.no_grad():
+                h = self.lp_model.encoder(X, edge_index_struct)
+                logits = self.lp_model.edge_head(h, edge_index_lab).view(-1)
+                scores = torch.sigmoid(logits)
+
+            y_true = y_label.view(-1).long()
+            y_pred = (scores >= 0.5).long()
+
+            # confidence for accuracy–rejection
+            conf = torch.maximum(scores, 1.0 - scores)
+
+            correct = (y_true == y_pred).long()
+
+            # move to cpu for csv
+            conf = conf.cpu().numpy()
+            scores = scores.cpu().numpy()
+            y_true = y_true.cpu().numpy()
+            y_pred = y_pred.cpu().numpy()
+            correct = correct.cpu().numpy()
+
+            # ---- write csv ----
+            out_dir = "extendedPlotting/accuracyRejection"
+            os.makedirs(out_dir, exist_ok=True)
+
+            csv_path = os.path.join(
+                out_dir,
+                f"acc_rejection_dataset{self.dataset}_seed{self.seed}.csv"
+            )
+
+            with open(csv_path, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(["confidence", "score", "y_true", "y_pred", "correct"])
+                for i in range(len(conf)):
+                    writer.writerow([
+                        float(conf[i]),
+                        float(scores[i]),
+                        int(y_true[i]),
+                        int(y_pred[i]),
+                        int(correct[i]),
+                    ])
+
+            print("[CSV] saved accuracy–rejection data to:", csv_path)
+
+        elif plot_gen in ("spearman_rho",):
+            print(plot_gen, "-> computing spearman rho")
+
+            self.n_candidates_k_sample = 2000
+            self.n_candidates_one_sample = 5000
+            self.acc_drop_threshold_k_samples = 1e-3
+            self.loss_drop_threshold_k_samples = 1e-3
+            self.k_samples_batch = 10
+            self.ads_mode = "one_sample"
+            self.drop_mode = "endpoint"
+
+            if self.drop_mode == "acc":  # TODO: logging für alle ads_modes+drop_modes
+                cache_path = f"cache/selection_dataset{self.dataset}_seed{self.seed}_ads_{self.ads_mode}_k{self.n_candidates_k_sample}_bt{self.k_samples_batch}_drpmd{self.drop_mode}_drp{self.acc_drop_threshold_k_samples}.pt"
+            elif self.drop_mode == "loss":
+                cache_path = f"cache/selection_dataset{self.dataset}_seed{self.seed}_ads_{self.ads_mode}_k{self.n_candidates_k_sample}_bt{self.k_samples_batch}_drpmd{self.drop_mode}_drp{self.loss_drop_threshold_k_samples}.pt"
+            elif self.drop_mode == "endpoint":
+                cache_path = f"cache/selection_dataset{self.dataset}_seed{self.seed}_ads_{self.ads_mode}_k{self.n_candidates_one_sample}_drpmd{self.drop_mode}.pt"
+
+            if os.path.exists(cache_path):
+                print("[CACHE] loading selection:", cache_path)
+                (
+                    y_out,
+                    edge_index_lab,
+                    y_label,
+                    tried_set,
+                    harmful_set,
+                    sub_nodes,
+                    edge_index_sub,
+                    edge_weight_sub,
+                    edge_index_lab_local,
+                    X_sub,
+                    edge_index_struct_local,
+                    meta,
+                ) = PRBCDExtendedPlotting.load_selection(
+                    cache_path,
+                    device=self.device,
+                )
+            else:
+                print("[CACHE] computing selection and saving:", cache_path)
+                y_out, edge_index_lab, y_label, tried_set, harmful_set = self.label_edge_flips_prbcd_selfsample_fast(
+                    mode=self.ads_mode,
+                    drop_mode=self.drop_mode,
+                    n_candidates_k_sample=self.n_candidates_k_sample,
+                    n_candidates_one_sample=self.n_candidates_one_sample,
+                    acc_drop_threshold_k_samples=self.acc_drop_threshold_k_samples,
+                    loss_drop_threshold_k_samples=self.loss_drop_threshold_k_samples,
+                    k_samples_batch=self.k_samples_batch
+                )
+                meta = {
+                    "ads_mode": self.ads_mode,
+                    "n_candidates_k_sample": self.n_candidates_k_sample,
+                    "acc_drop_threshold_k_samples": self.acc_drop_threshold_k_samples,
+                    "loss_drop_threshold_k_samples": self.loss_drop_threshold_k_samples,
+                }
+                PRBCDExtendedPlotting.save_selection(cache_path, y_out, edge_index_lab, y_label, tried_set, harmful_set,
+                                                     meta=meta)
+
+            X, edge_index_struct = self.extract_X_and_edge_index_from_sparsegraph(graph)
+            stats = PRBCDExtendedPlotting.tried_add_del_proportion(tried_set, edge_index_struct, n=int(self.n))
             print(stats)
 
             self.lp_model = self.train_link_prediction_gnn(
@@ -237,10 +515,116 @@ class PRBCD(SparseAttack):
                 verbose=True,
             )
             self.sample_block_from_linkpred_threshold(graph=graph, n_perturbations=n_perturbations)
-            #self.init_search_space_from_y_out(y_out=y_out,n_perturbations=n_perturbations)
-            self.tried_set = tried_set
-        elif use_cert in ("accuracy_drop_selector_subgraph_random", "accuracy_drop_selector_subgraph_khop", "accuracy_drop_selector_subgraph_growhop"):
-            print(use_cert, "-> sampling with accuracy drop selector subgraph")
+            self.sample_random_block(n_perturbations)
+
+            with torch.no_grad():
+
+                logits = self._get_logits(self.attr, self.edge_index, self.edge_weight)
+                loss = self.calculate_loss(logits[self.idx_attack], self.labels[self.idx_attack])
+                accuracy = utils.accuracy(logits, self.labels, self.idx_attack)
+
+                logging.info(f'\nBefore the attack - Loss: {loss.item()} Accuracy: {100 * accuracy:.3f} %\n')
+
+                self._append_attack_statistics(loss.item(), accuracy, 0., 0.)
+
+                del logits, loss
+
+            # ------ Get model eval for block ------
+
+            h = self.lp_model.encoder(X, edge_index_struct)
+            logits = self.lp_model.edge_head(h, PRBCDExtendedPlotting.linear_to_triu_idx(self.n,
+                                                                                         self.current_search_space))
+            scores = torch.sigmoid(logits)
+
+            # ------ Get PRBCD Gradient For Block ------
+
+            grad_abs_cum = torch.zeros_like(self.perturbed_edge_weight)
+
+            # Loop over the epochs (Algorithm 1, line 5)
+            for epoch in tqdm(range(self.epochs)):
+                self.perturbed_edge_weight.requires_grad = True
+
+                # Retreive sparse perturbed adjacency matrix `A \oplus p_{t-1}` (Algorithm 1, line 6)
+                edge_index, edge_weight = self.get_modified_adj()
+
+                if torch.cuda.is_available() and self.do_synchronize:
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+
+                # Calculate logits for each node (Algorithm 1, line 6)
+                logits = self._get_logits(self.attr, edge_index, edge_weight)
+                # Calculate loss combining all each node (Algorithm 1, line 7)
+                loss = self.calculate_loss(logits[self.idx_attack], self.labels[
+                    self.idx_attack])  # Todo: Hier wird der loss und gradient für perturbed edge weight erzeugt.
+                # Retreive gradient towards the current block (Algorithm 1, line 7)
+                gradient = utils.grad_with_checkpoint(loss, self.perturbed_edge_weight)[0]
+                grad_abs_cum += gradient.detach().abs()
+                self.gradient = gradient
+
+                if torch.cuda.is_available() and self.do_synchronize:
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+
+                with torch.no_grad():
+                    # Gradient update step (Algorithm 1, line 7)
+                    edge_weight = self.update_edge_weights(n_perturbations, epoch, gradient)[1]
+                    # For monitoring
+                    probability_mass_update = self.perturbed_edge_weight.sum().item()
+                    # Projection to stay within relaxed `L_0` budget (Algorithm 1, line 8)
+                    self.perturbed_edge_weight = Attack.project(
+                        n_perturbations, self.perturbed_edge_weight, self.eps)
+                    # For monitoring
+                    probability_mass_projected = self.perturbed_edge_weight.sum().item()
+
+                    # Calculate accuracy after the current epoch (overhead for monitoring and early stopping)
+                    edge_index, edge_weight = self.get_modified_adj()
+                    logits = self.attacked_model(data=self.attr.to(self.device), adj=(edge_index, edge_weight))
+                    accuracy = utils.accuracy(logits, self.labels, self.idx_attack)
+
+                    del edge_index, edge_weight, logits
+
+                    if epoch % self.display_step == 0:
+                        logging.info(f'\nEpoch: {epoch} Loss: {loss} Accuracy: {100 * accuracy:.3f} %\n')
+
+                    # Save best epoch for early stopping (not explicitly covered by pesudo code)
+                    if self.with_early_stopping and best_accuracy > accuracy:
+                        best_accuracy = accuracy
+                        best_epoch = epoch
+                        best_search_space = self.current_search_space.clone().cpu()
+                        best_edge_index = self.modified_edge_index.clone().cpu()
+                        best_edge_weight_diff = self.perturbed_edge_weight.detach().clone().cpu()
+
+                    self._append_attack_statistics(loss, accuracy, probability_mass_update,
+                                                   probability_mass_projected)
+
+            if self.with_early_stopping:
+                self.current_search_space = best_search_space.to(self.device)
+                self.modified_edge_index = best_edge_index.to(self.device)
+                self.perturbed_edge_weight = best_edge_weight_diff.to(self.device)
+
+            # Sample final discrete graph (Algorithm 1, line 16)
+            edge_index = self.sample_final_edges(n_perturbations)[0]
+
+            self.adj_adversary = SparseTensor.from_edge_index(
+                edge_index,
+                torch.ones_like(edge_index[0], dtype=torch.float32),
+                (self.n, self.n)
+            ).coalesce().detach()
+
+            self.attr_adversary = self.attr
+
+            grad_abs_mean = grad_abs_cum / float(self.epochs)
+
+            s = scores.detach().cpu().view(-1).numpy()
+            g = grad_abs_mean.detach().cpu().view(-1).numpy()
+
+            rho, p = spearmanr(s, g)
+            print("Spearman rho:", rho, "p:", p)
+
+            self._append_attack_statistics_spearman_rho(rho)
+
+        elif plot_gen in ("accuracy_drop_selector_subgraph_random", "accuracy_drop_selector_subgraph_khop", "accuracy_drop_selector_subgraph_growhop"):
+            print(plot_gen, "-> sampling with accuracy drop selector subgraph")
 
             self.n_candidates_one_sample = 5000
             self.n_candidates_k_sample = 2000
@@ -251,9 +635,9 @@ class PRBCD(SparseAttack):
             self.acc_drop_threshold_k_samples = 1e-3
             self.loss_drop_threshold_k_samples = 1e-3
 
-            if use_cert in ("accuracy_drop_selector_subgraph_random",):
+            if plot_gen in ("accuracy_drop_selector_subgraph_random",):
                 self.ads_mode = "random_subgraph"
-            elif use_cert in ("accuracy_drop_selector_subgraph_khop",):
+            elif plot_gen in ("accuracy_drop_selector_subgraph_khop",):
                 self.ads_mode = "khop_subgraph"
             else:
                 self.ads_mode = "growhop_subgraph"
@@ -284,26 +668,26 @@ class PRBCD(SparseAttack):
                     X_sub,
                     edge_index_struct_local,
                     meta,
-                ) = PRBCD.load_selection(
+                ) = PRBCDExtendedPlotting.load_selection(
                     cache_path,
                     device=self.device,
                 )
             else:
                 print("[CACHE] computing selection and saving:", cache_path)
                 if self.ads_mode == "random_subgraph":
-                    sub_nodes, edge_index_sub, edge_weight_sub, g2l, l2g = PRBCD.extract_random_induced_subgraph(
+                    sub_nodes, edge_index_sub, edge_weight_sub, g2l, l2g = PRBCDExtendedPlotting.extract_random_induced_subgraph(
                         edge_index_struct,
                         self.n,
                         subgraph_size=self.subgraph_size,
                     )
                 elif self.ads_mode == "khop_subgraph": #no local values
-                    sub_nodes, edge_index_sub, edge_weight_sub, g2l, l2g = PRBCD.extract_k_hop_induced_subgraph_of_random_node(
+                    sub_nodes, edge_index_sub, edge_weight_sub, g2l, l2g = PRBCDExtendedPlotting.extract_k_hop_induced_subgraph_of_random_node(
                         edge_index_struct,
                         self.n,
                         k=self.k_subgraph,
                     )
                 elif self.ads_mode == "growhop_subgraph":
-                    sub_nodes, edge_index_sub, edge_weight_sub, g2l, l2g, hops_used = PRBCD.extract_growing_hop_subgraph_of_random_node(
+                    sub_nodes, edge_index_sub, edge_weight_sub, g2l, l2g, hops_used = PRBCDExtendedPlotting.extract_growing_hop_subgraph_of_random_node(
                         edge_index_struct,
                         self.n,
                         subgraph_size=self.subgraph_size
@@ -316,7 +700,7 @@ class PRBCD(SparseAttack):
                     sub_nodes=sub_nodes,
                 )
 
-                X_sub, edge_index_struct_local = PRBCD.build_lp_struct_for_subgraph(
+                X_sub, edge_index_struct_local = PRBCDExtendedPlotting.build_lp_struct_for_subgraph(
                     X=X,
                     edge_index_struct=edge_index_struct,
                     sub_nodes=sub_nodes,
@@ -326,9 +710,9 @@ class PRBCD(SparseAttack):
                 meta = {
                     "n_candidates_one_sample": self.n_candidates_one_sample,
                 }
-                PRBCD.save_selection(cache_path, y_out, edge_index_lab, y_label, tried_set, harmful_set, sub_nodes, edge_index_sub, edge_weight_sub, edge_index_lab_local, X_sub, edge_index_struct_local, meta=meta)
+                PRBCDExtendedPlotting.save_selection(cache_path, y_out, edge_index_lab, y_label, tried_set, harmful_set, sub_nodes, edge_index_sub, edge_weight_sub, edge_index_lab_local, X_sub, edge_index_struct_local, meta=meta)
 
-            stats = PRBCD.tried_add_del_proportion(tried_set, edge_index_struct, n=int(self.n))
+            stats = PRBCDExtendedPlotting.tried_add_del_proportion(tried_set, edge_index_struct, n=int(self.n))
             print(stats)
 
             self.sub_nodes = sub_nodes
@@ -349,254 +733,10 @@ class PRBCD(SparseAttack):
             self.sample_block_from_linkpred_threshold(graph=graph, n_perturbations=n_perturbations)
             # self.init_search_space_from_y_out(y_out=y_out,n_perturbations=n_perturbations)
             self.tried_set = tried_set
-        elif use_cert in ("direct_selector",):
-
-            self.n_candidates_k_sample = 2000
-            self.n_candidates_one_sample = 5000
-            self.acc_drop_threshold_k_samples = 1e-3
-            self.loss_drop_threshold_k_samples = 1e-3
-            self.k_samples_batch = 10
-            self.ads_mode = ads_mode
-            self.drop_mode = "endpoint"
-
-            if self.drop_mode == "acc":  # TODO: logging für alle ads_modes+drop_modes
-                cache_path = f"cache/selection_dataset{self.dataset}_seed{self.seed}_ads_{ads_mode}_k{self.n_candidates_k_sample}_bt{self.k_samples_batch}_drpmd{self.drop_mode}_drp{self.acc_drop_threshold_k_samples}.pt"
-            elif self.drop_mode == "loss":
-                cache_path = f"cache/selection_dataset{self.dataset}_seed{self.seed}_ads_{ads_mode}_k{self.n_candidates_k_sample}_bt{self.k_samples_batch}_drpmd{self.drop_mode}_drp{self.loss_drop_threshold_k_samples}.pt"
-            elif self.drop_mode == "endpoint":
-                cache_path = f"cache/selection_dataset{self.dataset}_seed{self.seed}_ads_{ads_mode}_k{self.n_candidates_one_sample}_drpmd{self.drop_mode}.pt"
-
-            if os.path.exists(cache_path):
-                print("[CACHE] loading selection:", cache_path)
-                (
-                    y_out,
-                    edge_index_lab,
-                    y_label,
-                    tried_set,
-                    harmful_set,
-                    sub_nodes,
-                    edge_index_sub,
-                    edge_weight_sub,
-                    edge_index_lab_local,
-                    X_sub,
-                    edge_index_struct_local,
-                    meta,
-                ) = PRBCD.load_selection(
-                    cache_path,
-                    device=self.device,
-                )
-            else:
-                print("[CACHE] computing selection and saving:", cache_path)
-                y_out, edge_index_lab, y_label, tried_set, harmful_set = self.label_edge_flips_prbcd_selfsample_fast(
-                    mode=ads_mode,
-                    drop_mode=self.drop_mode,
-                    n_candidates_k_sample=self.n_candidates_k_sample,
-                    n_candidates_one_sample=self.n_candidates_one_sample,
-                    acc_drop_threshold_k_samples=self.acc_drop_threshold_k_samples,
-                    loss_drop_threshold_k_samples=self.loss_drop_threshold_k_samples,
-                    k_samples_batch=self.k_samples_batch
-                )
-                meta = {
-                    "ads_mode": self.ads_mode,
-                    "n_candidates_k_sample": self.n_candidates_k_sample,
-                    "acc_drop_threshold_k_samples": self.acc_drop_threshold_k_samples,
-                    "loss_drop_threshold_k_samples": self.loss_drop_threshold_k_samples,
-                }
-                PRBCD.save_selection(cache_path, y_out, edge_index_lab, y_label, tried_set, harmful_set, meta=meta)
-
-            X, edge_index_struct = self.extract_X_and_edge_index_from_sparsegraph(graph)
-            stats = PRBCD.tried_add_del_proportion(tried_set, edge_index_struct, n=int(self.n))
-            print(stats)
-
-            self.lp_model = self.train_link_prediction_gnn(
-                x=X,
-                edge_index_struct=edge_index_struct,
-                edge_index_lab=edge_index_lab,
-                y_label=y_label,
-                device=self.device,
-                num_epochs=200,
-                use_tqdm=True,
-                verbose=True,
-            )
-
-            # ------ Start LP-Model attack loop ------
-
 
         else:
-            print(use_cert, "run sampling with no certificate")
+            print(plot_gen, "run sampling with no certificate")
             self.sample_random_block(n_perturbations)
-        # Accuracy and attack statistics before the attack even started
-        with torch.no_grad():
-
-            logits = self._get_logits(self.attr, self.edge_index, self.edge_weight)
-            loss = self.calculate_loss(logits[self.idx_attack], self.labels[self.idx_attack])
-            accuracy = utils.accuracy(logits, self.labels, self.idx_attack)
-
-            logging.info(f'\nBefore the attack - Loss: {loss.item()} Accuracy: {100 * accuracy:.3f} %\n')
-
-            self._append_attack_statistics(loss.item(), accuracy, 0., 0.)
-
-            del logits, loss
-
-        # Loop over the epochs (Algorithm 1, line 5)
-        for epoch in tqdm(range(self.epochs)):
-            self.perturbed_edge_weight.requires_grad = True
-
-            # Retreive sparse perturbed adjacency matrix `A \oplus p_{t-1}` (Algorithm 1, line 6)
-            edge_index, edge_weight = self.get_modified_adj()
-
-            if torch.cuda.is_available() and self.do_synchronize:
-                torch.cuda.empty_cache()
-                torch.cuda.synchronize()
-
-            # Calculate logits for each node (Algorithm 1, line 6)
-            logits = self._get_logits(self.attr, edge_index, edge_weight)
-            # Calculate loss combining all each node (Algorithm 1, line 7)
-            loss = self.calculate_loss(logits[self.idx_attack], self.labels[self.idx_attack]) #Todo: Hier wird der loss und gradient für perturbed edge weight erzeugt.
-            # Retreive gradient towards the current block (Algorithm 1, line 7)
-            gradient = utils.grad_with_checkpoint(loss, self.perturbed_edge_weight)[0]
-            self.gradient = gradient
-
-            if torch.cuda.is_available() and self.do_synchronize:
-                torch.cuda.empty_cache()
-                torch.cuda.synchronize()
-
-            with torch.no_grad():
-                # Gradient update step (Algorithm 1, line 7)
-                edge_weight = self.update_edge_weights(n_perturbations, epoch, gradient)[1]
-                # For monitoring
-                probability_mass_update = self.perturbed_edge_weight.sum().item()
-                # Projection to stay within relaxed `L_0` budget (Algorithm 1, line 8)
-                self.perturbed_edge_weight = Attack.project(
-                    n_perturbations, self.perturbed_edge_weight, self.eps)
-                # For monitoring
-                probability_mass_projected = self.perturbed_edge_weight.sum().item()
-
-                # Calculate accuracy after the current epoch (overhead for monitoring and early stopping)
-                edge_index, edge_weight = self.get_modified_adj()
-                logits = self.attacked_model(data=self.attr.to(self.device), adj=(edge_index, edge_weight))
-                accuracy = utils.accuracy(logits, self.labels, self.idx_attack)
-
-                del edge_index, edge_weight, logits
-
-                if epoch % self.display_step == 0:
-                    logging.info(f'\nEpoch: {epoch} Loss: {loss} Accuracy: {100 * accuracy:.3f} %\n')
-
-                # Save best epoch for early stopping (not explicitly covered by pesudo code)
-                if self.with_early_stopping and best_accuracy > accuracy:
-                    best_accuracy = accuracy
-                    best_epoch = epoch
-                    best_search_space = self.current_search_space.clone().cpu()
-                    best_edge_index = self.modified_edge_index.clone().cpu()
-                    best_edge_weight_diff = self.perturbed_edge_weight.detach().clone().cpu()
-
-                self._append_attack_statistics(loss, accuracy, probability_mass_update, probability_mass_projected)
-
-                # Resampling of search space (Algorithm 1, line 9-14)
-                if epoch < self.epochs_resampling - 1:
-                    if use_cert in ("sampling_with_prior",):
-                        print(use_cert, "run resampling_with_prior")
-                        self.resample_block_from_prior_gumbel(n_perturbations=n_perturbations, tau=1.0)
-
-                    elif use_cert in ("accuracy_drop_selector", "accuracy_drop_selector_subgraph"):
-                        print(use_cert, "run resampling with no certificate")
-                        if epoch % 50 == 0:
-                            self.resample_block_from_linkpred_threshold(graph=graph, n_perturbations=n_perturbations)
-                            self.resample_random_block(n_perturbations=n_perturbations)
-                        else:
-                            self.resample_random_block(n_perturbations=n_perturbations)
-                        pass
-                        '''
-                        if epoch % 5 == 0:
-                            print(use_cert, "-> resampling with accuracy drop selector")
-                            y_out, edge_index_lab, y_label, tried_set, harmful_set = self.label_edge_flips_prbcd_selfsample_fast(mode=ads_mode,
-                                                                                                    n_candidates_k_sample=int(self.n_candidates_k_sample / 2),
-                                                                                                    prev_tried_set=self.tried_set,
-                                                                                                    drop_threshold_k_samples=3e-3)
-                            self.append_search_space_with_y_out(y_out=y_out)
-                            self.tried_set = tried_set
-                        else:
-                            pass'''
-
-                    elif use_cert in ("selector_block", "selector_block_pgd"):
-
-                        # --- Configurable decay mode ---
-                        # Choose between: "exp" | "linear" | "none"
-                        decay_mode = getattr(self, "intra_decay_mode", "exp")
-
-                        # Initial and final intra ratios (set these somewhere in __init__)
-                        init_ratio = float(self.initial_max_intra_ratio)
-                        final_ratio = float(getattr(self, "final_max_intra_ratio", 0.0))
-
-                        # --- Compute current intra ratio ---
-                        if decay_mode == "exp":
-                            # Exponential decay: halve every 10 epochs
-                            halving_steps = max(0, int(epoch // 10))
-                            current_max_intra = init_ratio * (0.5 ** halving_steps)
-
-                        elif decay_mode == "linear":
-                            # Linear decay over all resampling epochs
-                            total_resample_steps = max(1, getattr(self, "epochs_resampling", 1) - 1)
-                            resample_step = min(epoch, total_resample_steps)
-                            t = float(resample_step) / float(total_resample_steps)
-                            current_max_intra = init_ratio * (1.0 - t) + final_ratio * t
-
-                        elif decay_mode == "none":
-                            # No decay: keep constant
-                            current_max_intra = init_ratio
-
-                        else:
-                            raise ValueError(f"Unknown intra decay mode: {decay_mode}")
-
-                        # --- Clamp and log ---
-                        current_max_intra = max(final_ratio, min(1.0, current_max_intra))
-                        logging.info(
-                            f"[Resample] epoch={epoch} | mode={decay_mode} | max_intra_ratio={current_max_intra:.4f}"
-                        )
-
-                        # --- Perform resampling ---
-                        self.resample_block_from_selector(
-                            n_perturbations=n_perturbations,
-                            blend_alpha=0,
-                            prefer_edges="intra",
-                            max_intra_ratio=current_max_intra,
-                        )
-                    else:
-                        print(use_cert, "run resampling with no certificate")
-                        self.resample_random_block(n_perturbations)
-                        pass
-                elif self.with_early_stopping and epoch == self.epochs_resampling - 1:
-                    # Retreive best epoch if early stopping is active (not explicitly covered by pesudo code)
-                    logging.info(
-                        f'Loading search space of epoch {best_epoch} (accuarcy={best_accuracy}) for fine tuning\n')
-                    self.current_search_space = best_search_space.to(self.device)
-                    self.modified_edge_index = best_edge_index.to(self.device)
-                    self.perturbed_edge_weight = best_edge_weight_diff.to(self.device)
-                    self.perturbed_edge_weight.requires_grad = True
-
-        #_edge_to_node_transfer = PRBCD.linear_to_triu_idx(self.modified_edge_index)
-
-        #row_idx, col_idx = _edge_to_node_transfer[0], _edge_to_node_transfer[1] TODO: hier könnte man die nodes die noch übrig sind nach dem Angriff evaluaten
-
-        #self.nodes_after_attack = pd.concat([row_idx, col_idx])
-
-        # Retreive best epoch if early stopping is active (not explicitly covered by pesudo code)
-        if self.with_early_stopping:
-            self.current_search_space = best_search_space.to(self.device)
-            self.modified_edge_index = best_edge_index.to(self.device)
-            self.perturbed_edge_weight = best_edge_weight_diff.to(self.device)
-
-        # Sample final discrete graph (Algorithm 1, line 16)
-        edge_index = self.sample_final_edges(n_perturbations)[0]
-
-        self.adj_adversary = SparseTensor.from_edge_index(
-            edge_index,
-            torch.ones_like(edge_index[0], dtype=torch.float32),
-            (self.n, self.n)
-        ).coalesce().detach()
-        self.attr_adversary = self.attr
-
-        # TODO: Don't we want to switch to returning things? Haha yeah me too
 
     def _get_logits(self, x, edge_index, edge_weight):
         return self.attacked_model(
@@ -611,6 +751,104 @@ class PRBCD(SparseAttack):
             adj=(new_edge_index.to(self.device),
                  torch.ones(new_edge_index.shape[1], device=self.device))
         )
+
+    def save_block_scores_and_gradients_csv(
+            self,
+            scores: torch.Tensor,
+            gradient: Optional[torch.Tensor] = None,
+            base_path: str = "cache/block_eval",
+            include_edges: bool = True,
+    ) -> str:
+        """
+        Save a CSV combining block-sized link-pred scores and PRBCD gradients.
+
+        base_path:
+            Directory in which the CSV will be written.
+            A timestamped filename is automatically appended.
+
+        Returns:
+            Full path to the written CSV file.
+        """
+        if gradient is None:
+            if not hasattr(self, "gradient") or self.gradient is None:
+                raise ValueError("gradient is None and self.gradient is not set.")
+            gradient = self.gradient
+
+        if scores is None:
+            raise ValueError("scores must not be None.")
+
+        # flatten + move to CPU
+        scores_cpu = scores.detach().view(-1).to("cpu")
+        grad_cpu = gradient.detach().view(-1).to("cpu")
+
+        if scores_cpu.numel() != grad_cpu.numel():
+            raise ValueError(
+                f"scores and gradient must have the same length, "
+                f"got {scores_cpu.numel()} vs {grad_cpu.numel()}"
+            )
+
+        B = int(scores_cpu.numel())
+
+        # prepare edge metadata if available
+        lin_ids = None
+        uv = None
+        if include_edges:
+            if hasattr(self, "current_search_space") and self.current_search_space is not None:
+                lin_ids = self.current_search_space.detach().view(-1).to("cpu")
+
+            if hasattr(self, "modified_edge_index") and self.modified_edge_index is not None:
+                uv = self.modified_edge_index.detach().to("cpu")
+                if uv.dim() != 2 or uv.size(0) != 2:
+                    uv = None
+
+        # --- directory + timestamped filename ---
+        os.makedirs(base_path, exist_ok=True)
+
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        filename = f"block_scores_grads_{timestamp}.csv"
+        csv_path = os.path.join(base_path, filename)
+
+        fieldnames = ["idx", "score", "grad", "abs_grad"]
+        if include_edges:
+            fieldnames = ["idx", "lin_id", "u", "v", "score", "grad", "abs_grad"]
+
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+
+            for i in range(B):
+                row = {
+                    "idx": i,
+                    "score": float(scores_cpu[i].item()),
+                    "grad": float(grad_cpu[i].item()),
+                    "abs_grad": float(abs(grad_cpu[i].item())),
+                }
+
+                if include_edges:
+                    row["lin_id"] = int(lin_ids[i].item()) if lin_ids is not None and lin_ids.numel() == B else ""
+                    if uv is not None and uv.size(1) == B:
+                        row["u"] = int(uv[0, i].item())
+                        row["v"] = int(uv[1, i].item())
+                    else:
+                        row["u"], row["v"] = "", ""
+
+                writer.writerow(row)
+
+        return csv_path
+
+    @staticmethod
+    def acc_rejection_curve(y_true, y_pred, conf):
+        idx = torch.argsort(conf, descending=True)
+        y_true = y_true[idx]
+        y_pred = y_pred[idx]
+
+        correct = (y_true == y_pred).float()
+        cum_correct = torch.cumsum(correct, dim=0)
+        k = torch.arange(1, len(y_true) + 1, device=y_true.device).float()
+
+        acc = cum_correct / k
+        cov = k / float(len(y_true))
+        return cov.cpu(), acc.cpu()
 
     @torch.no_grad()
     def sample_final_edges(self, n_perturbations: int) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -770,9 +1008,9 @@ class PRBCD(SparseAttack):
                 self.n_possible_edges, (self.block_size,), device=self.device)
             self.current_search_space = torch.unique(self.current_search_space, sorted=True)
             if self.make_undirected:
-                self.modified_edge_index = PRBCD.linear_to_triu_idx(self.n, self.current_search_space)
+                self.modified_edge_index = PRBCDExtendedPlotting.linear_to_triu_idx(self.n, self.current_search_space)
             else:
-                self.modified_edge_index = PRBCD.linear_to_full_idx(self.n, self.current_search_space)
+                self.modified_edge_index = PRBCDExtendedPlotting.linear_to_full_idx(self.n, self.current_search_space)
                 is_not_self_loop = self.modified_edge_index[0] != self.modified_edge_index[1]
                 self.current_search_space = self.current_search_space[is_not_self_loop]
                 self.modified_edge_index = self.modified_edge_index[:, is_not_self_loop]
@@ -841,9 +1079,9 @@ class PRBCD(SparseAttack):
 
             # 2) decode to pairs exactly like PRBCD does
             if self.make_undirected:
-                cand_ei = PRBCD.linear_to_triu_idx(self.n, cand_lin)  # (2, M)
+                cand_ei = PRBCDExtendedPlotting.linear_to_triu_idx(self.n, cand_lin)  # (2, M)
             else:
-                cand_ei = PRBCD.linear_to_full_idx(self.n, cand_lin)  # (2, M)
+                cand_ei = PRBCDExtendedPlotting.linear_to_full_idx(self.n, cand_lin)  # (2, M)
                 is_not_self_loop = cand_ei[0] != cand_ei[1]
                 cand_lin = cand_lin[is_not_self_loop]
                 cand_ei = cand_ei[:, is_not_self_loop]
@@ -892,9 +1130,9 @@ class PRBCD(SparseAttack):
 
             # 5) initialize modified_edge_index EXACTLY like sample_random_block
             if self.make_undirected:
-                self.modified_edge_index = PRBCD.linear_to_triu_idx(self.n, self.current_search_space)
+                self.modified_edge_index = PRBCDExtendedPlotting.linear_to_triu_idx(self.n, self.current_search_space)
             else:
-                self.modified_edge_index = PRBCD.linear_to_full_idx(self.n, self.current_search_space)
+                self.modified_edge_index = PRBCDExtendedPlotting.linear_to_full_idx(self.n, self.current_search_space)
                 is_not_self_loop = self.modified_edge_index[0] != self.modified_edge_index[1]
                 self.current_search_space = self.current_search_space[is_not_self_loop]
                 self.modified_edge_index = self.modified_edge_index[:, is_not_self_loop]
@@ -915,135 +1153,6 @@ class PRBCD(SparseAttack):
         )
 
     def sample_block_from_linkpred_threshold(
-            self,
-            graph,
-            n_perturbations: int = 0,
-            tau: float = 0.8,  # kept for compatibility but NOT used for acceptance anymore
-            max_sampling_tries: int = 2_000_000,
-            score_batch_size: int = 100000,
-            rng_seed: int = 0,
-            exclude_tried: bool = False,  # optional: never reuse edges across resamples
-            q_lo: float = 0.70,  # NEW: lower quantile
-            q_hi: float = 0.98,  # NEW: upper quantile (exclude saturated top tail)
-    ):
-        if not hasattr(self, "lp_model") or self.lp_model is None:
-            raise RuntimeError("self.lp_model is not set.")
-
-        if not (0.0 <= q_lo < q_hi <= 1.0):
-            raise ValueError(f"q_lo and q_hi must satisfy 0 <= q_lo < q_hi <= 1, got {q_lo}, {q_hi}")
-
-        # optional global tried mask
-        if exclude_tried and (not hasattr(self, "tried_mask") or self.tried_mask is None):
-            self.tried_mask = torch.zeros(self.n_possible_edges, device=self.device, dtype=torch.bool)
-
-        # prep features/structure + embeddings once
-        X, edge_index_struct = self.extract_X_and_edge_index_from_sparsegraph(graph)
-        X = X.to(self.device)
-        edge_index_struct = edge_index_struct.to(self.device)
-
-        self.lp_model = self.lp_model.to(self.device).eval()
-        with torch.no_grad():
-            h = self.lp_model.encoder(X, edge_index_struct)
-
-        g = torch.Generator(device=self.device)
-        g.manual_seed(int(rng_seed))
-
-        accepted = []
-        accepted_mask = torch.zeros(self.n_possible_edges, device=self.device, dtype=torch.bool)
-
-        tries = 0
-        while len(accepted) < int(self.block_size) and tries < int(max_sampling_tries):
-            tries += 1
-
-            # sample a batch of candidate linear indices
-            cand_lin = torch.randint(
-                self.n_possible_edges, (int(score_batch_size),), device=self.device, generator=g
-            )
-            cand_lin = torch.unique(cand_lin, sorted=False)
-
-            # exclude duplicates within this block
-            cand_lin = cand_lin[~accepted_mask[cand_lin]]
-
-            # optionally exclude globally tried
-            if exclude_tried:
-                cand_lin = cand_lin[~self.tried_mask[cand_lin]]
-
-            if cand_lin.numel() == 0:
-                continue
-
-            # decode to pairs for scoring
-            if self.make_undirected:
-                cand_ei = PRBCD.linear_to_triu_idx(self.n, cand_lin)
-            else:
-                cand_ei = PRBCD.linear_to_full_idx(self.n, cand_lin)
-                is_not_self = cand_ei[0] != cand_ei[1]
-                cand_lin = cand_lin[is_not_self]
-                cand_ei = cand_ei[:, is_not_self]
-                if cand_lin.numel() == 0:
-                    continue
-
-            # score
-            with torch.no_grad():
-                logits = self.lp_model.edge_head(h, cand_ei).view(-1)
-                scores = torch.sigmoid(logits)
-
-            if scores.numel() == 0:
-                continue
-
-            # --- NEW: accept those within the per-batch quantile band ---
-            # NOTE: computed on this batch's score distribution
-            lo = torch.quantile(scores, float(q_lo))
-            hi = torch.quantile(scores, float(q_hi))
-
-            keep = (scores >= lo) & (scores <= hi)
-            cand_keep = cand_lin[keep]
-
-            # fallback: if the band is empty (can happen if scores are very concentrated)
-            if cand_keep.numel() == 0:
-                # try just "above lo" (i.e., high-score tail without excluding top)
-                keep = scores >= lo
-                cand_keep = cand_lin[keep]
-
-            if cand_keep.numel() == 0:
-                continue
-
-            # add until block is full
-            need = int(self.block_size) - len(accepted)
-            cand_keep = cand_keep[:need]
-
-            accepted.extend(cand_keep.tolist())
-            accepted_mask[cand_keep] = True
-
-        if len(accepted) < int(self.block_size):
-            raise RuntimeError(
-                f"Could not fill block_size={self.block_size} with quantile band q_lo={q_lo}, q_hi={q_hi}. "
-                f"Got {len(accepted)} after {tries} tries. Increase score_batch_size/max_sampling_tries or widen the band."
-            )
-
-        # finalize current_search_space exactly like PRBCD
-        self.current_search_space = torch.tensor(accepted, device=self.device, dtype=torch.long)
-        self.current_search_space = torch.unique(self.current_search_space, sorted=True)
-
-        if self.make_undirected:
-            self.modified_edge_index = PRBCD.linear_to_triu_idx(self.n, self.current_search_space)
-        else:
-            self.modified_edge_index = PRBCD.linear_to_full_idx(self.n, self.current_search_space)
-            is_not_self = self.modified_edge_index[0] != self.modified_edge_index[1]
-            self.current_search_space = self.current_search_space[is_not_self]
-            self.modified_edge_index = self.modified_edge_index[:, is_not_self]
-
-        self.perturbed_edge_weight = torch.full_like(
-            self.current_search_space, self.eps, dtype=torch.float32, requires_grad=True
-        )
-
-        if exclude_tried:
-            self.tried_mask[self.current_search_space] = True
-
-        if self.current_search_space.size(0) < n_perturbations:
-            raise RuntimeError("Block has fewer unique edges than n_perturbations. Widen band or increase sampling.")
-
-
-    '''def sample_block_from_linkpred_threshold(
             self,
             graph,
             n_perturbations: int = 0,
@@ -1097,9 +1206,9 @@ class PRBCD(SparseAttack):
 
             # decode to pairs for scoring
             if self.make_undirected:
-                cand_ei = PRBCD.linear_to_triu_idx(self.n, cand_lin)
+                cand_ei = PRBCDExtendedPlotting.linear_to_triu_idx(self.n, cand_lin)
             else:
-                cand_ei = PRBCD.linear_to_full_idx(self.n, cand_lin)
+                cand_ei = PRBCDExtendedPlotting.linear_to_full_idx(self.n, cand_lin)
                 is_not_self = cand_ei[0] != cand_ei[1]
                 cand_lin = cand_lin[is_not_self]
                 cand_ei = cand_ei[:, is_not_self]
@@ -1136,9 +1245,9 @@ class PRBCD(SparseAttack):
         self.current_search_space = torch.unique(self.current_search_space, sorted=True)
 
         if self.make_undirected:
-            self.modified_edge_index = PRBCD.linear_to_triu_idx(self.n, self.current_search_space)
+            self.modified_edge_index = PRBCDExtendedPlotting.linear_to_triu_idx(self.n, self.current_search_space)
         else:
-            self.modified_edge_index = PRBCD.linear_to_full_idx(self.n, self.current_search_space)
+            self.modified_edge_index = PRBCDExtendedPlotting.linear_to_full_idx(self.n, self.current_search_space)
             is_not_self = self.modified_edge_index[0] != self.modified_edge_index[1]
             self.current_search_space = self.current_search_space[is_not_self]
             self.modified_edge_index = self.modified_edge_index[:, is_not_self]
@@ -1152,7 +1261,6 @@ class PRBCD(SparseAttack):
 
         if self.current_search_space.size(0) < n_perturbations:
             raise RuntimeError("Block has fewer unique edges than n_perturbations. Lower tau or increase sampling.")
-            '''
 
     def sample_block_from_linkpred_threshold_subgraph(
             self,
@@ -1242,12 +1350,12 @@ class PRBCD(SparseAttack):
 
             # decode LOCAL lin -> LOCAL pairs for scoring
             if self.make_undirected:
-                cand_ei_local = PRBCD.linear_to_triu_idx(m, cand_lin_local)  # (2, B) local ids
+                cand_ei_local = PRBCDExtendedPlotting.linear_to_triu_idx(m, cand_lin_local)  # (2, B) local ids
                 # convert to GLOBAL lin to optionally exclude tried
                 u_l = cand_ei_local[0]
                 v_l = cand_ei_local[1]
             else:
-                cand_ei_local = PRBCD.linear_to_full_idx(m, cand_lin_local)
+                cand_ei_local = PRBCDExtendedPlotting.linear_to_full_idx(m, cand_lin_local)
                 is_not_self = cand_ei_local[0] != cand_ei_local[1]
                 cand_lin_local = cand_lin_local[is_not_self]
                 cand_ei_local = cand_ei_local[:, is_not_self]
@@ -1266,10 +1374,10 @@ class PRBCD(SparseAttack):
                 uu = torch.minimum(u_g, v_g)
                 vv = torch.maximum(u_g, v_g)
                 cand_ei_global_uv = torch.stack([uu, vv], dim=0)  # (2,B)
-                cand_lin_global = PRBCD.triu_idx_to_linear_idx(int(self.n), cand_ei_global_uv).long()
+                cand_lin_global = PRBCDExtendedPlotting.triu_idx_to_linear_idx(int(self.n), cand_ei_global_uv).long()
             else:
                 cand_ei_global_uv = torch.stack([u_g, v_g], dim=0)
-                cand_lin_global = PRBCD.full_idx_to_linear_idx(int(self.n), cand_ei_global_uv).long()
+                cand_lin_global = PRBCDExtendedPlotting.full_idx_to_linear_idx(int(self.n), cand_ei_global_uv).long()
 
             # optionally exclude globally tried (GLOBAL)
             if exclude_tried:
@@ -1316,9 +1424,9 @@ class PRBCD(SparseAttack):
 
         # GLOBAL modified_edge_index for downstream perturbation code
         if self.make_undirected:
-            self.modified_edge_index = PRBCD.linear_to_triu_idx(int(self.n), self.current_search_space)
+            self.modified_edge_index = PRBCDExtendedPlotting.linear_to_triu_idx(int(self.n), self.current_search_space)
         else:
-            self.modified_edge_index = PRBCD.linear_to_full_idx(int(self.n), self.current_search_space)
+            self.modified_edge_index = PRBCDExtendedPlotting.linear_to_full_idx(int(self.n), self.current_search_space)
             is_not_self = self.modified_edge_index[0] != self.modified_edge_index[1]
             self.current_search_space = self.current_search_space[is_not_self]
             self.modified_edge_index = self.modified_edge_index[:, is_not_self]
@@ -1384,9 +1492,9 @@ class PRBCD(SparseAttack):
 
             # decode to pairs for scoring
             if self.make_undirected:
-                cand_ei = PRBCD.linear_to_triu_idx(self.n, cand_lin)
+                cand_ei = PRBCDExtendedPlotting.linear_to_triu_idx(self.n, cand_lin)
             else:
-                cand_ei = PRBCD.linear_to_full_idx(self.n, cand_lin)
+                cand_ei = PRBCDExtendedPlotting.linear_to_full_idx(self.n, cand_lin)
                 is_not_self = cand_ei[0] != cand_ei[1]
                 cand_lin = cand_lin[is_not_self]
                 cand_ei = cand_ei[:, is_not_self]
@@ -1423,9 +1531,9 @@ class PRBCD(SparseAttack):
         self.current_search_space = torch.unique(self.current_search_space, sorted=True)
 
         if self.make_undirected:
-            self.modified_edge_index = PRBCD.linear_to_triu_idx(self.n, self.current_search_space)
+            self.modified_edge_index = PRBCDExtendedPlotting.linear_to_triu_idx(self.n, self.current_search_space)
         else:
-            self.modified_edge_index = PRBCD.linear_to_full_idx(self.n, self.current_search_space)
+            self.modified_edge_index = PRBCDExtendedPlotting.linear_to_full_idx(self.n, self.current_search_space)
             is_not_self = self.modified_edge_index[0] != self.modified_edge_index[1]
             self.current_search_space = self.current_search_space[is_not_self]
             self.modified_edge_index = self.modified_edge_index[:, is_not_self]
@@ -1462,9 +1570,9 @@ class PRBCD(SparseAttack):
 
         # ---- build modified edge index
         if self.make_undirected:
-            self.modified_edge_index = PRBCD.linear_to_triu_idx(self.n, self.current_search_space)
+            self.modified_edge_index = PRBCDExtendedPlotting.linear_to_triu_idx(self.n, self.current_search_space)
         else:
-            self.modified_edge_index = PRBCD.linear_to_full_idx(self.n, self.current_search_space)
+            self.modified_edge_index = PRBCDExtendedPlotting.linear_to_full_idx(self.n, self.current_search_space)
             is_not_self_loop = self.modified_edge_index[0] != self.modified_edge_index[1]
             self.current_search_space = self.current_search_space[is_not_self_loop]
             self.modified_edge_index = self.modified_edge_index[:, is_not_self_loop]
@@ -1961,9 +2069,9 @@ class PRBCD(SparseAttack):
 
         # build modified_edge_index for this augmented block
         if self.make_undirected:
-            self.modified_edge_index = PRBCD.linear_to_triu_idx(self.n, self.current_search_space)
+            self.modified_edge_index = PRBCDExtendedPlotting.linear_to_triu_idx(self.n, self.current_search_space)
         else:
-            self.modified_edge_index = PRBCD.linear_to_full_idx(self.n, self.current_search_space)
+            self.modified_edge_index = PRBCDExtendedPlotting.linear_to_full_idx(self.n, self.current_search_space)
             is_not_self_loop = self.modified_edge_index[0] != self.modified_edge_index[1]
             self.current_search_space = self.current_search_space[is_not_self_loop]
             self.modified_edge_index = self.modified_edge_index[:, is_not_self_loop]
@@ -2399,7 +2507,7 @@ class PRBCD(SparseAttack):
         full_idx = torch.stack([uu, vv], dim=0)  # (2, K')
 
         # convert to PRBCD's linear indexing
-        lin_idx = PRBCD.triu_idx_to_linear_idx(self.n, full_idx)
+        lin_idx = PRBCDExtendedPlotting.triu_idx_to_linear_idx(self.n, full_idx)
 
         self.current_search_space = lin_idx
         self.modified_edge_index = full_idx
@@ -2518,7 +2626,7 @@ class PRBCD(SparseAttack):
         topk_idx = torch.topk(edge_uncertainty_all, k=K, largest=True).indices
 
         block_pairs = all_edge_index[:, topk_idx].detach().cpu()  # (2, K)
-        block_lin = PRBCD.triu_idx_to_linear_idx(N, block_pairs)  # (K,), CPU
+        block_lin = PRBCDExtendedPlotting.triu_idx_to_linear_idx(N, block_pairs)  # (K,), CPU
 
         # IMPORTANT: match PR-BCD expectations
         self.current_search_space = block_lin.detach().to(device)  # (K,)
@@ -2587,9 +2695,9 @@ class PRBCD(SparseAttack):
 
         # --- 5) Set modified_edge_index exactly like sample_random_block ---
         if self.make_undirected:
-            self.modified_edge_index = PRBCD.linear_to_triu_idx(N, self.current_search_space)
+            self.modified_edge_index = PRBCDExtendedPlotting.linear_to_triu_idx(N, self.current_search_space)
         else:
-            self.modified_edge_index = PRBCD.linear_to_full_idx(N, self.current_search_space)
+            self.modified_edge_index = PRBCDExtendedPlotting.linear_to_full_idx(N, self.current_search_space)
             # drop self-loops in the directed/full case
             is_not_self_loop = self.modified_edge_index[0] != self.modified_edge_index[1]
             if not torch.all(is_not_self_loop):
@@ -2664,7 +2772,7 @@ class PRBCD(SparseAttack):
         chosen = topk.indices  # indices into iu/ju
 
         block_pairs = torch.stack([iu[chosen].cpu(), ju[chosen].cpu()], dim=0).contiguous()  # (2, K)
-        block_lin = PRBCD.triu_idx_to_linear_idx(N, block_pairs)  # (K,), CPU
+        block_lin = PRBCDExtendedPlotting.triu_idx_to_linear_idx(N, block_pairs)  # (K,), CPU
 
         self.current_search_space = block_lin.detach().to(device)  # (K,)
         self.modified_edge_index = block_pairs.detach().to(device)  # (2, K)
@@ -2732,9 +2840,9 @@ class PRBCD(SparseAttack):
 
         # --- 5) Set modified_edge_index exactly like sample_random_block ---
         if self.make_undirected:
-            self.modified_edge_index = PRBCD.linear_to_triu_idx(N, self.current_search_space)
+            self.modified_edge_index = PRBCDExtendedPlotting.linear_to_triu_idx(N, self.current_search_space)
         else:
-            self.modified_edge_index = PRBCD.linear_to_full_idx(N, self.current_search_space)
+            self.modified_edge_index = PRBCDExtendedPlotting.linear_to_full_idx(N, self.current_search_space)
             # drop self-loops in the directed/full case
             is_not_self_loop = self.modified_edge_index[0] != self.modified_edge_index[1]
             if not torch.all(is_not_self_loop):
@@ -2842,9 +2950,9 @@ class PRBCD(SparseAttack):
 
         # --- 5) Set modified_edge_index like sample_random_block ---
         if self.make_undirected:
-            self.modified_edge_index = PRBCD.linear_to_triu_idx(N, self.current_search_space)
+            self.modified_edge_index = PRBCDExtendedPlotting.linear_to_triu_idx(N, self.current_search_space)
         else:
-            self.modified_edge_index = PRBCD.linear_to_full_idx(N, self.current_search_space)
+            self.modified_edge_index = PRBCDExtendedPlotting.linear_to_full_idx(N, self.current_search_space)
             is_not_self_loop = self.modified_edge_index[0] != self.modified_edge_index[1]
             if not torch.all(is_not_self_loop):
                 self.current_search_space = self.current_search_space[is_not_self_loop]
@@ -2916,7 +3024,7 @@ class PRBCD(SparseAttack):
                 return torch.empty(0, dtype=torch.long, device=dev)
             uu, vv = uu[mask], vv[mask]
             full_idx = torch.stack([uu, vv], dim=0)
-            return PRBCD.triu_idx_to_linear_idx(N, full_idx)
+            return PRBCDExtendedPlotting.triu_idx_to_linear_idx(N, full_idx)
 
         # --- (3) candidate edges: intra-TopK and incident to outside ---
         # Intra-TopK
@@ -3009,7 +3117,7 @@ class PRBCD(SparseAttack):
 
         # --- finalize PR-BCD tensors ---
         self.current_search_space = sel_lin
-        self.modified_edge_index = PRBCD.linear_to_triu_idx(N, sel_lin)
+        self.modified_edge_index = PRBCDExtendedPlotting.linear_to_triu_idx(N, sel_lin)
         self.perturbed_edge_weight = torch.full(
             (sel_lin.numel(),), self.eps, dtype=torch.float32, device=dev, requires_grad=True
         )
@@ -3147,7 +3255,7 @@ class PRBCD(SparseAttack):
             if mask.sum() == 0:
                 return torch.empty(0, dtype=torch.long, device=dev)
             uu, vv = uu[mask], vv[mask]
-            return PRBCD.triu_idx_to_linear_idx(N, torch.stack([uu, vv], dim=0))
+            return PRBCDExtendedPlotting.triu_idx_to_linear_idx(N, torch.stack([uu, vv], dim=0))
 
         # 4) Pick k nodes — either greedy top‑k or Gumbel‑top‑k over softmax(node_score/τ)
         if k_nodes is None:
@@ -3156,7 +3264,7 @@ class PRBCD(SparseAttack):
 
         if gumbel_nodes:
             node_logits = torch.log_softmax(node_score / max(1e-6, float(tau_nodes)), dim=0)
-            topk_nodes = PRBCD._gumbel_topk(self ,node_logits, k).to(dev)
+            topk_nodes = PRBCDExtendedPlotting._gumbel_topk(self, node_logits, k).to(dev)
         else:
             topk_nodes = torch.topk(node_score, k=k, largest=True).indices.to(dev)
 
@@ -3255,7 +3363,7 @@ class PRBCD(SparseAttack):
 
         # 8) Finalize PR-BCD block tensors
         self.current_search_space = sel_lin
-        self.modified_edge_index = PRBCD.linear_to_triu_idx(N, sel_lin)
+        self.modified_edge_index = PRBCDExtendedPlotting.linear_to_triu_idx(N, sel_lin)
         self.perturbed_edge_weight = torch.full((sel_lin.numel(),), self.eps, dtype=torch.float32, device=dev,
                                                 requires_grad=True)
 
@@ -3313,7 +3421,7 @@ class PRBCD(SparseAttack):
             intra_u, intra_v = comb[:, 0], comb[:, 1]
             uu = torch.minimum(intra_u, intra_v)
             vv = torch.maximum(intra_u, intra_v)
-            intra_lin = PRBCD.triu_idx_to_linear_idx(N, torch.stack([uu, vv], dim=0))
+            intra_lin = PRBCDExtendedPlotting.triu_idx_to_linear_idx(N, torch.stack([uu, vv], dim=0))
             intra_scores = node_scores[intra_u] + node_scores[intra_v]
         else:
             intra_lin = torch.empty(0, dtype=torch.long, device=dev)
@@ -3360,7 +3468,7 @@ class PRBCD(SparseAttack):
                 uu = uu[uniq_idx];
                 vv = vv[uniq_idx];
                 ss = ss[uniq_idx]
-                inc_lin = PRBCD.triu_idx_to_linear_idx(N, torch.stack([uu, vv], dim=0))
+                inc_lin = PRBCDExtendedPlotting.triu_idx_to_linear_idx(N, torch.stack([uu, vv], dim=0))
                 inc_scores = ss
 
         # ---- assemble by quota ----
@@ -3408,8 +3516,8 @@ class PRBCD(SparseAttack):
 
         kept_lin = self.current_search_space[keep_idx].to(self.device)
         kept_w = self.perturbed_edge_weight[keep_idx].to(self.device)
-        kept_pairs = PRBCD.linear_to_triu_idx(self.n, kept_lin) if self.make_undirected \
-            else PRBCD.linear_to_full_idx(self.n, kept_lin)
+        kept_pairs = PRBCDExtendedPlotting.linear_to_triu_idx(self.n, kept_lin) if self.make_undirected \
+            else PRBCDExtendedPlotting.linear_to_full_idx(self.n, kept_lin)
 
         # --- selector update (PGD teacher) ---
         self._selector_online_step_pgd()
@@ -3436,8 +3544,8 @@ class PRBCD(SparseAttack):
                 all_lin = kept_lin
                 pos_kept = torch.arange(kept_lin.numel(), device=self.device, dtype=torch.long)
 
-            self.modified_edge_index = PRBCD.linear_to_triu_idx(self.n, all_lin) if self.make_undirected \
-                else PRBCD.linear_to_full_idx(self.n, all_lin)
+            self.modified_edge_index = PRBCDExtendedPlotting.linear_to_triu_idx(self.n, all_lin) if self.make_undirected \
+                else PRBCDExtendedPlotting.linear_to_full_idx(self.n, all_lin)
 
             new_w = torch.full((all_lin.numel(),), self.eps, dtype=torch.float32, device=self.device)
             new_w[pos_kept] = kept_w
@@ -3541,9 +3649,9 @@ class PRBCD(SparseAttack):
             )
 
             if self.make_undirected:
-                self.modified_edge_index = PRBCD.linear_to_triu_idx(self.n, self.current_search_space)
+                self.modified_edge_index = PRBCDExtendedPlotting.linear_to_triu_idx(self.n, self.current_search_space)
             else:
-                self.modified_edge_index = PRBCD.linear_to_full_idx(self.n, self.current_search_space)
+                self.modified_edge_index = PRBCDExtendedPlotting.linear_to_full_idx(self.n, self.current_search_space)
 
             # Merge existing weights with new edge weights
             perturbed_edge_weight_old = self.perturbed_edge_weight.clone()
@@ -3615,8 +3723,8 @@ class PRBCD(SparseAttack):
         # helper: decode lin -> edge_index for scoring
         def decode_lin(cand_lin: torch.Tensor) -> torch.Tensor:
             if self.make_undirected:
-                return PRBCD.linear_to_triu_idx(self.n, cand_lin)
-            ei = PRBCD.linear_to_full_idx(self.n, cand_lin)
+                return PRBCDExtendedPlotting.linear_to_triu_idx(self.n, cand_lin)
+            ei = PRBCDExtendedPlotting.linear_to_full_idx(self.n, cand_lin)
             is_not_self = ei[0] != ei[1]
             return ei[:, is_not_self], cand_lin[is_not_self]
 
@@ -3657,9 +3765,9 @@ class PRBCD(SparseAttack):
 
             # 3) decode and (optionally) filter self-loops
             if self.make_undirected:
-                cand_ei = PRBCD.linear_to_triu_idx(self.n, cand_lin)
+                cand_ei = PRBCDExtendedPlotting.linear_to_triu_idx(self.n, cand_lin)
             else:
-                cand_ei = PRBCD.linear_to_full_idx(self.n, cand_lin)
+                cand_ei = PRBCDExtendedPlotting.linear_to_full_idx(self.n, cand_lin)
                 is_not_self = cand_ei[0] != cand_ei[1]
                 cand_lin = cand_lin[is_not_self]
                 cand_ei = cand_ei[:, is_not_self]
@@ -3690,9 +3798,9 @@ class PRBCD(SparseAttack):
             )
 
             if self.make_undirected:
-                self.modified_edge_index = PRBCD.linear_to_triu_idx(self.n, self.current_search_space)
+                self.modified_edge_index = PRBCDExtendedPlotting.linear_to_triu_idx(self.n, self.current_search_space)
             else:
-                self.modified_edge_index = PRBCD.linear_to_full_idx(self.n, self.current_search_space)
+                self.modified_edge_index = PRBCDExtendedPlotting.linear_to_full_idx(self.n, self.current_search_space)
 
             self.perturbed_edge_weight = torch.full_like(
                 self.current_search_space, self.eps, dtype=torch.float32
@@ -3724,30 +3832,27 @@ class PRBCD(SparseAttack):
             n_perturbations: int,
             tau: float = 0.8,
             max_sampling_tries: int = 2_000_000,
-            score_batch_size: int = 125000,
+            score_batch_size: int = 1000,
             rng_seed: int = 0,
             exclude_tried: bool = True,
     ):
         """
-        Resampling function, that encodes the link-pred GNN on the *current perturbed graph*
+        Drop-in replacement that encodes the link-pred GNN on the *current perturbed graph*
         (via self.get_modified_adj()) instead of the unperturbed input `graph`.
 
         Notes:
           - We binarize the current attacked adjacency for the LP encoder by default:
                 keep edges with edge_weight > 0.5
             (Adjust the threshold below if your LP model expects something else.)
-          - Candidate sampling is done from a restricted "allowed pool" derived from a single
-            combined block mask (block + tried), rather than sampling from the full space
-            and then cutting.
+          - Everything else follows your original logic.
         """
-
         import torch
 
         if not hasattr(self, "lp_model") or self.lp_model is None:
             raise RuntimeError("self.lp_model is not set.")
 
         # -----------------------------
-        # tried_mask init
+        # tried_mask init (same intent)
         # -----------------------------
         if exclude_tried and (not hasattr(self, "tried_mask") or self.tried_mask is None):
             self.tried_mask = torch.zeros(self.n_possible_edges, device=self.device, dtype=torch.bool)
@@ -3782,11 +3887,9 @@ class PRBCD(SparseAttack):
             edge_index_mod = edge_index_mod.to(self.device)
             edge_weight_mod = edge_weight_mod.to(self.device).float()
 
-            edge_index_struct = edge_index_mod
-
-            '''# Binarize attacked adjacency for message passing
+            # Binarize attacked adjacency for message passing
             present = edge_weight_mod > 0.5
-            edge_index_struct = edge_index_mod[:, present]'''
+            edge_index_struct = edge_index_mod[:, present]
 
         # encode once
         self.lp_model = self.lp_model.to(self.device).eval()
@@ -3796,53 +3899,37 @@ class PRBCD(SparseAttack):
         g = torch.Generator(device=self.device)
         g.manual_seed(int(rng_seed))
 
-        # -----------------------------
         # masks for uniqueness within the block
-        # -----------------------------
         block_mask = torch.zeros(self.n_possible_edges, device=self.device, dtype=torch.bool)
-        if self.current_search_space.numel() > 0:
-            block_mask[self.current_search_space] = True
-
-        # Combine masks: "blocked" = in block OR (optionally) already tried
-        blocked_mask = block_mask.clone()
-        if exclude_tried:
-            blocked_mask |= self.tried_mask
-
-        # Allowed pool: indices we can sample from (NOT blocked)
-        allowed_pool = torch.nonzero(~blocked_mask, as_tuple=False).view(-1)
+        block_mask[self.current_search_space] = True
 
         accepted = []
         tries = 0
         n_needed = int(self.block_size - self.current_search_space.numel())
 
-        # If we already have enough, skip refill loop
-        if n_needed < 0:
-            n_needed = 0
-
         while len(accepted) < n_needed and tries < int(max_sampling_tries):
             tries += 1
 
-            # Nothing left to sample from -> cannot refill
-            if allowed_pool.numel() == 0:
-                break
-
-            # sample directly from allowed pool (restricted sampling)
-            k = min(int(score_batch_size), int(allowed_pool.numel()))
-            idx = torch.randint(allowed_pool.numel(), (k,), device=self.device, generator=g)
-            cand_lin = allowed_pool[idx]
+            cand_lin = torch.randint(
+                self.n_possible_edges, (int(score_batch_size),), device=self.device, generator=g
+            )
             cand_lin = torch.unique(cand_lin, sorted=False)
 
-            # Pool can be slightly stale because we accept edges and update block_mask.
-            # Filter out edges that have become blocked since pool creation.
+            # exclude already in block
             cand_lin = cand_lin[~block_mask[cand_lin]]
+
+            # optional exclude tried
+            if exclude_tried:
+                cand_lin = cand_lin[~self.tried_mask[cand_lin]]
+
             if cand_lin.numel() == 0:
                 continue
 
             # decode to pairs
             if self.make_undirected:
-                cand_ei = PRBCD.linear_to_triu_idx(self.n, cand_lin)
+                cand_ei = PRBCDExtendedPlotting.linear_to_triu_idx(self.n, cand_lin)
             else:
-                cand_ei = PRBCD.linear_to_full_idx(self.n, cand_lin)
+                cand_ei = PRBCDExtendedPlotting.linear_to_full_idx(self.n, cand_lin)
                 is_not_self = cand_ei[0] != cand_ei[1]
                 cand_lin = cand_lin[is_not_self]
                 cand_ei = cand_ei[:, is_not_self]
@@ -3861,19 +3948,8 @@ class PRBCD(SparseAttack):
 
             need = n_needed - len(accepted)
             cand_keep = cand_keep[:need]
-
             accepted.extend(cand_keep.tolist())
-
-            # update block_mask for uniqueness
             block_mask[cand_keep] = True
-
-            # also update blocked_mask + allowed_pool if you want to keep pool tight
-            # (this avoids repeatedly drawing now-blocked edges)
-            if cand_keep.numel() > 0:
-                blocked_mask[cand_keep] = True
-                # remove newly blocked edges from pool
-                # (cheap: just filter pool by blocked_mask)
-                allowed_pool = allowed_pool[~blocked_mask[allowed_pool]]
 
         if len(accepted) < n_needed:
             raise RuntimeError(
@@ -3905,9 +3981,9 @@ class PRBCD(SparseAttack):
 
         # rebuild modified_edge_index from new_space
         if self.make_undirected:
-            self.modified_edge_index = PRBCD.linear_to_triu_idx(self.n, self.current_search_space)
+            self.modified_edge_index = PRBCDExtendedPlotting.linear_to_triu_idx(self.n, self.current_search_space)
         else:
-            self.modified_edge_index = PRBCD.linear_to_full_idx(self.n, self.current_search_space)
+            self.modified_edge_index = PRBCDExtendedPlotting.linear_to_full_idx(self.n, self.current_search_space)
 
         self.perturbed_edge_weight = new_w
 
@@ -3998,10 +4074,10 @@ class PRBCD(SparseAttack):
             if self.make_undirected:
                 uu, vv = (u, v) if u < v else (v, u)
                 full = torch.tensor([[uu], [vv]], dtype=torch.long)
-                return int(PRBCD.triu_idx_to_linear_idx(self.n, full).item())
+                return int(PRBCDExtendedPlotting.triu_idx_to_linear_idx(self.n, full).item())
             else:
                 full = torch.tensor([[u], [v]], dtype=torch.long)
-                return int(PRBCD.full_to_linear_idx(self.n, full).item())
+                return int(PRBCDExtendedPlotting.full_to_linear_idx(self.n, full).item())
 
         # --- sample candidates and evaluate ---
         rng = np.random.default_rng(rng_seed)
@@ -4121,7 +4197,7 @@ class PRBCD(SparseAttack):
                    else torch.ones(ei_base.size(1), device=device, dtype=torch.float32)).contiguous()
 
         # ---- build undirected membership bitset
-        present = PRBCD._build_uppertri_bitset(ei_base, n)  # (num_pairs,) bool
+        present = PRBCDExtendedPlotting._build_uppertri_bitset(ei_base, n)  # (num_pairs,) bool
 
         E = ei_base.size(1)
         dir_pos = torch.full((n, n), -1, dtype=torch.int32, device=device)
@@ -4289,7 +4365,7 @@ class PRBCD(SparseAttack):
                 # compute linear indices (upper-tri)
                 # full_idx shape (2, m)
                 full_idx = torch.stack([uu, vv], dim=0)
-                k_all = PRBCD.triu_idx_to_linear_idx(n, full_idx).long()  # (m,)
+                k_all = PRBCDExtendedPlotting.triu_idx_to_linear_idx(n, full_idx).long()  # (m,)
 
                 # filter: not already seen
                 not_seen = ~seen[k_all]
@@ -4326,7 +4402,7 @@ class PRBCD(SparseAttack):
         # -------- switch: sampling mode --------
         if mode == "one_sample":
             while (flips_done == 0 or flips_done < n_candidates_one_sample) and tries < max_sampling_tries:
-                u, v, action, k_lin = PRBCD._sample_one_flip(n, present, g, device)
+                u, v, action, k_lin = PRBCDExtendedPlotting._sample_one_flip(n, present, g, device)
                 tries += 1
                 if seen[k_lin]:
                     continue
@@ -4397,7 +4473,7 @@ class PRBCD(SparseAttack):
 
         elif mode == "k_action":
             while (flips_done == 0 or flips_done < n_candidates_k_sample) and tries < max_sampling_tries:
-                batch = PRBCD._sample_k_flips(
+                batch = PRBCDExtendedPlotting._sample_k_flips(
                     n=n,
                     present=present,
                     g=g,
@@ -4435,7 +4511,7 @@ class PRBCD(SparseAttack):
 
         elif mode == "k_action_individual":
             while (flips_done == 0 or flips_done < n_candidates_k_sample) and tries < max_sampling_tries:
-                batch = PRBCD._sample_k_flips(
+                batch = PRBCDExtendedPlotting._sample_k_flips(
                     n=n,
                     present=present,
                     g=g,
@@ -4496,7 +4572,7 @@ class PRBCD(SparseAttack):
             max_root_tries = 100_000
 
             while (flips_done == 0 or flips_done < n_candidates_k_hop_sample) and tries < max_sampling_tries:
-                batch = PRBCD._sample_khop_flips(
+                batch = PRBCDExtendedPlotting._sample_khop_flips(
                     n=n,
                     present=present,
                     g=g,
@@ -4727,7 +4803,7 @@ class PRBCD(SparseAttack):
             dir_pos[ei_sub[0], ei_sub[1]] = torch.arange(E_sub, device=device, dtype=torch.int32)
 
         # membership bitset for local undirected presence
-        present = PRBCD._build_uppertri_bitset(ei_sub, m)  # (m*(m-1)//2,) bool
+        present = PRBCDExtendedPlotting._build_uppertri_bitset(ei_sub, m)  # (m*(m-1)//2,) bool
 
         # ---------------- clean forward on SUBGRAPH ONLY ----------------
         # IMPORTANT: This assumes your attacked_model can run on (attr_sub, adj_sub)
@@ -4810,7 +4886,7 @@ class PRBCD(SparseAttack):
         # ---------------- main loop: one_sample on SUBGRAPH, endpoint labels on SUBGRAPH ----------------
         while (flips_done == 0 or flips_done < n_candidates_one_sample) and tries < max_sampling_tries:
             # sample one flip in LOCAL subgraph index space
-            u_l, v_l, action, k_lin_local = PRBCD._sample_one_flip(m, present, g, device)
+            u_l, v_l, action, k_lin_local = PRBCDExtendedPlotting._sample_one_flip(m, present, g, device)
             tries += 1
 
             # map LOCAL endpoints -> GLOBAL endpoints
@@ -4935,7 +5011,7 @@ class PRBCD(SparseAttack):
                    else torch.ones(ei_base.size(1), device=device, dtype=torch.float32)).contiguous()
 
         # ---- undirected membership bitset
-        present = PRBCD._build_uppertri_bitset(ei_base, n)
+        present = PRBCDExtendedPlotting._build_uppertri_bitset(ei_base, n)
 
         E = ei_base.size(1)
         dir_pos = torch.full((n, n), -1, dtype=torch.int32, device=device)
@@ -5001,7 +5077,7 @@ class PRBCD(SparseAttack):
         # ---- k_action loop ----
         while (flips_done == 0 or flips_done < n_candidates_k_sample) and tries < max_sampling_tries:
 
-            batch = PRBCD._sample_k_flips(
+            batch = PRBCDExtendedPlotting._sample_k_flips(
                 n=n,
                 present=present,
                 g=g,
@@ -5048,7 +5124,7 @@ class PRBCD(SparseAttack):
         num_pairs = n * (n - 1) // 2
         if num_pairs == 0:
             return torch.zeros(0, dtype=torch.bool, device=edge_index.device)
-        lin = PRBCD.pairs_to_linear_uppertri(edge_index, n)  # (E',)
+        lin = PRBCDExtendedPlotting.pairs_to_linear_uppertri(edge_index, n)  # (E',)
         if lin.numel() > 0:
             lin = torch.unique(lin, sorted=False)
         present = torch.zeros(num_pairs, dtype=torch.bool, device=edge_index.device)
@@ -5099,7 +5175,7 @@ class PRBCD(SparseAttack):
         """
         num_pairs = n * (n - 1) // 2
         k = int(torch.randint(num_pairs, (1,), generator=g, device=device).item())
-        uv = PRBCD.linear_to_triu_idx(n, torch.tensor([k], device=device))  # (2,1)
+        uv = PRBCDExtendedPlotting.linear_to_triu_idx(n, torch.tensor([k], device=device))  # (2,1)
         u = int(uv[0, 0].item())
         v = int(uv[1, 0].item())
         action = "del" if present[k].item() else "add"
@@ -5135,7 +5211,7 @@ class PRBCD(SparseAttack):
             pick = mask[perm[:k]]
 
         # map linear -> (u,v) with u<v
-        uv = PRBCD.linear_to_triu_idx(n, pick.long())  # shape (2, m)
+        uv = PRBCDExtendedPlotting.linear_to_triu_idx(n, pick.long())  # shape (2, m)
         u = uv[0].to(torch.int64)
         v = uv[1].to(torch.int64)
 
@@ -5223,7 +5299,7 @@ class PRBCD(SparseAttack):
                 dim=0,
             )  # shape (2, m)
 
-            k_lin_all = PRBCD.pairs_to_linear_uppertri(pair_ei, n).long()  # (m,)
+            k_lin_all = PRBCDExtendedPlotting.pairs_to_linear_uppertri(pair_ei, n).long()  # (m,)
 
             # 5) keep only unseen pairs
             unseen_mask = (~seen[k_lin_all]).nonzero(as_tuple=False).flatten()
@@ -5604,7 +5680,7 @@ class PRBCD(SparseAttack):
         ]
 
         if csv_path is None:
-            csv_path = PRBCD.make_selector_gnn_log_path(
+            csv_path = PRBCDExtendedPlotting.make_selector_gnn_log_path(
                 ads_mode=self.ads_mode,
                 drop_mode=self.drop_mode,
                 k_samples_batch=self.k_samples_batch,
@@ -5688,8 +5764,8 @@ class PRBCD(SparseAttack):
                 acc_pos = float((preds_val[yv == 1] == 1).float().mean().item()) if (yv == 1).any() else float("nan")
                 acc_neg = float((preds_val[yv == 0] == 0).float().mean().item()) if (yv == 0).any() else float("nan")
 
-                tp, fp, tn, fn = PRBCD._confusion_counts(preds_val, yv)
-                auc, ap = PRBCD._safe_auc_ap_sklearn(probs_val, yv)
+                tp, fp, tn, fn = PRBCDExtendedPlotting._confusion_counts(preds_val, yv)
+                auc, ap = PRBCDExtendedPlotting._safe_auc_ap_sklearn(probs_val, yv)
 
                 pmin = float(probs_val.min().item())
                 pmean = float(probs_val.mean().item())
@@ -6084,16 +6160,16 @@ class PRBCD(SparseAttack):
         #self.current_search_space = self.current_search_space[
         #                                torch.randperm(self.current_search_space.size(0))[:self.block_size]
         #                                ]
-        self.modified_edge_index = PRBCD.linear_to_triu_idx(self.n, self.current_search_space)
+        self.modified_edge_index = PRBCDExtendedPlotting.linear_to_triu_idx(self.n, self.current_search_space)
         # if the new logic is usable this method is redundant
         return
 
     def edges_to_current_search_space(self, n: int):
         # first we cut edges so that index build a triu matrix
         # (function triu_idx_to_linear only support triu matrix idx)
-        self.edges_to_attack_index = PRBCD.flip_matrix_idx_to_triu_idx(self.edges_to_attack_index)
+        self.edges_to_attack_index = PRBCDExtendedPlotting.flip_matrix_idx_to_triu_idx(self.edges_to_attack_index)
         # we then build linear idx which is the current_search_space
-        lin_idx = PRBCD.triu_idx_to_linear_idx(n, self.edges_to_attack_index)
+        lin_idx = PRBCDExtendedPlotting.triu_idx_to_linear_idx(n, self.edges_to_attack_index)
         lin_idx = torch.unique(lin_idx, sorted=True)
         return lin_idx
 
@@ -6123,12 +6199,18 @@ class PRBCD(SparseAttack):
         return
 
     def _append_attack_statistics(self, loss: float, accuracy: float,
-                                  probability_mass_update: float, probability_mass_projected: float):
+                                  probability_mass_update: float, probability_mass_projected: float, spearman_rho: float = None):
         self.attack_statistics['loss'].append(loss)
         self.attack_statistics['accuracy'].append(accuracy)
         self.attack_statistics['nonzero_weights'].append((self.perturbed_edge_weight > self.eps).sum().item())
         self.attack_statistics['probability_mass_update'].append(probability_mass_update)
         self.attack_statistics['probability_mass_projected'].append(probability_mass_projected)
+
+        if spearman_rho is not None:
+            self.attack_statistics['spearman_rho'].append(spearman_rho)
+
+    def _append_attack_statistics_spearman_rho(self, spearman_rho: float):
+        self.attack_statistics['spearman_rho'].append(spearman_rho)
 
     def extract_X_and_edge_index_from_sparsegraph(self, graph):
         N, d = graph.attr_matrix.shape
@@ -6326,7 +6408,7 @@ class PRBCD(SparseAttack):
 
     @staticmethod
     def flip_matrix_idx_to_triu_idx(matrix: torch.tensor) -> torch.tensor:
-        matrix = PRBCD.cut_diagonal_entries(matrix)
+        matrix = PRBCDExtendedPlotting.cut_diagonal_entries(matrix)
         row_idx = matrix[0]
         col_idx = matrix[1]
         # flip all entries of matrix where the entry (x,y) holds x>y
@@ -6444,7 +6526,7 @@ class PRBCD(SparseAttack):
 
     @staticmethod
     def tried_add_del_proportion(tried_set, edge_index_struct, n):
-        undirected_edges = PRBCD._build_undirected_edge_set(edge_index_struct)
+        undirected_edges = PRBCDExtendedPlotting._build_undirected_edge_set(edge_index_struct)
 
         n_del_like = 0  # pair exists in graph -> would be a deletion candidate
         n_add_like = 0  # pair not in graph -> would be an addition candidate
@@ -6455,7 +6537,7 @@ class PRBCD(SparseAttack):
             if k_lin < 0 or k_lin >= n * (n - 1) // 2:
                 missing_decode += 1
                 continue
-            u, v = PRBCD._uppertri_decode(k_lin, n)
+            u, v = PRBCDExtendedPlotting._uppertri_decode(k_lin, n)
             if (u, v) in undirected_edges:
                 n_del_like += 1
             else:
