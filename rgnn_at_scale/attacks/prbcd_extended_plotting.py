@@ -615,13 +615,204 @@ class PRBCDExtendedPlotting(SparseAttack):
 
             grad_abs_mean = grad_abs_cum / float(self.epochs)
 
-            s = scores.detach().cpu().view(-1).numpy()
-            g = grad_abs_mean.detach().cpu().view(-1).numpy()
+            spearman_score = scores.detach().cpu().view(-1).numpy()
+            spearman_gradient = grad_abs_mean.detach().cpu().view(-1).numpy()
 
-            rho, p = spearmanr(s, g)
+            rho, p = spearmanr(spearman_score, spearman_gradient)
             print("Spearman rho:", rho, "p:", p)
 
             self._append_attack_statistics_spearman_rho(rho)
+
+        elif plot_gen in ("jaccard_topk",):
+            print(plot_gen, "-> computing jaccard_topk")
+
+            self.n_candidates_k_sample = 2000
+            self.n_candidates_one_sample = 5000
+            self.acc_drop_threshold_k_samples = 1e-3
+            self.loss_drop_threshold_k_samples = 1e-3
+            self.k_samples_batch = 10
+            self.ads_mode = "one_sample"
+            self.drop_mode = "endpoint"
+
+            if self.drop_mode == "acc":  # TODO: logging für alle ads_modes+drop_modes
+                cache_path = f"cache/selection_dataset{self.dataset}_seed{self.seed}_ads_{self.ads_mode}_k{self.n_candidates_k_sample}_bt{self.k_samples_batch}_drpmd{self.drop_mode}_drp{self.acc_drop_threshold_k_samples}.pt"
+            elif self.drop_mode == "loss":
+                cache_path = f"cache/selection_dataset{self.dataset}_seed{self.seed}_ads_{self.ads_mode}_k{self.n_candidates_k_sample}_bt{self.k_samples_batch}_drpmd{self.drop_mode}_drp{self.loss_drop_threshold_k_samples}.pt"
+            elif self.drop_mode == "endpoint":
+                cache_path = f"cache/selection_dataset{self.dataset}_seed{self.seed}_ads_{self.ads_mode}_k{self.n_candidates_one_sample}_drpmd{self.drop_mode}.pt"
+
+            if os.path.exists(cache_path):
+                print("[CACHE] loading selection:", cache_path)
+                (
+                    y_out,
+                    edge_index_lab,
+                    y_label,
+                    tried_set,
+                    harmful_set,
+                    sub_nodes,
+                    edge_index_sub,
+                    edge_weight_sub,
+                    edge_index_lab_local,
+                    X_sub,
+                    edge_index_struct_local,
+                    meta,
+                ) = PRBCDExtendedPlotting.load_selection(
+                    cache_path,
+                    device=self.device,
+                )
+            else:
+                print("[CACHE] computing selection and saving:", cache_path)
+                y_out, edge_index_lab, y_label, tried_set, harmful_set = self.label_edge_flips_prbcd_selfsample_fast(
+                    mode=self.ads_mode,
+                    drop_mode=self.drop_mode,
+                    n_candidates_k_sample=self.n_candidates_k_sample,
+                    n_candidates_one_sample=self.n_candidates_one_sample,
+                    acc_drop_threshold_k_samples=self.acc_drop_threshold_k_samples,
+                    loss_drop_threshold_k_samples=self.loss_drop_threshold_k_samples,
+                    k_samples_batch=self.k_samples_batch
+                )
+                meta = {
+                    "ads_mode": self.ads_mode,
+                    "n_candidates_k_sample": self.n_candidates_k_sample,
+                    "acc_drop_threshold_k_samples": self.acc_drop_threshold_k_samples,
+                    "loss_drop_threshold_k_samples": self.loss_drop_threshold_k_samples,
+                }
+                PRBCDExtendedPlotting.save_selection(cache_path, y_out, edge_index_lab, y_label, tried_set, harmful_set,
+                                                     meta=meta)
+
+            X, edge_index_struct = self.extract_X_and_edge_index_from_sparsegraph(graph)
+            stats = PRBCDExtendedPlotting.tried_add_del_proportion(tried_set, edge_index_struct, n=int(self.n))
+            print(stats)
+
+            self.lp_model = self.train_link_prediction_gnn(
+                x=X,
+                edge_index_struct=edge_index_struct,
+                edge_index_lab=edge_index_lab,
+                y_label=y_label,
+                device=self.device,
+                num_epochs=200,
+                use_tqdm=True,
+                verbose=True,
+            )
+            self.sample_block_from_linkpred_threshold(graph=graph, n_perturbations=n_perturbations)
+            self.sample_random_block(n_perturbations)
+
+            with torch.no_grad():
+
+                logits = self._get_logits(self.attr, self.edge_index, self.edge_weight)
+                loss = self.calculate_loss(logits[self.idx_attack], self.labels[self.idx_attack])
+                accuracy = utils.accuracy(logits, self.labels, self.idx_attack)
+
+                logging.info(f'\nBefore the attack - Loss: {loss.item()} Accuracy: {100 * accuracy:.3f} %\n')
+
+                self._append_attack_statistics(loss.item(), accuracy, 0., 0.)
+
+                del logits, loss
+
+            # ------ Get model eval for block ------
+
+            h = self.lp_model.encoder(X, edge_index_struct)
+            logits = self.lp_model.edge_head(h, PRBCDExtendedPlotting.linear_to_triu_idx(self.n,
+                                                                                         self.current_search_space))
+            scores = torch.sigmoid(logits)
+
+            # ------ Get PRBCD Gradient For Block ------
+
+            grad_abs_cum = torch.zeros_like(self.perturbed_edge_weight)
+
+            # Loop over the epochs (Algorithm 1, line 5)
+            for epoch in tqdm(range(self.epochs)):
+                self.perturbed_edge_weight.requires_grad = True
+
+                # Retreive sparse perturbed adjacency matrix `A \oplus p_{t-1}` (Algorithm 1, line 6)
+                edge_index, edge_weight = self.get_modified_adj()
+
+                if torch.cuda.is_available() and self.do_synchronize:
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+
+                # Calculate logits for each node (Algorithm 1, line 6)
+                logits = self._get_logits(self.attr, edge_index, edge_weight)
+                # Calculate loss combining all each node (Algorithm 1, line 7)
+                loss = self.calculate_loss(logits[self.idx_attack], self.labels[
+                    self.idx_attack])  # Todo: Hier wird der loss und gradient für perturbed edge weight erzeugt.
+                # Retreive gradient towards the current block (Algorithm 1, line 7)
+                gradient = utils.grad_with_checkpoint(loss, self.perturbed_edge_weight)[0]
+                grad_abs_cum += gradient.detach().abs()
+                self.gradient = gradient
+
+                if torch.cuda.is_available() and self.do_synchronize:
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+
+                with torch.no_grad():
+                    # Gradient update step (Algorithm 1, line 7)
+                    edge_weight = self.update_edge_weights(n_perturbations, epoch, gradient)[1]
+                    # For monitoring
+                    probability_mass_update = self.perturbed_edge_weight.sum().item()
+                    # Projection to stay within relaxed `L_0` budget (Algorithm 1, line 8)
+                    self.perturbed_edge_weight = Attack.project(
+                        n_perturbations, self.perturbed_edge_weight, self.eps)
+                    # For monitoring
+                    probability_mass_projected = self.perturbed_edge_weight.sum().item()
+
+                    # Calculate accuracy after the current epoch (overhead for monitoring and early stopping)
+                    edge_index, edge_weight = self.get_modified_adj()
+                    logits = self.attacked_model(data=self.attr.to(self.device), adj=(edge_index, edge_weight))
+                    accuracy = utils.accuracy(logits, self.labels, self.idx_attack)
+
+                    del edge_index, edge_weight, logits
+
+                    if epoch % self.display_step == 0:
+                        logging.info(f'\nEpoch: {epoch} Loss: {loss} Accuracy: {100 * accuracy:.3f} %\n')
+
+                    # Save best epoch for early stopping (not explicitly covered by pesudo code)
+                    if self.with_early_stopping and best_accuracy > accuracy:
+                        best_accuracy = accuracy
+                        best_epoch = epoch
+                        best_search_space = self.current_search_space.clone().cpu()
+                        best_edge_index = self.modified_edge_index.clone().cpu()
+                        best_edge_weight_diff = self.perturbed_edge_weight.detach().clone().cpu()
+
+                    self._append_attack_statistics(loss, accuracy, probability_mass_update,
+                                                   probability_mass_projected)
+
+            if self.with_early_stopping:
+                self.current_search_space = best_search_space.to(self.device)
+                self.modified_edge_index = best_edge_index.to(self.device)
+                self.perturbed_edge_weight = best_edge_weight_diff.to(self.device)
+
+            # Sample final discrete graph (Algorithm 1, line 16)
+            edge_index = self.sample_final_edges(n_perturbations)[0]
+
+            self.adj_adversary = SparseTensor.from_edge_index(
+                edge_index,
+                torch.ones_like(edge_index[0], dtype=torch.float32),
+                (self.n, self.n)
+            ).coalesce().detach()
+
+            self.attr_adversary = self.attr
+
+            grad_abs_mean = grad_abs_cum / float(self.epochs)
+
+            jaccard_score = scores.detach().cpu().view(-1).numpy()
+            jaccard_gradient = grad_abs_mean.detach().cpu().view(-1).numpy()
+
+            k = 25000  # choose your k
+
+            # Top-k indices (largest values)
+            topk_score = np.argsort(jaccard_score)[-k:]
+            topk_grad = np.argsort(jaccard_gradient)[-k:]
+
+            set_score = set(topk_score)
+            set_grad = set(topk_grad)
+
+            intersection = len(set_score & set_grad)
+            union = len(set_score | set_grad)
+
+            jaccard = intersection / union
+
+            print(f"Jaccard@{k}: {jaccard:.4f}")
 
         elif plot_gen in ("accuracy_drop_selector_subgraph_random", "accuracy_drop_selector_subgraph_khop", "accuracy_drop_selector_subgraph_growhop"):
             print(plot_gen, "-> sampling with accuracy drop selector subgraph")
@@ -849,6 +1040,18 @@ class PRBCDExtendedPlotting(SparseAttack):
         acc = cum_correct / k
         cov = k / float(len(y_true))
         return cov.cpu(), acc.cpu()
+
+    @staticmethod
+    def jaccard_topk(arr1, arr2, k):
+        # get top-k indices (highest values)
+        topk1 = np.argsort(arr1)[-k:]
+        topk2 = np.argsort(arr2)[-k:]
+
+        set1 = set(topk1)
+        set2 = set(topk2)
+
+        intersection = len(set1 & set2)
+        union = len(set1 | set2)
 
     @torch.no_grad()
     def sample_final_edges(self, n_perturbations: int) -> Tuple[torch.Tensor, torch.Tensor]:

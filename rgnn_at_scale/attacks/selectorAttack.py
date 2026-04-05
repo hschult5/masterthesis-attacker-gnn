@@ -294,7 +294,7 @@ class SelectorAttack(SparseAttack):
                         f"{self.n_perturbations_epoch} were required."
                     )
 
-                #self.edge_index = self.addXOR(self.edge_index, perturbed_edges)
+                self.edge_index = self.addXOR(self.edge_index, perturbed_edges)
 
                 # self.apply_edge_toggles(perturbed_edges)
                 self.attr_adversary = self.attr
@@ -1165,7 +1165,7 @@ class SelectorAttack(SparseAttack):
             X,
             edge_index_struct,
             n_perturbations_epoch: int,
-            score_batch_size: int = 10_000,
+            score_batch_size: int = 1_000_000,
             rng_seed: int = 0,
             exclude_tried: bool = True,
     ):
