@@ -94,20 +94,48 @@ def prepare_attack_experiment(data_dir: str, dataset: str, attack: str, attack_p
     return attr, adj, labels, idx_train, idx_val, idx_test, storage, attack_params, pert_params, model_params, m
 
 
-def run_global_attack(ads_mode, graph, dataset, epsilon, m, storage, pert_adj_storage_type, pert_attr_storage_type,
-                      pert_params, adversary, model_label,semi, use_cert, seed):
+def run_global_attack(
+    graph,
+    dataset,
+    epsilon,
+    m,
+    storage,
+    pert_adj_storage_type,
+    pert_attr_storage_type,
+    pert_params,
+    adversary,
+    model_label,
+    semi,
+    use_cert,
+    seed,
+    selector_params=None,
+):
+    selector_params = selector_params or {}
 
     n_perturbations = int(round(epsilon * m))
 
-    pert_adj = storage.load_artifact(pert_adj_storage_type, {**pert_params, **{'epsilon': epsilon}})
-    pert_attr = storage.load_artifact(pert_attr_storage_type, {**pert_params, **{'epsilon': epsilon}})
+    pert_adj = storage.load_artifact(
+        pert_adj_storage_type,
+        {**pert_params, **{"epsilon": epsilon}},
+    )
+    pert_attr = storage.load_artifact(
+        pert_attr_storage_type,
+        {**pert_params, **{"epsilon": epsilon}},
+    )
+
+    gradient = None
 
     if pert_adj is not None and pert_attr is not None:
         logging.info(
-            f"Found cached perturbed adjacency and attribute matrix for model '{model_label}' and eps {epsilon}")
+            f"Found cached perturbed adjacency and attribute matrix for model '{model_label}' and eps {epsilon}"
+        )
         adversary.set_pertubations(pert_adj, pert_attr)
+
     else:
-        logging.info(f"No cached perturbations found for model '{model_label}' and eps {epsilon}. Execute attack...")
+        logging.info(
+            f"No cached perturbations found for model '{model_label}' and eps {epsilon}. Execute attack..."
+        )
+
         import inspect
 
         attack_sig = inspect.signature(adversary.attack)
@@ -119,20 +147,34 @@ def run_global_attack(ads_mode, graph, dataset, epsilon, m, storage, pert_adj_st
             use_cert=use_cert,
             dataset=dataset,
             seed=seed,
+            selector_params=selector_params,
         )
 
         if needs_graph:
-            attack_kwargs["graph"] = graph  # only pass if required
+            attack_kwargs["graph"] = graph
 
-        attack_kwargs["ads_mode"] = ads_mode # pass ads_mode
+        # Backward compatibility:
+        # If PRBCD._attack still expects ads_mode explicitly, derive it from selector_params.
+        attack_kwargs["ads_mode"] = selector_params.get(
+            "accuracy_drop_selector_mode",
+            "none",
+        )
 
         gradient = adversary.attack(**attack_kwargs)
-        '''gradient = adversary.attack(edge_idx=edge_idx, attr_idx=attr_idx, n_perturbations=n_perturbations, semi = semi, use_cert = use_cert, grid_radii = grid_radii, grid_binary_class = grid_binary_class)'''
+
         pert_adj, pert_attr = adversary.get_pertubations()
 
         if n_perturbations > 0:
-            storage.save_artifact(pert_adj_storage_type, {**pert_params, **{'epsilon': epsilon}}, pert_adj)
-            storage.save_artifact(pert_attr_storage_type, {**pert_params, **{'epsilon': epsilon}}, pert_attr)
+            storage.save_artifact(
+                pert_adj_storage_type,
+                {**pert_params, **{"epsilon": epsilon}},
+                pert_adj,
+            )
+            storage.save_artifact(
+                pert_attr_storage_type,
+                {**pert_params, **{"epsilon": epsilon}},
+                pert_attr,
+            )
 
     return gradient
 

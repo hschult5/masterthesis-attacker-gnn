@@ -112,7 +112,7 @@ class Attack(ABC):
     def _attack(self, ads_mode, graph, n_perturbations: int, **kwargs):
         pass
 
-    def attack(self, ads_mode, graph, n_perturbations: int, semi: bool, use_cert: str = "none", **kwargs):
+    def attack(self, graph, n_perturbations: int, semi: bool, ads_mode="none", use_cert: str = "none", **kwargs):
         """
         Executes the attack on the model updating the attributes
         self.adj_adversary and self.attr_adversary accordingly.

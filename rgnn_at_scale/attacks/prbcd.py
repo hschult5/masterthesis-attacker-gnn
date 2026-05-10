@@ -98,6 +98,7 @@ class PRBCD(SparseAttack):
         self.use_cert = use_cert
         self.dataset = kwargs.get('dataset')
         self.seed = kwargs.get('seed')
+        selector_params = kwargs.get("selector_params", {}) or {}
 
         assert self.block_size > n_perturbations, \
             f'The search space size ({self.block_size}) must be ' \
@@ -117,13 +118,7 @@ class PRBCD(SparseAttack):
         if use_cert in ("accuracy_drop_selector", "accuracy_drop_selector_with_resampling"):
             print(use_cert, "-> sampling with accuracy drop selector")
 
-            self.n_candidates_k_sample=2000
-            self.n_candidates_one_sample=5000
-            self.acc_drop_threshold_k_samples=1e-3
-            self.loss_drop_threshold_k_samples=1e-3
-            self.k_samples_batch=10
-            self.ads_mode=ads_mode
-            self.drop_mode="endpoint"
+            self._load_selector_params(selector_params, ads_mode=ads_mode)
 
             if self.drop_mode == "acc": #TODO: logging für alle ads_modes+drop_modes
                 cache_path = f"cache/selection_dataset{self.dataset}_seed{self.seed}_ads_{ads_mode}_k{self.n_candidates_k_sample}_bt{self.k_samples_batch}_drpmd{self.drop_mode}_drp{self.acc_drop_threshold_k_samples}.pt"
@@ -189,14 +184,7 @@ class PRBCD(SparseAttack):
         elif use_cert in ("accuracy_drop_selector_subgraph_random", "accuracy_drop_selector_subgraph_khop", "accuracy_drop_selector_subgraph_growhop"):
             print(use_cert, "-> sampling with accuracy drop selector subgraph")
 
-            self.n_candidates_one_sample = 5000
-            self.n_candidates_k_sample = 2000
-            self.k_subgraph = 3
-            self.subgraph_size = int(self.n/2)
-            self.drop_mode = "endpoint"
-            self.k_samples_batch = 10
-            self.acc_drop_threshold_k_samples = 1e-3
-            self.loss_drop_threshold_k_samples = 1e-3
+            self._load_selector_params(selector_params, ads_mode=ads_mode)
 
             if use_cert in ("accuracy_drop_selector_subgraph_random",):
                 self.ads_mode = "random_subgraph"
@@ -4103,7 +4091,12 @@ class PRBCD(SparseAttack):
                     print(f"[LP-GNN][ERROR] NaN/Inf in train logits at epoch {epoch + 1}")
                     break
 
-                loss = loss_fn(logits_train, y_label[train_idx])
+                # loss = loss_fn(logits_train, y_label[train_idx]) TODO: decide on loss function
+
+                label_smoothing = 0.1  # good starting point
+
+                y_train_soft = y_label[train_idx] * (1.0 - label_smoothing) + 0.5 * label_smoothing
+                loss = loss_fn(logits_train, y_train_soft)
 
             loss.backward()
 
@@ -4716,3 +4709,61 @@ class PRBCD(SparseAttack):
             "prop_add": prop_add,
             "skipped": missing_decode,
         }
+
+    def _load_selector_params(self, selector_params: dict, ads_mode=None):
+        selector_params = selector_params or {}
+
+        self.ads_mode = selector_params.get(
+            "accuracy_drop_selector_mode",
+            ads_mode,
+        )
+
+        self.n_candidates_k_sample = selector_params.get(
+            "n_candidates_k_sample",
+            2000,
+        )
+
+        self.n_candidates_one_sample = selector_params.get(
+            "n_candidates_one_sample",
+            5000,
+        )
+
+        self.drop_mode = selector_params.get(
+            "drop_mode",
+            "endpoint",
+        )
+
+        self.acc_drop_threshold_k_samples = selector_params.get(
+            "acc_drop_threshold_k_samples",
+            1e-3,
+        )
+
+        self.loss_drop_threshold_k_samples = selector_params.get(
+            "loss_drop_threshold_k_samples",
+            1e-3,
+        )
+
+        self.k_samples_batch = selector_params.get(
+            "k_samples_batch",
+            10,
+        )
+
+        self.tau = selector_params.get(
+            "tau",
+            0.8,
+        )
+
+        self.score_batch_size = selector_params.get(
+            "score_batch_size",
+            1000,
+        )
+
+        self.max_sampling_tries = selector_params.get(
+            "max_sampling_tries",
+            2_000_000,
+        )
+
+        self.exclude_tried = selector_params.get(
+            "exclude_tried",
+            True,
+        )

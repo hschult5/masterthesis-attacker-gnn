@@ -128,6 +128,8 @@ class SelectorAttack(SparseAttack):
         self.use_cert = use_cert
         self.dataset = kwargs.get('dataset')
         self.seed = kwargs.get('seed')
+        self.ads_mode = ads_mode
+        selector_params = kwargs.get("selector_params", {}) or {}
 
         assert self.block_size > n_perturbations, \
             f'The search space size ({self.block_size}) must be ' \
@@ -143,6 +145,9 @@ class SelectorAttack(SparseAttack):
         self.tried_mask = torch.zeros(self.n_possible_edges, device=self.device, dtype=torch.bool)
 
         if use_cert in ("random_direct",):
+
+            self._load_selector_params(selector_params, ads_mode=ads_mode)
+
             self.current_search_space = torch.randint(
                 self.n_possible_edges, (self.block_size,), device=self.device)
             self.current_search_space = torch.unique(self.current_search_space, sorted=True)
@@ -194,13 +199,7 @@ class SelectorAttack(SparseAttack):
             #).coalesce().detach()
         else:
 
-            self.n_candidates_k_sample = 2000
-            self.n_candidates_one_sample = 5000
-            self.acc_drop_threshold_k_samples = 1e-3
-            self.loss_drop_threshold_k_samples = 1e-3
-            self.k_samples_batch = 10
-            self.ads_mode = "one_sample"
-            self.drop_mode = "endpoint"
+            self._load_selector_params(selector_params, ads_mode=ads_mode)
 
             if self.drop_mode == "acc":  # TODO: logging für alle ads_modes+drop_modes
                 cache_path = f"cache/selection_dataset{self.dataset}_seed{self.seed}_ads_{self.ads_mode}_k{self.n_candidates_k_sample}_bt{self.k_samples_batch}_drpmd{self.drop_mode}_drp{self.acc_drop_threshold_k_samples}.pt"
@@ -322,165 +321,6 @@ class SelectorAttack(SparseAttack):
             #    torch.ones_like(self.edge_index[0], dtype=torch.float32),
             #    (self.n, self.n),
             #).coalesce().detach()
-
-        '''
-        # Loop over the epochs (Algorithm 1, line 5)
-        for epoch in tqdm(range(self.epochs)):
-            self.perturbed_edge_weight.requires_grad = True
-
-            # Retreive sparse perturbed adjacency matrix `A \oplus p_{t-1}` (Algorithm 1, line 6)
-            edge_index, edge_weight = self.get_modified_adj()
-
-            if torch.cuda.is_available() and self.do_synchronize:
-                torch.cuda.empty_cache()
-                torch.cuda.synchronize()
-
-            # Calculate logits for each node (Algorithm 1, line 6)
-            logits = self._get_logits(self.attr, edge_index, edge_weight)
-            # Calculate loss combining all each node (Algorithm 1, line 7)
-            loss = self.calculate_loss(logits[self.idx_attack], self.labels[self.idx_attack]) #Todo: Hier wird der loss und gradient für perturbed edge weight erzeugt.
-            # Retreive gradient towards the current block (Algorithm 1, line 7)
-            gradient = utils.grad_with_checkpoint(loss, self.perturbed_edge_weight)[0]
-            self.gradient = gradient
-
-            if torch.cuda.is_available() and self.do_synchronize:
-                torch.cuda.empty_cache()
-                torch.cuda.synchronize()
-
-            with torch.no_grad():
-                # Gradient update step (Algorithm 1, line 7)
-                edge_weight = self.update_edge_weights(n_perturbations, epoch, gradient)[1]
-                # For monitoring
-                probability_mass_update = self.perturbed_edge_weight.sum().item()
-                # Projection to stay within relaxed `L_0` budget (Algorithm 1, line 8)
-                self.perturbed_edge_weight = Attack.project(
-                    n_perturbations, self.perturbed_edge_weight, self.eps)
-                # For monitoring
-                probability_mass_projected = self.perturbed_edge_weight.sum().item()
-
-                # Calculate accuracy after the current epoch (overhead for monitoring and early stopping)
-                edge_index, edge_weight = self.get_modified_adj()
-                logits = self.attacked_model(data=self.attr.to(self.device), adj=(edge_index, edge_weight))
-                accuracy = utils.accuracy(logits, self.labels, self.idx_attack)
-
-                del edge_index, edge_weight, logits
-
-                if epoch % self.display_step == 0:
-                    logging.info(f'\nEpoch: {epoch} Loss: {loss} Accuracy: {100 * accuracy:.3f} %\n')
-
-                # Save best epoch for early stopping (not explicitly covered by pesudo code)
-                if self.with_early_stopping and best_accuracy > accuracy:
-                    best_accuracy = accuracy
-                    best_epoch = epoch
-                    best_search_space = self.current_search_space.clone().cpu()
-                    best_edge_index = self.modified_edge_index.clone().cpu()
-                    best_edge_weight_diff = self.perturbed_edge_weight.detach().clone().cpu()
-
-                self._append_attack_statistics(loss, accuracy, probability_mass_update, probability_mass_projected)
-
-                # Resampling of search space (Algorithm 1, line 9-14)
-                if epoch < self.epochs_resampling - 1:
-                    if use_cert in ("sampling_with_prior",):
-                        print(use_cert, "run resampling_with_prior")
-                        self.resample_block_from_prior_gumbel(n_perturbations=n_perturbations, tau=1.0)
-
-                    elif use_cert in ("accuracy_drop_selector", "accuracy_drop_selector_subgraph"):
-                        print(use_cert, "run resampling with no certificate")
-                        if epoch % 5 == 0:
-                            #self.resample_block_from_linkpred_threshold(graph=graph, n_perturbations=n_perturbations)
-                            self.resample_random_block(n_perturbations=n_perturbations)
-                        else:
-                            self.resample_random_block(n_perturbations=n_perturbations)
-                        pass
-                        
-                        if epoch % 5 == 0:
-                            print(use_cert, "-> resampling with accuracy drop selector")
-                            y_out, edge_index_lab, y_label, tried_set, harmful_set = self.label_edge_flips_prbcd_selfsample_fast(mode=ads_mode,
-                                                                                                    n_candidates_k_sample=int(self.n_candidates_k_sample / 2),
-                                                                                                    prev_tried_set=self.tried_set,
-                                                                                                    drop_threshold_k_samples=3e-3)
-                            self.append_search_space_with_y_out(y_out=y_out)
-                            self.tried_set = tried_set
-                        else:
-                            pass
-
-                    elif use_cert in ("selector_block", "selector_block_pgd"):
-
-                        # --- Configurable decay mode ---
-                        # Choose between: "exp" | "linear" | "none"
-                        decay_mode = getattr(self, "intra_decay_mode", "exp")
-
-                        # Initial and final intra ratios (set these somewhere in __init__)
-                        init_ratio = float(self.initial_max_intra_ratio)
-                        final_ratio = float(getattr(self, "final_max_intra_ratio", 0.0))
-
-                        # --- Compute current intra ratio ---
-                        if decay_mode == "exp":
-                            # Exponential decay: halve every 10 epochs
-                            halving_steps = max(0, int(epoch // 10))
-                            current_max_intra = init_ratio * (0.5 ** halving_steps)
-
-                        elif decay_mode == "linear":
-                            # Linear decay over all resampling epochs
-                            total_resample_steps = max(1, getattr(self, "epochs_resampling", 1) - 1)
-                            resample_step = min(epoch, total_resample_steps)
-                            t = float(resample_step) / float(total_resample_steps)
-                            current_max_intra = init_ratio * (1.0 - t) + final_ratio * t
-
-                        elif decay_mode == "none":
-                            # No decay: keep constant
-                            current_max_intra = init_ratio
-
-                        else:
-                            raise ValueError(f"Unknown intra decay mode: {decay_mode}")
-
-                        # --- Clamp and log ---
-                        current_max_intra = max(final_ratio, min(1.0, current_max_intra))
-                        logging.info(
-                            f"[Resample] epoch={epoch} | mode={decay_mode} | max_intra_ratio={current_max_intra:.4f}"
-                        )
-
-                        # --- Perform resampling ---
-                        self.resample_block_from_selector(
-                            n_perturbations=n_perturbations,
-                            blend_alpha=0,
-                            prefer_edges="intra",
-                            max_intra_ratio=current_max_intra,
-                        )
-                    else:
-                        print(use_cert, "run resampling with no certificate")
-                        self.resample_random_block(n_perturbations)
-                        pass
-                elif self.with_early_stopping and epoch == self.epochs_resampling - 1:
-                    # Retreive best epoch if early stopping is active (not explicitly covered by pesudo code)
-                    logging.info(
-                        f'Loading search space of epoch {best_epoch} (accuarcy={best_accuracy}) for fine tuning\n')
-                    self.current_search_space = best_search_space.to(self.device)
-                    self.modified_edge_index = best_edge_index.to(self.device)
-                    self.perturbed_edge_weight = best_edge_weight_diff.to(self.device)
-                    self.perturbed_edge_weight.requires_grad = True
-
-        #_edge_to_node_transfer = PRBCD.linear_to_triu_idx(self.modified_edge_index)
-
-        #row_idx, col_idx = _edge_to_node_transfer[0], _edge_to_node_transfer[1] TODO: hier könnte man die nodes die noch übrig sind nach dem Angriff evaluaten
-
-        #self.nodes_after_attack = pd.concat([row_idx, col_idx])
-
-        # Retreive best epoch if early stopping is active (not explicitly covered by pesudo code)
-        if self.with_early_stopping:
-            self.current_search_space = best_search_space.to(self.device)
-            self.modified_edge_index = best_edge_index.to(self.device)
-            self.perturbed_edge_weight = best_edge_weight_diff.to(self.device)
-
-        # Sample final discrete graph (Algorithm 1, line 16)
-        edge_index = self.sample_final_edges(n_perturbations)[0]
-
-        self.adj_adversary = SparseTensor.from_edge_index(
-            edge_index,
-            torch.ones_like(edge_index[0], dtype=torch.float32),
-            (self.n, self.n)
-        ).coalesce().detach()
-        self.attr_adversary = self.attr'''
 
         # TODO: Don't we want to switch to returning things? Haha yeah me too
 
@@ -6441,3 +6281,61 @@ class SelectorAttack(SparseAttack):
             "prop_add": prop_add,
             "skipped": missing_decode,
         }
+
+    def _load_selector_params(self, selector_params: dict, ads_mode=None):
+        selector_params = selector_params or {}
+
+        self.ads_mode = selector_params.get(
+            "accuracy_drop_selector_mode",
+            ads_mode,
+        )
+
+        self.n_candidates_k_sample = selector_params.get(
+            "n_candidates_k_sample",
+            2000,
+        )
+
+        self.n_candidates_one_sample = selector_params.get(
+            "n_candidates_one_sample",
+            5000,
+        )
+
+        self.drop_mode = selector_params.get(
+            "drop_mode",
+            "endpoint",
+        )
+
+        self.acc_drop_threshold_k_samples = selector_params.get(
+            "acc_drop_threshold_k_samples",
+            1e-3,
+        )
+
+        self.loss_drop_threshold_k_samples = selector_params.get(
+            "loss_drop_threshold_k_samples",
+            1e-3,
+        )
+
+        self.k_samples_batch = selector_params.get(
+            "k_samples_batch",
+            10,
+        )
+
+        self.tau = selector_params.get(
+            "tau",
+            0.8,
+        )
+
+        self.score_batch_size = selector_params.get(
+            "score_batch_size",
+            1000,
+        )
+
+        self.max_sampling_tries = selector_params.get(
+            "max_sampling_tries",
+            2_000_000,
+        )
+
+        self.exclude_tried = selector_params.get(
+            "exclude_tried",
+            True,
+        )
