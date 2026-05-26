@@ -202,11 +202,19 @@ class SelectorAttack(SparseAttack):
             self._load_selector_params(selector_params, ads_mode=ads_mode)
 
             if self.drop_mode == "acc":  # TODO: logging für alle ads_modes+drop_modes
-                cache_path = f"cache/selection_dataset{self.dataset}_seed{self.seed}_ads_{self.ads_mode}_k{self.n_candidates_k_sample}_bt{self.k_samples_batch}_drpmd{self.drop_mode}_drp{self.acc_drop_threshold_k_samples}.pt"
+                cache_path = f"cache/selection_dataset{self.dataset}_seed{self.seed}_ads_{ads_mode}_k{self.n_candidates_k_sample}_bt{self.k_samples_batch}_drpmd{self.drop_mode}_drp{self.acc_drop_threshold_k_samples}.pt"
             elif self.drop_mode == "loss":
-                cache_path = f"cache/selection_dataset{self.dataset}_seed{self.seed}_ads_{self.ads_mode}_k{self.n_candidates_k_sample}_bt{self.k_samples_batch}_drpmd{self.drop_mode}_drp{self.loss_drop_threshold_k_samples}.pt"
+                cache_path = f"cache/selection_dataset{self.dataset}_seed{self.seed}_ads_{ads_mode}_k{self.n_candidates_k_sample}_bt{self.k_samples_batch}_drpmd{self.drop_mode}_drp{self.loss_drop_threshold_k_samples}.pt"
             elif self.drop_mode == "endpoint":
-                cache_path = f"cache/selection_dataset{self.dataset}_seed{self.seed}_ads_{self.ads_mode}_k{self.n_candidates_one_sample}_drpmd{self.drop_mode}.pt"
+                if self.training_data_node_cap > 0:
+                    cache_path = f"cache/selection_dataset{self.dataset}_seed{self.seed}_ads_{ads_mode}_k{self.n_candidates_one_sample}_drpmd{self.drop_mode}_trnodecap{self.training_data_node_cap}"
+                else:
+                    cache_path = f"cache/selection_dataset{self.dataset}_seed{self.seed}_ads_{ads_mode}_k{self.n_candidates_one_sample}_drpmd{self.drop_mode}.pt"
+            elif self.drop_mode == "endpointPRBCD":
+                if self.training_data_node_cap > 0:
+                    cache_path = f"cache/selection_dataset{self.dataset}_seed{self.seed}_ads_{ads_mode}_k{self.n_candidates_one_sample}_drpmd{self.drop_mode}_trnodecap{self.training_data_node_cap}"
+                else:
+                    cache_path = f"cache/selection_dataset{self.dataset}_seed{self.seed}_ads_{ads_mode}_k{self.n_candidates_one_sample}_drpmd{self.drop_mode}.pt"
 
             if os.path.exists(cache_path):
                 print("[CACHE] loading selection:", cache_path)
@@ -246,6 +254,36 @@ class SelectorAttack(SparseAttack):
                 }
                 SelectorAttack.save_selection(cache_path, y_out, edge_index_lab, y_label, tried_set, harmful_set, meta=meta)
 
+            # ---- selection statistics: tried vs harmful ----
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+            SelectorAttack.record_selection_statistics(
+                tried_set=tried_set,
+                harmful_set=harmful_set,
+                n_nodes=int(self.n),
+                device=self.device,
+                stats_dir="Plotting_Data/TrainingDataStats",
+                csv_prefix=(
+                    f"{timestamp}_"
+                    f"selection_dataset{self.dataset}_seed{self.seed}_"
+                    f"ads_{ads_mode}_drpmd{self.drop_mode}_"
+                    f"trnodecap{getattr(self, 'training_data_node_cap', 0)}"
+                ),
+                top_k=10,
+                extra={
+                    "timestamp": timestamp,
+                    "dataset": self.dataset,
+                    "seed": self.seed,
+                    "ads_mode": ads_mode,
+                    "drop_mode": self.drop_mode,
+                    "training_data_node_cap": int(getattr(self, "training_data_node_cap", 0)),
+                    "n_candidates_one_sample": int(getattr(self, "n_candidates_one_sample", 0)),
+                    "n_candidates_k_sample": int(getattr(self, "n_candidates_k_sample", 0)),
+                    "k_samples_batch": int(getattr(self, "k_samples_batch", 0)),
+                    "tau": float(getattr(self, "tau", 0.0)),
+                },
+            )
+
             X, edge_index_struct = self.extract_X_and_edge_index_from_sparsegraph(graph)
             stats = SelectorAttack.tried_add_del_proportion(tried_set, edge_index_struct, n=int(self.n))
             print(stats)
@@ -279,42 +317,48 @@ class SelectorAttack(SparseAttack):
 
                 del logits, loss
 
-            self.n_perturbations_epoch = int(self.n_perturbations / self.epochs)
 
-            for epoch in tqdm(range(self.epochs)):
 
-                perturbed_edges = self.sample_direct_attack_from_linkpred_topk(
-                    self.attr, self.edge_index, self.n_perturbations_epoch)
+            perturbed_edges = self.sample_direct_attack_from_linkpred_topk(
+                self.attr, self.edge_index, self.n_perturbations)
 
-                if perturbed_edges.size(1) < self.n_perturbations_epoch:
-                    raise RuntimeError(
-                        f"sample_direct_attack_from_linkpred_topk returned only "
-                        f"{perturbed_edges.size(1)} edges, but "
-                        f"{self.n_perturbations_epoch} were required."
-                    )
+            self.print_edge_index_node_dominance(
+                name="DIRECT_LP_TOPK_SELECTED",
+                edge_index_pairs=perturbed_edges,
+                top_k=10,
+                reference_edge_index=self.edge_index,
+                store=True,
+            )
 
-                self.edge_index = self.addXOR(self.edge_index, perturbed_edges)
+            if perturbed_edges.size(1) < self.n_perturbations:
+                raise RuntimeError(
+                    f"sample_direct_attack_from_linkpred_topk returned only "
+                    f"{perturbed_edges.size(1)} edges, but "
+                    f"{self.n_perturbations} were required."
+                )
 
-                # self.apply_edge_toggles(perturbed_edges)
-                self.attr_adversary = self.attr
+            self.edge_index = self.addXOR(self.edge_index, perturbed_edges)
 
-                current_search_space = SelectorAttack.edges_as_matrix_idx_to_current_search_space(self.n ,self.edge_index)
-                self.perturbed_edge_weight = torch.ones_like(current_search_space,dtype=torch.float32)
-                self.current_search_space = current_search_space
+            # self.apply_edge_toggles(perturbed_edges)
+            self.attr_adversary = self.attr
 
-                edge_weight = torch.ones_like(self.edge_index[0],dtype=torch.float32)
+            current_search_space = SelectorAttack.edges_as_matrix_idx_to_current_search_space(self.n ,self.edge_index)
+            self.perturbed_edge_weight = torch.ones_like(current_search_space,dtype=torch.float32)
+            self.current_search_space = current_search_space
 
-                with torch.no_grad():
+            edge_weight = torch.ones_like(self.edge_index[0],dtype=torch.float32)
 
-                    logits = self.attacked_model(self.attr_adversary, adj=(self.edge_index,edge_weight))
-                    loss = self.calculate_loss(logits[self.idx_attack], self.labels[self.idx_attack])
-                    accuracy = utils.accuracy(logits, self.labels, self.idx_attack)
+            with torch.no_grad():
 
-                    logging.info(f'\nBefore the attack - Loss: {loss.item()} Accuracy: {100 * accuracy:.3f} %\n')
+                logits = self.attacked_model(self.attr_adversary, adj=(self.edge_index,edge_weight))
+                loss = self.calculate_loss(logits[self.idx_attack], self.labels[self.idx_attack])
+                accuracy = utils.accuracy(logits, self.labels, self.idx_attack)
 
-                    self._append_attack_statistics(loss.item(), accuracy, 0., 0.)
+                logging.info(f'\nBefore the attack - Loss: {loss.item()} Accuracy: {100 * accuracy:.3f} %\n')
 
-                    del logits, loss
+                self._append_attack_statistics(loss.item(), accuracy, 0., 0.)
+
+                del logits, loss
 
             #self.adj_adversary = SparseTensor.from_edge_index(
             #    self.edge_index,
@@ -1000,12 +1044,12 @@ class SelectorAttack(SparseAttack):
         if self.current_search_space.size(0) < int(n_perturbations):
             raise RuntimeError("Block has fewer unique edges than n_perturbations. Lower tau or increase sampling.")
 
-    def sample_direct_attack_from_linkpred_topk(
+    '''def sample_direct_attack_from_linkpred_topk(
             self,
             X,
             edge_index_struct,
             n_perturbations_epoch: int,
-            score_batch_size: int = 1_000_000,
+            score_batch_size: int = 4_000_000,
             rng_seed: int = 0,
             exclude_tried: bool = True,
     ):
@@ -1106,6 +1150,182 @@ class SelectorAttack(SparseAttack):
 
         if edge_index_pairs.size() != (2, k):
             raise RuntimeError("Internal: output edge_index_pairs has wrong shape.")
+
+        return edge_index_pairs'''
+
+    def sample_direct_attack_from_linkpred_topk(
+            self,
+            X,
+            edge_index_struct,
+            n_perturbations_epoch: int,
+            score_batch_size: int = 4_000_000,
+            rng_seed: int = 0,
+            exclude_tried: bool = True,
+            max_per_node: int = 5,
+    ):
+        """
+        LP-guided direct attack selector with per-node cap.
+
+        Samples candidate edges, scores them with lp_model, then selects top-k edges
+        while preventing one node from dominating the selected flips.
+        """
+        k = int(n_perturbations_epoch)
+        if k <= 0:
+            raise ValueError("n_perturbations_epoch must be > 0.")
+
+        if max_per_node <= 0:
+            raise ValueError("max_per_node must be > 0.")
+
+        if not hasattr(self, "lp_model") or self.lp_model is None:
+            raise RuntimeError("self.lp_model is not set.")
+
+        # persistent tried mask
+        if exclude_tried and (not hasattr(self, "tried_mask") or self.tried_mask is None):
+            self.tried_mask = torch.zeros(
+                self.n_possible_edges,
+                device=self.device,
+                dtype=torch.bool,
+            )
+
+        # move inputs to device
+        X = X.to(self.device)
+        edge_index_struct = edge_index_struct.to(self.device)
+
+        # compute node embeddings once
+        self.lp_model = self.lp_model.to(self.device).eval()
+        with torch.no_grad():
+            h = self.lp_model.encoder(X, edge_index_struct)
+
+        # build candidate linear indices
+        g = torch.Generator(device=self.device)
+        g.manual_seed(int(rng_seed))
+
+        if exclude_tried:
+            available = torch.nonzero(~self.tried_mask, as_tuple=False).view(-1)
+        else:
+            available = torch.arange(self.n_possible_edges, device=self.device)
+
+        if available.numel() < k:
+            raise RuntimeError(
+                f"Not enough available edges to sample k={k} "
+                f"(only {available.numel()} left)."
+            )
+
+        m = int(min(score_batch_size, available.numel()))
+        if m < k:
+            m = k
+
+        perm = torch.randperm(
+            available.numel(),
+            generator=g,
+            device=self.device,
+        )
+        cand_lin = available[perm[:m]]
+
+        # decode candidate edges
+        if self.make_undirected:
+            cand_ei = SelectorAttack.linear_to_triu_idx(self.n, cand_lin)
+        else:
+            cand_ei = SelectorAttack.linear_to_full_idx(self.n, cand_lin)
+
+            is_not_self = cand_ei[0] != cand_ei[1]
+            cand_lin = cand_lin[is_not_self]
+            cand_ei = cand_ei[:, is_not_self]
+
+            if cand_lin.numel() < k:
+                raise RuntimeError(
+                    f"After removing self-loops, only {cand_lin.numel()} "
+                    f"candidates remain, need k={k}. Increase score_batch_size."
+                )
+
+        # score candidates with LP head
+        with torch.no_grad():
+            logits = self.lp_model.edge_head(h, cand_ei).view(-1)
+            scores = torch.sigmoid(logits)
+
+        # --------------------------------------------------
+        # Per-node capped top-k selection
+        # --------------------------------------------------
+
+        order = torch.argsort(scores, descending=True)
+
+        node_counts = torch.zeros(
+            int(self.n),
+            device=self.device,
+            dtype=torch.long,
+        )
+
+        selected = []
+
+        for idx in order.tolist():
+            u = int(cand_ei[0, idx].item())
+            v = int(cand_ei[1, idx].item())
+
+            if node_counts[u] >= max_per_node:
+                continue
+
+            if node_counts[v] >= max_per_node:
+                continue
+
+            selected.append(idx)
+            node_counts[u] += 1
+            node_counts[v] += 1
+
+            if len(selected) >= k:
+                break
+
+        if len(selected) < k:
+            raise RuntimeError(
+                f"Could only select {len(selected)} edges with "
+                f"max_per_node={max_per_node}, but need k={k}. "
+                f"Increase score_batch_size or max_per_node."
+            )
+
+        topk_idx = torch.tensor(
+            selected,
+            device=self.device,
+            dtype=torch.long,
+        )
+
+        edge_index_pairs = cand_ei[:, topk_idx]
+
+        # mark selected as tried
+        if exclude_tried:
+            if self.make_undirected:
+                lin_selected = SelectorAttack.triu_idx_to_linear_idx(
+                    self.n,
+                    edge_index_pairs,
+                )
+            else:
+                lin_selected = SelectorAttack.full_to_linear_idx(
+                    self.n,
+                    edge_index_pairs,
+                )
+
+            self.tried_mask[lin_selected] = True
+
+        if edge_index_pairs.size() != (2, k):
+            raise RuntimeError("Internal: output edge_index_pairs has wrong shape.")
+
+        # optional debug info
+        unique_nodes, counts = torch.unique(
+            edge_index_pairs.flatten(),
+            return_counts=True,
+        )
+
+        top_debug = torch.topk(
+            counts,
+            k=min(10, counts.numel()),
+        )
+
+        print("[direct LP selector] selected edges:", edge_index_pairs.size(1))
+        print("[direct LP selector] unique touched nodes:", unique_nodes.numel())
+        print("[direct LP selector] top endpoint counts:")
+        for node, count in zip(
+                unique_nodes[top_debug.indices].tolist(),
+                top_debug.values.tolist(),
+        ):
+            print(f"  node {node}: {count}")
 
         return edge_index_pairs
 
@@ -5328,19 +5548,36 @@ class SelectorAttack(SparseAttack):
             log_grad_norm: bool = False,
             csv_path: str | None = None,
             csv_append: bool = False,
+            # ---- optional auxiliary endpoint supervision ----
+            y_src_label: torch.Tensor | None = None,
+            y_dst_label: torch.Tensor | None = None,
+            aux_loss_weight: float = 0.5,
             # ---- early stopping / best checkpoint ----
             early_stop: bool = True,
-            early_stop_metric: str = "auc",  # "auc" | "ap" | "val_loss" | "val_acc"
+            early_stop_metric: str = "val_auc",
+            # allowed:
+            # "val_auc" | "val_ap" | "val_loss" | "val_acc" | "val_f1" | "val_recall"
             early_stop_patience: int = 15,
             early_stop_min_delta: float = 1e-4,
             restore_best: bool = True,
+            # ---- split ratios ----
+            train_ratio: float = 0.7,
+            val_ratio: float = 0.15,
+            test_ratio: float = 0.15,
+            threshold: float = 0.5,
     ):
         x = x.to(device)
         edge_index_struct = edge_index_struct.to(device)
         edge_index_lab = edge_index_lab.to(device)
         y_label = y_label.float().to(device)
 
+        if y_src_label is not None:
+            y_src_label = y_src_label.float().to(device)
+        if y_dst_label is not None:
+            y_dst_label = y_dst_label.float().to(device)
+
         M = edge_index_lab.size(1)
+
         if M == 0:
             print("[LP-GNN] No labeled pairs. Returning untrained model.")
             model = LinkPredictionGNN(
@@ -5352,15 +5589,43 @@ class SelectorAttack(SparseAttack):
 
         assert M == y_label.numel(), "edge_index_lab and y_label must have the same number of examples"
 
+        if y_src_label is not None:
+            assert M == y_src_label.numel(), "edge_index_lab and y_src_label must have the same number of examples"
+
+        if y_dst_label is not None:
+            assert M == y_dst_label.numel(), "edge_index_lab and y_dst_label must have the same number of examples"
+
+        ratio_sum = train_ratio + val_ratio + test_ratio
+        assert abs(ratio_sum - 1.0) < 1e-6, "train_ratio + val_ratio + test_ratio must equal 1.0"
+
+        use_aux = (y_src_label is not None) and (y_dst_label is not None)
+
         y_int = y_label.long()
+
         if verbose:
-            print(
+            msg = (
                 f"[LP-GNN] Labeled pairs: M={M} | "
                 f"pos={(y_int == 1).sum().item()} | neg={(y_int == 0).sum().item()}"
             )
 
-        # ---- split ----
-        assert M % 2 == 0, "Expected equal number of negatives/positives (M must be even)."
+            if use_aux:
+                msg += (
+                    f" | src_pos={(y_src_label.long() == 1).sum().item()} "
+                    f"| dst_pos={(y_dst_label.long() == 1).sum().item()} "
+                    f"| aux_loss_weight={aux_loss_weight}"
+                )
+
+            print(msg)
+
+        # ======================================================
+        # Stratified train / validation / test split
+        # Assumes your data layout is still:
+        # first half = negative examples
+        # second half = positive examples
+        # ======================================================
+
+        assert M % 2 == 0, "Expected equal number of negatives/positives. M must be even."
+
         half = M // 2
 
         neg_idx_all = torch.arange(0, half, device=device)
@@ -5369,15 +5634,45 @@ class SelectorAttack(SparseAttack):
         neg_perm = neg_idx_all[torch.randperm(half, device=device)]
         pos_perm = pos_idx_all[torch.randperm(half, device=device)]
 
-        train_size_per_class = int(0.8 * half)
+        train_size_per_class = int(train_ratio * half)
+        val_size_per_class = int(val_ratio * half)
 
-        train_idx = torch.cat([neg_perm[:train_size_per_class], pos_perm[:train_size_per_class]])
-        val_idx = torch.cat([neg_perm[train_size_per_class:], pos_perm[train_size_per_class:]])
+        # Everything left goes to test so that no samples are lost
+        test_size_per_class = half - train_size_per_class - val_size_per_class
+
+        if train_size_per_class <= 0 or val_size_per_class <= 0 or test_size_per_class <= 0:
+            raise ValueError(
+                "[LP-GNN] Split too small. Need at least one positive and one negative sample "
+                "in train, validation, and test."
+            )
+
+        neg_train = neg_perm[:train_size_per_class]
+        neg_val = neg_perm[train_size_per_class:train_size_per_class + val_size_per_class]
+        neg_test = neg_perm[train_size_per_class + val_size_per_class:]
+
+        pos_train = pos_perm[:train_size_per_class]
+        pos_val = pos_perm[train_size_per_class:train_size_per_class + val_size_per_class]
+        pos_test = pos_perm[train_size_per_class + val_size_per_class:]
+
+        train_idx = torch.cat([neg_train, pos_train])
+        val_idx = torch.cat([neg_val, pos_val])
+        test_idx = torch.cat([neg_test, pos_test])
 
         train_idx = train_idx[torch.randperm(train_idx.numel(), device=device)]
         val_idx = val_idx[torch.randperm(val_idx.numel(), device=device)]
+        test_idx = test_idx[torch.randperm(test_idx.numel(), device=device)]
 
-        # ---- model ---
+        if verbose:
+            print(
+                f"[LP-GNN] Split: "
+                f"train={train_idx.numel()} | "
+                f"val={val_idx.numel()} | "
+                f"test={test_idx.numel()}"
+            )
+
+        # ======================================================
+        # Model
+        # ======================================================
 
         model = LinkPredictionGNN(
             in_dim=x.size(1),
@@ -5385,27 +5680,182 @@ class SelectorAttack(SparseAttack):
             out_dim=out_dim,
         ).to(device)
 
-        optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
-        pos_weight = (len(neg_idx_all) / len(pos_idx_all)) if len(pos_idx_all) > 0 else 1.0
-        loss_fn = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pos_weight, device=device))
+        optimizer = torch.optim.Adam(
+            model.parameters(),
+            lr=lr,
+            weight_decay=weight_decay,
+        )
 
-        # ---- CSV logger ----
+        pos_weight = (len(neg_idx_all) / len(pos_idx_all)) if len(pos_idx_all) > 0 else 1.0
+
+        loss_fn = nn.BCEWithLogitsLoss(
+            pos_weight=torch.tensor(pos_weight, device=device)
+        )
+
+        if use_aux:
+            src_pos = float((y_src_label == 1).sum().item())
+            src_neg = float((y_src_label == 0).sum().item())
+            dst_pos = float((y_dst_label == 1).sum().item())
+            dst_neg = float((y_dst_label == 0).sum().item())
+
+            src_pos_weight = (src_neg / src_pos) if src_pos > 0 else 1.0
+            dst_pos_weight = (dst_neg / dst_pos) if dst_pos > 0 else 1.0
+
+            loss_fn_src = nn.BCEWithLogitsLoss(
+                pos_weight=torch.tensor(src_pos_weight, device=device)
+            )
+
+            loss_fn_dst = nn.BCEWithLogitsLoss(
+                pos_weight=torch.tensor(dst_pos_weight, device=device)
+            )
+
+        # ======================================================
+        # Evaluation helper
+        # ======================================================
+
+        def _safe_div(num: float, den: float) -> float:
+            return float(num / den) if den > 0 else 0.0
+
+        def _compute_metrics_from_logits(logits: torch.Tensor, labels_int: torch.Tensor):
+            logits = logits.view(-1)
+            labels_int = labels_int.long().view(-1)
+
+            probs = torch.sigmoid(logits)
+            preds = (probs >= threshold).long()
+
+            loss_val = loss_fn(logits, labels_int.float())
+
+            tp, fp, tn, fn = SelectorAttack._confusion_counts(preds, labels_int)
+
+            total = tp + fp + tn + fn
+
+            acc = _safe_div(tp + tn, total)
+            precision = _safe_div(tp, tp + fp)
+            recall = _safe_div(tp, tp + fn)
+            specificity = _safe_div(tn, tn + fp)
+
+            f1 = (
+                2.0 * precision * recall / (precision + recall)
+                if (precision + recall) > 0
+                else 0.0
+            )
+
+            auc, ap = SelectorAttack._safe_auc_ap_sklearn(probs, labels_int)
+
+            pmin = float(probs.min().item()) if probs.numel() > 0 else float("nan")
+            pmean = float(probs.mean().item()) if probs.numel() > 0 else float("nan")
+            pmax = float(probs.max().item()) if probs.numel() > 0 else float("nan")
+
+            return {
+                "loss": float(loss_val.item()),
+                "acc": float(acc),
+                "precision": float(precision),
+                "recall": float(recall),
+                "f1": float(f1),
+                "specificity": float(specificity),
+                "auc": auc,
+                "ap": ap,
+                "tp": int(tp),
+                "fp": int(fp),
+                "tn": int(tn),
+                "fn": int(fn),
+                "p_min": pmin,
+                "p_mean": pmean,
+                "p_max": pmax,
+            }
+
+        def _evaluate_split(split_idx: torch.Tensor):
+            model.eval()
+
+            with torch.no_grad():
+                if use_aux:
+                    out = model(
+                        x,
+                        edge_index_struct,
+                        edge_index_lab[:, split_idx],
+                        return_aux=True,
+                    )
+                    logits = out["edge_logits"].view(-1)
+                else:
+                    logits = model(
+                        x,
+                        edge_index_struct,
+                        edge_index_lab[:, split_idx],
+                    ).view(-1)
+
+                if torch.isnan(logits).any() or torch.isinf(logits).any():
+                    return None
+
+                labels = y_int[split_idx]
+
+                return _compute_metrics_from_logits(logits, labels)
+
+        # ======================================================
+        # CSV logger
+        # ======================================================
+
         csv_fields = [
             "epoch",
+
             "train_loss",
             "val_loss",
+            "test_loss",
+
+            "train_acc",
             "val_acc",
-            "acc_pos",
-            "acc_neg",
-            "auc",
-            "ap",
-            "tp",
-            "fp",
-            "tn",
-            "fn",
-            "p_min",
-            "p_mean",
-            "p_max",
+            "test_acc",
+
+            "train_precision",
+            "val_precision",
+            "test_precision",
+
+            "train_recall",
+            "val_recall",
+            "test_recall",
+
+            "train_f1",
+            "val_f1",
+            "test_f1",
+
+            "train_specificity",
+            "val_specificity",
+            "test_specificity",
+
+            "train_auc",
+            "val_auc",
+            "test_auc",
+
+            "train_ap",
+            "val_ap",
+            "test_ap",
+
+            "train_tp",
+            "train_fp",
+            "train_tn",
+            "train_fn",
+
+            "val_tp",
+            "val_fp",
+            "val_tn",
+            "val_fn",
+
+            "test_tp",
+            "test_fp",
+            "test_tn",
+            "test_fn",
+
+            "train_p_min",
+            "train_p_mean",
+            "train_p_max",
+
+            "val_p_min",
+            "val_p_mean",
+            "val_p_max",
+
+            "test_p_min",
+            "test_p_mean",
+            "test_p_max",
+
             "grad_norm",
             "best_metric",
             "is_best",
@@ -5428,17 +5878,33 @@ class SelectorAttack(SparseAttack):
             append=csv_append,
         )
 
-        # ---- helpers for early stopping ----
+        # ======================================================
+        # Early stopping
+        # ======================================================
+
         metric_mode = {
-            "auc": "max",
-            "ap": "max",
+            "val_auc": "max",
+            "val_ap": "max",
             "val_acc": "max",
+            "val_f1": "max",
+            "val_recall": "max",
             "val_loss": "min",
         }
+
+        # Backward compatibility with your old names
+        if early_stop_metric == "auc":
+            early_stop_metric = "val_auc"
+        elif early_stop_metric == "ap":
+            early_stop_metric = "val_ap"
+
         if early_stop_metric not in metric_mode:
-            raise ValueError(f"early_stop_metric must be one of {list(metric_mode.keys())}")
+            raise ValueError(
+                f"early_stop_metric must be one of {list(metric_mode.keys())}, "
+                f"or old aliases 'auc' / 'ap'."
+            )
 
         want = metric_mode[early_stop_metric]
+
         best_metric = -float("inf") if want == "max" else float("inf")
         best_epoch = -1
         best_state = None
@@ -5453,67 +5919,108 @@ class SelectorAttack(SparseAttack):
 
         epoch_iter = tqdm(range(num_epochs), desc="[LP-GNN] Training") if use_tqdm else range(num_epochs)
 
+        # ======================================================
+        # Training loop
+        # ======================================================
+
         for epoch in epoch_iter:
-            # ---- train ----
             model.train()
             optimizer.zero_grad()
 
-            logits_train = model(x, edge_index_struct, edge_index_lab[:, train_idx]).view(-1)
+            if use_aux:
+                out_train = model(
+                    x,
+                    edge_index_struct,
+                    edge_index_lab[:, train_idx],
+                    return_aux=True,
+                )
 
-            if torch.isnan(logits_train).any() or torch.isinf(logits_train).any():
-                print(f"[LP-GNN][ERROR] NaN/Inf in train logits at epoch {epoch + 1}")
-                break
+                logits_train = out_train["edge_logits"].view(-1)
 
-            loss = loss_fn(logits_train, y_label[train_idx])
+                if torch.isnan(logits_train).any() or torch.isinf(logits_train).any():
+                    print(f"[LP-GNN][ERROR] NaN/Inf in train edge logits at epoch {epoch + 1}")
+                    break
+
+                loss_edge = loss_fn(
+                    logits_train,
+                    y_label[train_idx],
+                )
+
+                loss_src = loss_fn_src(
+                    out_train["src_flip_logits"].view(-1),
+                    y_src_label[train_idx],
+                )
+
+                loss_dst = loss_fn_dst(
+                    out_train["dst_flip_logits"].view(-1),
+                    y_dst_label[train_idx],
+                )
+
+                loss = loss_edge + aux_loss_weight * (loss_src + loss_dst)
+
+            else:
+                logits_train = model(
+                    x,
+                    edge_index_struct,
+                    edge_index_lab[:, train_idx],
+                ).view(-1)
+
+                if torch.isnan(logits_train).any() or torch.isinf(logits_train).any():
+                    print(f"[LP-GNN][ERROR] NaN/Inf in train logits at epoch {epoch + 1}")
+                    break
+
+                label_smoothing = 0.1
+
+                y_train_soft = (
+                        y_label[train_idx] * (1.0 - label_smoothing)
+                        + 0.5 * label_smoothing
+                )
+
+                loss = loss_fn(logits_train, y_train_soft)
+
             loss.backward()
 
             grad_norm_val = None
+
             if log_grad_norm:
                 total_norm = 0.0
+
                 for p in model.parameters():
                     if p.grad is not None:
                         total_norm += p.grad.data.norm(2).item() ** 2
+
                 grad_norm_val = total_norm ** 0.5
 
             optimizer.step()
 
-            # ---- validation ----
-            model.eval()
-            with torch.no_grad():
-                logits_val = model(x, edge_index_struct, edge_index_lab[:, val_idx]).view(-1)
+            # ==================================================
+            # Evaluate train / validation / test
+            # ==================================================
 
-                if torch.isnan(logits_val).any() or torch.isinf(logits_val).any():
-                    print(f"[LP-GNN][ERROR] NaN/Inf in val logits at epoch {epoch + 1}")
-                    break
+            train_metrics = _evaluate_split(train_idx)
+            val_metrics = _evaluate_split(val_idx)
+            test_metrics = _evaluate_split(test_idx)
 
-                val_loss = loss_fn(logits_val, y_label[val_idx])
+            if train_metrics is None:
+                print(f"[LP-GNN][ERROR] NaN/Inf during train evaluation at epoch {epoch + 1}")
+                break
 
-                probs_val = torch.sigmoid(logits_val)
-                preds_val = (probs_val >= 0.5).long()
-                yv = y_int[val_idx]
+            if val_metrics is None:
+                print(f"[LP-GNN][ERROR] NaN/Inf during validation evaluation at epoch {epoch + 1}")
+                break
 
-                acc_val = float((preds_val == yv).float().mean().item())
-                acc_pos = float((preds_val[yv == 1] == 1).float().mean().item()) if (yv == 1).any() else float("nan")
-                acc_neg = float((preds_val[yv == 0] == 0).float().mean().item()) if (yv == 0).any() else float("nan")
+            if test_metrics is None:
+                print(f"[LP-GNN][ERROR] NaN/Inf during test evaluation at epoch {epoch + 1}")
+                break
 
-                tp, fp, tn, fn = SelectorAttack._confusion_counts(preds_val, yv)
-                auc, ap = SelectorAttack._safe_auc_ap_sklearn(probs_val, yv)
+            # Keep your old behavior:
+            # train_loss logs the actual training loss, including label smoothing / aux loss.
+            train_metrics["loss"] = float(loss.item())
 
-                pmin = float(probs_val.min().item())
-                pmean = float(probs_val.mean().item())
-                pmax = float(probs_val.max().item())
-
-            metric_val = None
-            if early_stop_metric == "auc":
-                metric_val = auc
-            elif early_stop_metric == "ap":
-                metric_val = ap
-            elif early_stop_metric == "val_acc":
-                metric_val = acc_val
-            elif early_stop_metric == "val_loss":
-                metric_val = float(val_loss.item())
+            metric_val = val_metrics[early_stop_metric.replace("val_", "")]
 
             is_best = False
+
             if metric_val is not None:
                 if _is_improvement(float(metric_val), float(best_metric)):
                     best_metric = float(metric_val)
@@ -5524,77 +6031,177 @@ class SelectorAttack(SparseAttack):
                 else:
                     patience_left -= 1
 
-            # ---- CSV log ----
+            # ==================================================
+            # CSV log
+            # ==================================================
+
             logger.log({
                 "epoch": epoch + 1,
-                "train_loss": float(loss.item()),
-                "val_loss": float(val_loss.item()),
-                "val_acc": acc_val,
-                "acc_pos": acc_pos,
-                "acc_neg": acc_neg,
-                "auc": auc,
-                "ap": ap,
-                "tp": tp,
-                "fp": fp,
-                "tn": tn,
-                "fn": fn,
-                "p_min": pmin,
-                "p_mean": pmean,
-                "p_max": pmax,
+
+                "train_loss": train_metrics["loss"],
+                "val_loss": val_metrics["loss"],
+                "test_loss": test_metrics["loss"],
+
+                "train_acc": train_metrics["acc"],
+                "val_acc": val_metrics["acc"],
+                "test_acc": test_metrics["acc"],
+
+                "train_precision": train_metrics["precision"],
+                "val_precision": val_metrics["precision"],
+                "test_precision": test_metrics["precision"],
+
+                "train_recall": train_metrics["recall"],
+                "val_recall": val_metrics["recall"],
+                "test_recall": test_metrics["recall"],
+
+                "train_f1": train_metrics["f1"],
+                "val_f1": val_metrics["f1"],
+                "test_f1": test_metrics["f1"],
+
+                "train_specificity": train_metrics["specificity"],
+                "val_specificity": val_metrics["specificity"],
+                "test_specificity": test_metrics["specificity"],
+
+                "train_auc": train_metrics["auc"],
+                "val_auc": val_metrics["auc"],
+                "test_auc": test_metrics["auc"],
+
+                "train_ap": train_metrics["ap"],
+                "val_ap": val_metrics["ap"],
+                "test_ap": test_metrics["ap"],
+
+                "train_tp": train_metrics["tp"],
+                "train_fp": train_metrics["fp"],
+                "train_tn": train_metrics["tn"],
+                "train_fn": train_metrics["fn"],
+
+                "val_tp": val_metrics["tp"],
+                "val_fp": val_metrics["fp"],
+                "val_tn": val_metrics["tn"],
+                "val_fn": val_metrics["fn"],
+
+                "test_tp": test_metrics["tp"],
+                "test_fp": test_metrics["fp"],
+                "test_tn": test_metrics["tn"],
+                "test_fn": test_metrics["fn"],
+
+                "train_p_min": train_metrics["p_min"],
+                "train_p_mean": train_metrics["p_mean"],
+                "train_p_max": train_metrics["p_max"],
+
+                "val_p_min": val_metrics["p_min"],
+                "val_p_mean": val_metrics["p_mean"],
+                "val_p_max": val_metrics["p_max"],
+
+                "test_p_min": test_metrics["p_min"],
+                "test_p_mean": test_metrics["p_mean"],
+                "test_p_max": test_metrics["p_max"],
+
                 "grad_norm": grad_norm_val,
                 "best_metric": float(best_metric) if best_epoch != -1 else float("nan"),
                 "is_best": 1 if is_best else 0,
             })
 
-            # ---- tqdm ----
+            # ==================================================
+            # tqdm
+            # ==================================================
+
             if use_tqdm:
                 postfix = {
-                    "tr_loss": f"{loss.item():.4f}",
-                    "va_loss": f"{val_loss.item():.4f}",
-                    "va_acc": f"{acc_val:.3f}",
+                    "tr_loss": f"{train_metrics['loss']:.4f}",
+                    "va_loss": f"{val_metrics['loss']:.4f}",
+                    "te_loss": f"{test_metrics['loss']:.4f}",
+                    "va_acc": f"{val_metrics['acc']:.3f}",
+                    "va_f1": f"{val_metrics['f1']:.3f}",
+                    "va_rec": f"{val_metrics['recall']:.3f}",
+                    "pat": patience_left if metric_val is not None else "n/a",
                 }
-                if auc is not None:
-                    postfix["auc"] = f"{auc:.3f}"
-                if ap is not None:
-                    postfix["ap"] = f"{ap:.3f}"
-                postfix["pat"] = patience_left if metric_val is not None else "n/a"
+
+                if val_metrics["auc"] is not None:
+                    postfix["va_auc"] = f"{val_metrics['auc']:.3f}"
+
+                if val_metrics["ap"] is not None:
+                    postfix["va_ap"] = f"{val_metrics['ap']:.3f}"
+
                 epoch_iter.set_postfix(postfix)
 
-            # ---- print ----
-            if verbose and ((epoch + 1) % log_every == 0 or epoch == 0 or (epoch + 1) == num_epochs):
+            # ==================================================
+            # Print
+            # ==================================================
+
+            if verbose and (
+                    (epoch + 1) % log_every == 0
+                    or epoch == 0
+                    or (epoch + 1) == num_epochs
+            ):
                 msg = (
                     f"[LP-GNN] Epoch {epoch + 1:03d}/{num_epochs} | "
-                    f"train_loss={loss.item():.4f} | val_loss={val_loss.item():.4f} | "
-                    f"val_acc={acc_val:.4f} | acc_pos={acc_pos:.4f} | acc_neg={acc_neg:.4f} | "
-                    f"TP/FP/TN/FN={tp}/{fp}/{tn}/{fn} | "
-                    f"p(min/mean/max)={pmin:.3f}/{pmean:.3f}/{pmax:.3f}"
+                    f"train_loss={train_metrics['loss']:.4f} | "
+                    f"val_loss={val_metrics['loss']:.4f} | "
+                    f"test_loss={test_metrics['loss']:.4f} | "
+                    f"train_acc={train_metrics['acc']:.4f} | "
+                    f"val_acc={val_metrics['acc']:.4f} | "
+                    f"test_acc={test_metrics['acc']:.4f} | "
+                    f"val_precision={val_metrics['precision']:.4f} | "
+                    f"val_recall={val_metrics['recall']:.4f} | "
+                    f"val_f1={val_metrics['f1']:.4f} | "
+                    f"val_TP/FP/TN/FN="
+                    f"{val_metrics['tp']}/{val_metrics['fp']}/"
+                    f"{val_metrics['tn']}/{val_metrics['fn']} | "
+                    f"val_p(min/mean/max)="
+                    f"{val_metrics['p_min']:.3f}/"
+                    f"{val_metrics['p_mean']:.3f}/"
+                    f"{val_metrics['p_max']:.3f}"
                 )
-                if auc is not None:
-                    msg += f" | AUC={auc:.4f}"
-                if ap is not None:
-                    msg += f" | AP={ap:.4f}"
+
+                if val_metrics["auc"] is not None:
+                    msg += f" | val_AUC={val_metrics['auc']:.4f}"
+
+                if val_metrics["ap"] is not None:
+                    msg += f" | val_AP={val_metrics['ap']:.4f}"
+
                 if metric_val is not None:
-                    msg += f" | best_{early_stop_metric}={best_metric:.4f} (epoch {best_epoch})"
+                    msg += (
+                        f" | best_{early_stop_metric}="
+                        f"{best_metric:.4f} "
+                        f"(epoch {best_epoch})"
+                    )
+
                 if grad_norm_val is not None:
                     msg += f" | grad_norm={grad_norm_val:.3e}"
+
+                if use_aux:
+                    msg += " | multitask_aux=on"
+
                 print(msg)
 
-            # ---- early stop ----
+            # ==================================================
+            # Early stopping
+            # ==================================================
+
             if early_stop and metric_val is not None and patience_left <= 0:
                 if verbose:
                     print(
                         f"[LP-GNN] Early stopping at epoch {epoch + 1}. "
-                        f"Best {early_stop_metric}={best_metric:.4f} at epoch {best_epoch}."
+                        f"Best {early_stop_metric}={best_metric:.4f} "
+                        f"at epoch {best_epoch}."
                     )
                 break
 
         logger.close()
 
-        # ---- restore best ----
+        # ======================================================
+        # Restore best validation model
+        # ======================================================
+
         if restore_best and best_state is not None:
             model.load_state_dict(best_state)
+
             if verbose:
-                print(f"[LP-GNN] Restored best model from epoch {best_epoch} ({early_stop_metric}={best_metric:.4f}).")
+                print(
+                    f"[LP-GNN] Restored best model from epoch {best_epoch} "
+                    f"({early_stop_metric}={best_metric:.4f})."
+                )
 
         if verbose:
             print(f"[LP-GNN] Training complete. Metrics saved to '{csv_path}'")
@@ -6338,4 +6945,510 @@ class SelectorAttack(SparseAttack):
         self.exclude_tried = selector_params.get(
             "exclude_tried",
             True,
+        )
+
+        self.lp_hit_rate_detour = selector_params.get("lp_hit_rate_detour", False)
+        self.lp_hit_rate_top_k = selector_params.get("lp_hit_rate_top_k", 200)
+        self.lp_hit_rate_out_dir = selector_params.get(
+            "lp_hit_rate_out_dir",
+            "extendedPlotting/lpEndpointHitRate",
+        )
+
+        self.training_data_node_cap = selector_params.get("training_data_node_cap", 0)
+        #
+    def _edge_index_node_dominance_stats(
+            self,
+            edge_index_pairs: torch.Tensor,
+            name: str = "DIRECT_ATTACK",
+            top_k: int = 10,
+            reference_edge_index: torch.Tensor | None = None,
+    ) -> dict:
+        """
+        Compute node dominance statistics for direct attack perturbation edges.
+
+        Unlike PR-BCD block statistics, this works directly on edge pairs
+        of shape (2, k), e.g. the output of:
+            - sample_direct_attack_random_uniform(...)
+            - sample_direct_attack_from_linkpred_topk(...)
+            - sample_direct_attack_from_linkpred_threshold(...)
+
+        If reference_edge_index is given, the function also estimates how many
+        selected perturbations are deletions vs additions with respect to the
+        current graph before applying XOR.
+        """
+        if edge_index_pairs is None or edge_index_pairs.numel() == 0:
+            return {
+                "name": name,
+                "n_edges": 0,
+                "endpoint_occurrences": 0,
+                "active_nodes": 0,
+                "effective_nodes": 0.0,
+                "gini": 0.0,
+                "top1_endpoint_share": 0.0,
+                "top5_endpoint_share": 0.0,
+                "top10_endpoint_share": 0.0,
+                "add_like": 0,
+                "del_like": 0,
+                "prop_add": 0.0,
+                "prop_del": 0.0,
+                "top_nodes": [],
+            }
+
+        edge_index_pairs = edge_index_pairs.detach().to(
+            device=self.device,
+            dtype=torch.long,
+        )
+
+        if edge_index_pairs.dim() != 2 or edge_index_pairs.size(0) != 2:
+            raise ValueError(
+                "edge_index_pairs must have shape (2, k)."
+            )
+
+        # Canonicalize undirected edges.
+        if self.make_undirected:
+            u = torch.minimum(edge_index_pairs[0], edge_index_pairs[1])
+            v = torch.maximum(edge_index_pairs[0], edge_index_pairs[1])
+            valid = u < v
+            edge_index_pairs = torch.stack([u[valid], v[valid]], dim=0)
+        else:
+            valid = edge_index_pairs[0] != edge_index_pairs[1]
+            edge_index_pairs = edge_index_pairs[:, valid]
+
+        if edge_index_pairs.numel() == 0:
+            return {
+                "name": name,
+                "n_edges": 0,
+                "endpoint_occurrences": 0,
+                "active_nodes": 0,
+                "effective_nodes": 0.0,
+                "gini": 0.0,
+                "top1_endpoint_share": 0.0,
+                "top5_endpoint_share": 0.0,
+                "top10_endpoint_share": 0.0,
+                "add_like": 0,
+                "del_like": 0,
+                "prop_add": 0.0,
+                "prop_del": 0.0,
+                "top_nodes": [],
+            }
+
+        endpoints = edge_index_pairs.reshape(-1).detach().cpu()
+        node_counts = torch.bincount(
+            endpoints,
+            minlength=int(self.n),
+        )
+
+        active_counts = node_counts[node_counts > 0]
+
+        n_edges = int(edge_index_pairs.size(1))
+        endpoint_occurrences = int(endpoints.numel())
+        active_nodes = int(active_counts.numel())
+
+        if active_nodes == 0 or endpoint_occurrences == 0:
+            effective_nodes = 0.0
+            gini = 0.0
+            top_nodes_payload = []
+            top1_share = 0.0
+            top5_share = 0.0
+            top10_share = 0.0
+        else:
+            top_k_use = min(int(top_k), active_nodes)
+            top_counts, top_nodes = torch.topk(node_counts, k=top_k_use)
+
+            top1_share = float(top_counts[:1].sum().item() / endpoint_occurrences)
+            top5_share = float(
+                top_counts[:min(5, top_k_use)].sum().item() / endpoint_occurrences
+            )
+            top10_share = float(
+                top_counts[:min(10, top_k_use)].sum().item() / endpoint_occurrences
+            )
+
+            probs = active_counts.float() / active_counts.sum().float()
+            effective_nodes = float(1.0 / torch.sum(probs ** 2).item())
+
+            sorted_counts = torch.sort(active_counts.float()).values
+            m = sorted_counts.numel()
+
+            if m > 1:
+                idx = torch.arange(1, m + 1, dtype=torch.float32)
+                gini = float(
+                    (2.0 * torch.sum(idx * sorted_counts) / (m * torch.sum(sorted_counts)))
+                    - (m + 1.0) / m
+                )
+            else:
+                gini = 0.0
+
+            top_nodes_payload = [
+                {
+                    "node": int(node),
+                    "endpoint_count": int(count),
+                    "endpoint_share": float(count) / float(endpoint_occurrences),
+                }
+                for node, count in zip(top_nodes.tolist(), top_counts.tolist())
+                if int(count) > 0
+            ]
+
+        # Addition/deletion character relative to the graph before XOR.
+        del_like = 0
+        add_like = 0
+
+        if reference_edge_index is None:
+            reference_edge_index = self.edge_index
+
+        if reference_edge_index is not None and reference_edge_index.numel() > 0:
+            reference_edge_index = reference_edge_index.detach().to(
+                device=self.device,
+                dtype=torch.long,
+            )
+
+            if self.make_undirected:
+                ref_u = torch.minimum(reference_edge_index[0], reference_edge_index[1])
+                ref_v = torch.maximum(reference_edge_index[0], reference_edge_index[1])
+                ref_valid = ref_u < ref_v
+                ref_pairs = torch.stack([ref_u[ref_valid], ref_v[ref_valid]], dim=0)
+
+                ref_lin = SelectorAttack.triu_idx_to_linear_idx(
+                    int(self.n),
+                    ref_pairs,
+                ).detach().cpu()
+
+                cand_lin = SelectorAttack.triu_idx_to_linear_idx(
+                    int(self.n),
+                    edge_index_pairs,
+                ).detach().cpu()
+            else:
+                ref_pairs = reference_edge_index[:, reference_edge_index[0] != reference_edge_index[1]]
+                ref_lin = SelectorAttack.full_to_linear_idx(
+                    int(self.n),
+                    ref_pairs,
+                ).detach().cpu()
+
+                cand_lin = SelectorAttack.full_to_linear_idx(
+                    int(self.n),
+                    edge_index_pairs,
+                ).detach().cpu()
+
+            ref_set = set(int(x) for x in ref_lin.tolist())
+
+            for lin in cand_lin.tolist():
+                if int(lin) in ref_set:
+                    del_like += 1
+                else:
+                    add_like += 1
+
+        total_action_like = del_like + add_like
+
+        stats = {
+            "name": name,
+            "n_edges": n_edges,
+            "endpoint_occurrences": endpoint_occurrences,
+            "active_nodes": active_nodes,
+            "effective_nodes": effective_nodes,
+            "gini": gini,
+            "top1_endpoint_share": top1_share,
+            "top5_endpoint_share": top5_share,
+            "top10_endpoint_share": top10_share,
+            "add_like": add_like,
+            "del_like": del_like,
+            "prop_add": float(add_like / total_action_like) if total_action_like else 0.0,
+            "prop_del": float(del_like / total_action_like) if total_action_like else 0.0,
+            "top_nodes": top_nodes_payload,
+        }
+
+        return stats
+
+    def print_edge_index_node_dominance(
+            self,
+            name: str,
+            edge_index_pairs: torch.Tensor,
+            top_k: int = 10,
+            reference_edge_index: torch.Tensor | None = None,
+            store: bool = True,
+    ) -> dict:
+        """
+        Print and optionally store node dominance statistics for direct attack edges.
+        """
+        stats = self._edge_index_node_dominance_stats(
+            edge_index_pairs=edge_index_pairs,
+            name=name,
+            top_k=top_k,
+            reference_edge_index=reference_edge_index,
+        )
+
+        print(
+            f"[{name} NODE STATS] edges={stats['n_edges']} | "
+            f"endpoint_occurrences={stats['endpoint_occurrences']} | "
+            f"active_nodes={stats['active_nodes']}/{int(self.n)} | "
+            f"effective_nodes={stats['effective_nodes']:.2f} | "
+            f"gini={stats['gini']:.4f} | "
+            f"top1_endpoint_share={100.0 * stats['top1_endpoint_share']:.2f}% | "
+            f"top5_endpoint_share={100.0 * stats['top5_endpoint_share']:.2f}% | "
+            f"top10_endpoint_share={100.0 * stats['top10_endpoint_share']:.2f}% | "
+            f"add_like={stats['add_like']} ({100.0 * stats['prop_add']:.2f}%) | "
+            f"del_like={stats['del_like']} ({100.0 * stats['prop_del']:.2f}%)"
+        )
+
+        print(f"[{name} TOP NODES]")
+        for item in stats["top_nodes"]:
+            print(
+                f"  node={item['node']} | "
+                f"endpoint_count={item['endpoint_count']} | "
+                f"endpoint_share={100.0 * item['endpoint_share']:.2f}%"
+            )
+
+        if store:
+            if not hasattr(self, "attack_statistics"):
+                self.attack_statistics = defaultdict(list)
+
+            prefix = f"{name.lower()}_node_dominance"
+
+            for key, value in stats.items():
+                if key in ("name", "top_nodes"):
+                    continue
+                self.attack_statistics[f"{prefix}_{key}"].append(value)
+
+            # Store top nodes as a compact string, because attack_statistics
+            # usually contains scalar lists.
+            top_nodes_string = ";".join(
+                f"{x['node']}:{x['endpoint_count']}"
+                for x in stats["top_nodes"]
+            )
+            self.attack_statistics[f"{prefix}_top_nodes"].append(top_nodes_string)
+
+        return stats
+
+    @staticmethod
+    def record_selection_statistics(
+            tried_set,
+            harmful_set,
+            n_nodes: int,
+            device=None,
+            stats_dir: str = "cache",
+            csv_prefix: str = "selection",
+            top_k: int = 10,
+            extra: dict | None = None,
+    ) -> dict:
+        """
+        Prints and records all selection statistics in CSV files.
+
+        This replaces the inline block that printed:
+          - TRIED node dominance
+          - HARMFUL node dominance
+          - tried/harmful ratio
+
+        It writes two CSVs:
+          - {stats_dir}/{csv_prefix}_node_dominance.csv
+          - {stats_dir}/{csv_prefix}_selection_stats.csv
+        """
+        import os
+
+        if extra is None:
+            extra = {}
+
+        os.makedirs(stats_dir, exist_ok=True)
+
+        node_stats_csv_path = os.path.join(stats_dir, f"{csv_prefix}_node_dominance.csv")
+        selection_stats_csv_path = os.path.join(stats_dir, f"{csv_prefix}_selection_stats.csv")
+
+        n_tried = int(len(tried_set) if tried_set is not None else 0)
+        n_harmful = int(len(harmful_set) if harmful_set is not None else 0)
+        harmful_ratio = float(n_harmful / n_tried) if n_tried > 0 else 0.0
+
+        tried_node_stats = SelectorAttack._linear_edge_set_node_dominance_stats(
+            name="TRIED",
+            edge_set=tried_set,
+            n_nodes=int(n_nodes),
+            top_k=int(top_k),
+            device=device,
+            extra=extra,
+        )
+        harmful_node_stats = SelectorAttack._linear_edge_set_node_dominance_stats(
+            name="HARMFUL",
+            edge_set=harmful_set,
+            n_nodes=int(n_nodes),
+            top_k=int(top_k),
+            device=device,
+            extra=extra,
+        )
+
+        SelectorAttack._print_node_dominance_stats(tried_node_stats, top_k=top_k)
+        SelectorAttack._print_node_dominance_stats(harmful_node_stats, top_k=top_k)
+
+        SelectorAttack._append_dict_to_csv(node_stats_csv_path, tried_node_stats)
+        SelectorAttack._append_dict_to_csv(node_stats_csv_path, harmful_node_stats)
+
+        selection_stats = {
+            **extra,
+            "tried_edges": n_tried,
+            "harmful_edges": n_harmful,
+            "harmful_ratio": harmful_ratio,
+            "harmful_ratio_percent": 100.0 * harmful_ratio,
+        }
+
+        SelectorAttack._append_dict_to_csv(selection_stats_csv_path, selection_stats)
+
+        print(
+            f"[SELECTION STATS] tried_edges={n_tried} | "
+            f"harmful_edges={n_harmful} | "
+            f"harmful/tried={harmful_ratio:.4f} "
+            f"({100.0 * harmful_ratio:.2f}%)"
+        )
+
+        return {
+            "tried_node_stats": tried_node_stats,
+            "harmful_node_stats": harmful_node_stats,
+            "selection_stats": selection_stats,
+            "node_stats_csv_path": node_stats_csv_path,
+            "selection_stats_csv_path": selection_stats_csv_path,
+        }
+
+    @staticmethod
+    def _append_dict_to_csv(csv_path: str, row: dict):
+        import csv
+        import os
+
+        if csv_path is None:
+            return
+
+        directory = os.path.dirname(csv_path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+
+        file_exists = os.path.exists(csv_path)
+
+        with open(csv_path, mode="a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow(row)
+
+    @staticmethod
+    def _linear_edge_set_node_dominance_stats(
+            name: str,
+            edge_set,
+            n_nodes: int,
+            top_k: int = 10,
+            device=None,
+            extra: dict | None = None,
+    ) -> dict:
+        import torch
+
+        if extra is None:
+            extra = {}
+
+        if device is None:
+            device = torch.device("cpu")
+
+        base = {
+            **extra,
+            "name": str(name),
+            "edges": 0,
+            "endpoint_occurrences": 0,
+            "active_nodes": 0,
+            "n_nodes": int(n_nodes),
+            "effective_nodes": 0.0,
+            "gini": 0.0,
+            "top1_endpoint_share": 0.0,
+            "top5_endpoint_share": 0.0,
+            "top10_endpoint_share": 0.0,
+            "top_nodes": "",
+            "top_counts": "",
+        }
+
+        if edge_set is None or len(edge_set) == 0:
+            return base
+
+        lin_indices = torch.tensor(
+            [int(item[0]) for item in edge_set],
+            dtype=torch.long,
+            device=device,
+        )
+
+        edge_index = SelectorAttack.linear_to_triu_idx(int(n_nodes), lin_indices)
+        endpoints = edge_index.reshape(-1).detach().cpu()
+
+        node_counts = torch.bincount(endpoints, minlength=int(n_nodes))
+        active_counts = node_counts[node_counts > 0]
+
+        n_edges = int(len(edge_set))
+        n_endpoint_occurrences = int(endpoints.numel())
+        n_active_nodes = int(active_counts.numel())
+
+        top_k = min(int(top_k), n_active_nodes)
+        if top_k > 0:
+            top_counts, top_nodes = torch.topk(node_counts, k=top_k)
+        else:
+            top_counts = torch.empty(0, dtype=torch.long)
+            top_nodes = torch.empty(0, dtype=torch.long)
+
+        top1_share = float(top_counts[:1].sum().item() / n_endpoint_occurrences) if n_endpoint_occurrences else 0.0
+        top5_share = float(
+            top_counts[:min(5, top_k)].sum().item() / n_endpoint_occurrences) if n_endpoint_occurrences else 0.0
+        top10_share = float(
+            top_counts[:min(10, top_k)].sum().item() / n_endpoint_occurrences) if n_endpoint_occurrences else 0.0
+
+        probs = active_counts.float() / active_counts.sum().float()
+        effective_nodes = float(1.0 / torch.sum(probs ** 2).item()) if active_counts.numel() > 0 else 0.0
+
+        sorted_counts = torch.sort(active_counts.float()).values
+        m = sorted_counts.numel()
+
+        if m > 1:
+            idx = torch.arange(1, m + 1, dtype=torch.float32)
+            gini = float(
+                (2.0 * torch.sum(idx * sorted_counts) / (m * torch.sum(sorted_counts)))
+                - (m + 1.0) / m
+            )
+        else:
+            gini = 0.0
+
+        top_items = [
+            (int(node), int(count))
+            for node, count in zip(top_nodes.tolist(), top_counts.tolist())
+            if int(count) > 0
+        ]
+
+        return {
+            **base,
+            "edges": n_edges,
+            "endpoint_occurrences": n_endpoint_occurrences,
+            "active_nodes": n_active_nodes,
+            "effective_nodes": float(effective_nodes),
+            "gini": float(gini),
+            "top1_endpoint_share": float(top1_share),
+            "top5_endpoint_share": float(top5_share),
+            "top10_endpoint_share": float(top10_share),
+            "top_nodes": ";".join(str(node) for node, _count in top_items),
+            "top_counts": ";".join(str(count) for _node, count in top_items),
+        }
+
+    @staticmethod
+    def _print_node_dominance_stats(stats: dict, top_k: int = 10):
+        name = stats["name"]
+
+        if int(stats["edges"]) == 0:
+            print(f"[{name} NODE STATS] empty set; no node dominance statistics available.")
+            return
+
+        print(
+            f"[{name} NODE STATS] edges={int(stats['edges'])} | "
+            f"endpoint_occurrences={int(stats['endpoint_occurrences'])} | "
+            f"active_nodes={int(stats['active_nodes'])}/{int(stats['n_nodes'])} | "
+            f"effective_nodes={float(stats['effective_nodes']):.2f} | "
+            f"gini={float(stats['gini']):.4f} | "
+            f"top1_endpoint_share={100.0 * float(stats['top1_endpoint_share']):.2f}% | "
+            f"top5_endpoint_share={100.0 * float(stats['top5_endpoint_share']):.2f}% | "
+            f"top10_endpoint_share={100.0 * float(stats['top10_endpoint_share']):.2f}%"
+        )
+
+        top_nodes = [x for x in str(stats.get("top_nodes", "")).split(";") if x != ""]
+        top_counts = [x for x in str(stats.get("top_counts", "")).split(";") if x != ""]
+        top_items = list(zip(top_nodes, top_counts))[:int(top_k)]
+
+        print(
+            f"[{name} NODE TOP{len(top_items)}] "
+            + ", ".join(
+                f"node={int(node)}:count={int(count)}"
+                for node, count in top_items
+            )
         )

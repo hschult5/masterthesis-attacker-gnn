@@ -125,7 +125,15 @@ class PRBCD(SparseAttack):
             elif self.drop_mode == "loss":
                 cache_path = f"cache/selection_dataset{self.dataset}_seed{self.seed}_ads_{ads_mode}_k{self.n_candidates_k_sample}_bt{self.k_samples_batch}_drpmd{self.drop_mode}_drp{self.loss_drop_threshold_k_samples}.pt"
             elif self.drop_mode == "endpoint":
-                cache_path = f"cache/selection_dataset{self.dataset}_seed{self.seed}_ads_{ads_mode}_k{self.n_candidates_one_sample}_drpmd{self.drop_mode}.pt"
+                if self.training_data_node_cap > 0:
+                    cache_path = f"cache/selection_dataset{self.dataset}_seed{self.seed}_ads_{ads_mode}_k{self.n_candidates_one_sample}_drpmd{self.drop_mode}_trnodecap{self.training_data_node_cap}"
+                else:
+                    cache_path = f"cache/selection_dataset{self.dataset}_seed{self.seed}_ads_{ads_mode}_k{self.n_candidates_one_sample}_drpmd{self.drop_mode}.pt"
+            elif self.drop_mode == "endpointPRBCD":
+                if self.training_data_node_cap > 0:
+                    cache_path = f"cache/selection_dataset{self.dataset}_seed{self.seed}_ads_{ads_mode}_k{self.n_candidates_one_sample}_drpmd{self.drop_mode}_trnodecap{self.training_data_node_cap}"
+                else:
+                    cache_path = f"cache/selection_dataset{self.dataset}_seed{self.seed}_ads_{ads_mode}_k{self.n_candidates_one_sample}_drpmd{self.drop_mode}.pt"
 
             if os.path.exists(cache_path):
                 print("[CACHE] loading selection:", cache_path)
@@ -148,14 +156,17 @@ class PRBCD(SparseAttack):
                 )
             else:
                 print("[CACHE] computing selection and saving:", cache_path)
+
                 y_out, edge_index_lab, y_label, tried_set, harmful_set = self.label_edge_flips_prbcd_selfsample_fast(
+                    n_perturbations=n_perturbations,
                     mode=ads_mode,
                     drop_mode=self.drop_mode,
                     n_candidates_k_sample=self.n_candidates_k_sample,
                     n_candidates_one_sample=self.n_candidates_one_sample,
                     acc_drop_threshold_k_samples=self.acc_drop_threshold_k_samples,
                     loss_drop_threshold_k_samples=self.loss_drop_threshold_k_samples,
-                    k_samples_batch=self.k_samples_batch
+                    k_samples_batch=self.k_samples_batch,
+                    training_data_node_cap=self.training_data_node_cap,
                 )
                 meta = {
                     "ads_mode": self.ads_mode,
@@ -164,6 +175,36 @@ class PRBCD(SparseAttack):
                     "loss_drop_threshold_k_samples": self.loss_drop_threshold_k_samples,
                 }
                 PRBCD.save_selection(cache_path, y_out, edge_index_lab, y_label, tried_set, harmful_set, meta=meta)
+
+            # ---- selection statistics: tried vs harmful ----
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+            PRBCD.record_selection_statistics(
+                tried_set=tried_set,
+                harmful_set=harmful_set,
+                n_nodes=int(self.n),
+                device=self.device,
+                stats_dir="Plotting_Data/TrainingDataStats",
+                csv_prefix=(
+                    f"{timestamp}_"
+                    f"selection_dataset{self.dataset}_seed{self.seed}_"
+                    f"ads_{ads_mode}_drpmd{self.drop_mode}_"
+                    f"trnodecap{getattr(self, 'training_data_node_cap', 0)}"
+                ),
+                top_k=10,
+                extra={
+                    "timestamp": timestamp,
+                    "dataset": self.dataset,
+                    "seed": self.seed,
+                    "ads_mode": ads_mode,
+                    "drop_mode": self.drop_mode,
+                    "training_data_node_cap": int(getattr(self, "training_data_node_cap", 0)),
+                    "n_candidates_one_sample": int(getattr(self, "n_candidates_one_sample", 0)),
+                    "n_candidates_k_sample": int(getattr(self, "n_candidates_k_sample", 0)),
+                    "k_samples_batch": int(getattr(self, "k_samples_batch", 0)),
+                    "tau": float(getattr(self, "tau", 0.0)),
+                },
+            )
 
             X, edge_index_struct = self.extract_X_and_edge_index_from_sparsegraph(graph)
             stats = PRBCD.tried_add_del_proportion(tried_set, edge_index_struct, n=int(self.n))
@@ -179,7 +220,7 @@ class PRBCD(SparseAttack):
                 use_tqdm=True,
                 verbose=True,
             )
-            self.sample_block_from_linkpred_threshold(graph=graph, n_perturbations=n_perturbations)
+            self.sample_block_from_linkpred_threshold(graph=graph, n_perturbations=n_perturbations, tau=self.tau)
             self.tried_set = tried_set
         elif use_cert in ("accuracy_drop_selector_subgraph_random", "accuracy_drop_selector_subgraph_khop", "accuracy_drop_selector_subgraph_growhop"):
             print(use_cert, "-> sampling with accuracy drop selector subgraph")
@@ -286,7 +327,7 @@ class PRBCD(SparseAttack):
             self.tried_set = tried_set
         else:
             print(use_cert, "run sampling with no certificate")
-            self.sample_random_block(n_perturbations)
+            self.sample_random_block(n_perturbations, self.block_size)
         # Accuracy and attack statistics before the attack even started
         with torch.no_grad():
 
@@ -363,11 +404,11 @@ class PRBCD(SparseAttack):
                                 self.resample_block_from_linkpred_threshold(graph=graph,
                                                                             n_perturbations=n_perturbations, score_batch_size=int(self.block_size/10), tau=0.7-epoch*0.04)
                         else:
-                            self.resample_random_block(n_perturbations=n_perturbations)
+                            self.resample_random_block(n_perturbations=n_perturbations, mod_block_size=self.block_size)
                         pass
                     else:
                         print(use_cert, "run resampling with no certificate")
-                        self.resample_random_block(n_perturbations)
+                        self.resample_random_block(n_perturbations, mod_block_size=self.block_size)
                         pass
                 elif self.with_early_stopping and epoch == self.epochs_resampling - 1:
                     # Retreive best epoch if early stopping is active (not explicitly covered by pesudo code)
@@ -533,11 +574,11 @@ class PRBCD(SparseAttack):
 
         Parameters
         ----------
-        n_perturbations : int
+            n_perturbations : int
             Number of perturbations.
-        epoch : int
+            epoch : int
             Number of epochs until fine tuning.
-        gradient : torch.Tensor
+            gradient : torch.Tensor
             The current gradient.
 
         Returns
@@ -554,10 +595,10 @@ class PRBCD(SparseAttack):
 
         return self.get_modified_adj()
 
-    def sample_random_block(self, n_perturbations: int = 0):
+    def sample_random_block(self, n_perturbations: int = 0, mod_block_size: int = 0):
         for _ in range(self.max_final_samples):
             self.current_search_space = torch.randint(
-                self.n_possible_edges, (self.block_size,), device=self.device)
+                self.n_possible_edges, (mod_block_size,), device=self.device)
             self.current_search_space = torch.unique(self.current_search_space, sorted=True)
             if self.make_undirected:
                 self.modified_edge_index = PRBCD.linear_to_triu_idx(self.n, self.current_search_space)
@@ -708,11 +749,11 @@ class PRBCD(SparseAttack):
             self,
             graph,
             n_perturbations: int = 0,
-            tau: float = 0.8,  # acceptance threshold
+            tau: float = 0.8,
             max_sampling_tries: int = 2_000_000,
             score_batch_size: int = 1000,
             rng_seed: int = 0,
-            exclude_tried: bool = False,  # optional: never reuse edges across resamples
+            exclude_tried: bool = False,
     ):
         if not hasattr(self, "lp_model") or self.lp_model is None:
             raise RuntimeError("self.lp_model is not set.")
@@ -742,7 +783,10 @@ class PRBCD(SparseAttack):
 
             # sample a batch of candidate linear indices
             cand_lin = torch.randint(
-                self.n_possible_edges, (int(score_batch_size),), device=self.device, generator=g
+                self.n_possible_edges,
+                (int(score_batch_size),),
+                device=self.device,
+                generator=g,
             )
             cand_lin = torch.unique(cand_lin, sorted=False)
 
@@ -767,7 +811,7 @@ class PRBCD(SparseAttack):
                 if cand_lin.numel() == 0:
                     continue
 
-            # score
+            # score candidates
             with torch.no_grad():
                 logits = self.lp_model.edge_head(h, cand_ei).view(-1)
                 scores = torch.sigmoid(logits)
@@ -793,19 +837,82 @@ class PRBCD(SparseAttack):
             )
 
         # finalize current_search_space exactly like PRBCD
-        self.current_search_space = torch.tensor(accepted, device=self.device, dtype=torch.long)
+        self.current_search_space = torch.tensor(
+            accepted,
+            device=self.device,
+            dtype=torch.long,
+        )
         self.current_search_space = torch.unique(self.current_search_space, sorted=True)
 
         if self.make_undirected:
-            self.modified_edge_index = PRBCD.linear_to_triu_idx(self.n, self.current_search_space)
+            self.modified_edge_index = PRBCD.linear_to_triu_idx(
+                self.n,
+                self.current_search_space,
+            )
         else:
-            self.modified_edge_index = PRBCD.linear_to_full_idx(self.n, self.current_search_space)
+            self.modified_edge_index = PRBCD.linear_to_full_idx(
+                self.n,
+                self.current_search_space,
+            )
             is_not_self = self.modified_edge_index[0] != self.modified_edge_index[1]
             self.current_search_space = self.current_search_space[is_not_self]
             self.modified_edge_index = self.modified_edge_index[:, is_not_self]
 
+        PRBCD.print_linear_tensor_node_dominance(
+            name="SAMPLED_PRBCD_BLOCK",
+            lin_indices=self.current_search_space,
+            n_nodes=int(self.n),
+            top_k=10,
+            device=self.device,
+        )
+
+        # ============================================================
+        # Optional LP hit-rate detour
+        # Does NOT write into attack_statistics.
+        # Does NOT change the chosen block.
+        # Does NOT stop the PR-BCD attack.
+        # ============================================================
+        if getattr(self, "lp_hit_rate_detour", True):
+            with torch.no_grad():
+                detour_scores = torch.empty(
+                    self.current_search_space.numel(),
+                    device=self.device,
+                    dtype=torch.float32,
+                )
+
+                start = 0
+                while start < self.current_search_space.numel():
+                    end = min(
+                        start + int(score_batch_size),
+                        self.current_search_space.numel(),
+                    )
+
+                    batch_ei = self.modified_edge_index[:, start:end]
+                    detour_logits = self.lp_model.edge_head(h, batch_ei).view(-1)
+                    detour_scores[start:end] = torch.sigmoid(detour_logits)
+
+                    start = end
+
+            self._lp_endpoint_hit_rate_detour(
+                cand_lin=self.current_search_space,
+                cand_ei=self.modified_edge_index,
+                scores=detour_scores,
+                top_k=getattr(self, "lp_hit_rate_top_k", 200),
+                out_dir=getattr(
+                    self,
+                    "lp_hit_rate_out_dir",
+                    "extendedPlotting/lpEndpointHitRate",
+                ),
+                use_cert=getattr(self, "use_cert", ""),
+                ads_mode=getattr(self, "ads_mode", ""),
+                tau=tau,
+            )
+
         self.perturbed_edge_weight = torch.full_like(
-            self.current_search_space, self.eps, dtype=torch.float32, requires_grad=True
+            self.current_search_space,
+            self.eps,
+            dtype=torch.float32,
+            requires_grad=True,
         )
 
         if exclude_tried:
@@ -814,6 +921,252 @@ class PRBCD(SparseAttack):
         if self.current_search_space.size(0) < n_perturbations:
             raise RuntimeError("Block has fewer unique edges than n_perturbations. Lower tau or increase sampling.")
 
+    @torch.no_grad()
+    def _lp_endpoint_hit_rate_detour(
+            self,
+            cand_lin: torch.Tensor,
+            cand_ei: torch.Tensor,
+            scores: torch.Tensor,
+            top_k: int = 200,
+            out_dir: str = "extendedPlotting/lpEndpointHitRate",
+            use_cert: str = "",
+            ads_mode: str = "",
+            tau: float = None,
+    ):
+        import os
+        import csv
+        import time
+
+        os.makedirs(out_dir, exist_ok=True)
+
+        cand_lin = cand_lin.detach().to(self.device).long()
+        cand_ei = cand_ei.detach().to(self.device).long()
+        scores = scores.detach().to(self.device).float()
+
+        if cand_lin.numel() == 0 or scores.numel() == 0:
+            return
+
+        k = min(int(top_k), int(scores.numel()))
+        top_idx = torch.topk(scores, k=k, largest=True).indices
+
+        selected_lin = cand_lin[top_idx]
+        selected_ei = cand_ei[:, top_idx]
+        selected_scores = scores[top_idx]
+
+        clean_edge_index = self.edge_index.to(self.device)
+        clean_edge_weight = (
+            self.edge_weight.to(self.device).float()
+            if getattr(self, "edge_weight", None) is not None
+            else torch.ones(clean_edge_index.size(1), device=self.device)
+        )
+
+        labels_dev = self.labels.to(self.device)
+
+        logits_clean = self.attacked_model(
+            data=self.attr.to(self.device),
+            adj=(clean_edge_index, clean_edge_weight),
+        )
+
+        pred_clean = logits_clean.argmax(dim=-1)
+        clean_correct = pred_clean == labels_dev
+
+        n = int(self.n)
+
+        present = PRBCD._build_uppertri_bitset(clean_edge_index, n).to(self.device)
+
+        E = clean_edge_index.size(1)
+        dir_pos = torch.full(
+            (n, n),
+            -1,
+            dtype=torch.long,
+            device=self.device,
+        )
+        dir_pos[clean_edge_index[0], clean_edge_index[1]] = torch.arange(
+            E,
+            dtype=torch.long,
+            device=self.device,
+        )
+
+        rows = []
+
+        endpoint_hits = 0
+        u_hits = 0
+        v_hits = 0
+        both_hits = 0
+
+        for lin_t, edge_t, score_t in zip(
+                selected_lin,
+                selected_ei.t(),
+                selected_scores,
+        ):
+            lin = int(lin_t.item())
+            u = int(edge_t[0].item())
+            v = int(edge_t[1].item())
+            score = float(score_t.item())
+
+            if self.make_undirected:
+                exists_clean = bool(present[lin].item())
+            else:
+                exists_clean = int(dir_pos[u, v].item()) >= 0
+
+            action = "del" if exists_clean else "add"
+
+            edge_index_use = clean_edge_index
+            edge_weight_use = clean_edge_weight.clone()
+
+            if action == "del":
+                del_pos = []
+
+                pos_uv = int(dir_pos[u, v].item())
+                if pos_uv >= 0:
+                    del_pos.append(pos_uv)
+
+                if self.make_undirected:
+                    pos_vu = int(dir_pos[v, u].item())
+                    if pos_vu >= 0:
+                        del_pos.append(pos_vu)
+
+                if del_pos:
+                    del_pos = torch.tensor(
+                        del_pos,
+                        dtype=torch.long,
+                        device=self.device,
+                    )
+                    edge_weight_use[del_pos] = 0.0
+
+            else:
+                if self.make_undirected:
+                    extra_edges = torch.tensor(
+                        [[u, v], [v, u]],
+                        dtype=torch.long,
+                        device=self.device,
+                    ).t()
+                else:
+                    extra_edges = torch.tensor(
+                        [[u], [v]],
+                        dtype=torch.long,
+                        device=self.device,
+                    )
+
+                extra_weights = torch.ones(
+                    extra_edges.size(1),
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+
+                edge_index_use = torch.cat([edge_index_use, extra_edges], dim=1)
+                edge_weight_use = torch.cat([edge_weight_use, extra_weights], dim=0)
+
+            logits_pert = self.attacked_model(
+                data=self.attr.to(self.device),
+                adj=(edge_index_use, edge_weight_use),
+            )
+
+            pred_pert = logits_pert.argmax(dim=-1)
+
+            u_was_correct = bool(clean_correct[u].item())
+            v_was_correct = bool(clean_correct[v].item())
+
+            u_now_wrong = int(pred_pert[u].item()) != int(labels_dev[u].item())
+            v_now_wrong = int(pred_pert[v].item()) != int(labels_dev[v].item())
+
+            u_hit = u_was_correct and u_now_wrong
+            v_hit = v_was_correct and v_now_wrong
+
+            endpoint_hit = u_hit or v_hit
+            both_hit = u_hit and v_hit
+
+            endpoint_hits += int(endpoint_hit)
+            u_hits += int(u_hit)
+            v_hits += int(v_hit)
+            both_hits += int(both_hit)
+
+            rows.append({
+                "dataset": getattr(self, "dataset", ""),
+                "seed": getattr(self, "seed", ""),
+                "use_cert": use_cert,
+                "ads_mode": ads_mode,
+                "tau": tau,
+
+                "linear_idx": lin,
+                "u": u,
+                "v": v,
+                "lp_score": score,
+                "exists_clean": exists_clean,
+                "action": action,
+
+                "u_label": int(labels_dev[u].item()),
+                "v_label": int(labels_dev[v].item()),
+                "u_clean_pred": int(pred_clean[u].item()),
+                "v_clean_pred": int(pred_clean[v].item()),
+                "u_pert_pred": int(pred_pert[u].item()),
+                "v_pert_pred": int(pred_pert[v].item()),
+
+                "u_was_correct": u_was_correct,
+                "v_was_correct": v_was_correct,
+                "u_hit_correct_to_incorrect": u_hit,
+                "v_hit_correct_to_incorrect": v_hit,
+                "endpoint_hit": endpoint_hit,
+            })
+
+        n_selected = len(rows)
+
+        endpoint_hit_rate = endpoint_hits / n_selected if n_selected else 0.0
+        u_hit_rate = u_hits / n_selected if n_selected else 0.0
+        v_hit_rate = v_hits / n_selected if n_selected else 0.0
+        both_hit_rate = both_hits / n_selected if n_selected else 0.0
+
+        summary_row = {
+            "dataset": getattr(self, "dataset", ""),
+            "seed": getattr(self, "seed", ""),
+            "use_cert": use_cert,
+            "ads_mode": ads_mode,
+            "tau": tau,
+            "top_k": k,
+            "n_selected": n_selected,
+
+            "endpoint_hits": endpoint_hits,
+            "u_hits": u_hits,
+            "v_hits": v_hits,
+            "both_hits": both_hits,
+
+            "endpoint_hit_rate": endpoint_hit_rate,
+            "u_hit_rate": u_hit_rate,
+            "v_hit_rate": v_hit_rate,
+            "both_hit_rate": both_hit_rate,
+
+            "mean_lp_score": float(selected_scores.mean().item()) if n_selected else "",
+            "max_lp_score": float(selected_scores.max().item()) if n_selected else "",
+            "min_lp_score": float(selected_scores.min().item()) if n_selected else "",
+        }
+
+        summary_path = os.path.join(
+            out_dir,
+            f"lp_endpoint_hitrate__dataset{getattr(self, 'dataset', '')}"
+            f"__seed{getattr(self, 'seed', '')}"
+            f"__usecert{use_cert}"
+            f"__mode{ads_mode}"
+            f"__tau{tau}"
+            f"__{time.strftime('%y%m%d-%H%M%S')}.csv",
+        )
+
+        with open(summary_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(summary_row.keys()))
+            writer.writeheader()
+            writer.writerow(summary_row)
+
+        details_path = summary_path.replace(".csv", "__details.csv")
+
+        if rows:
+            with open(details_path, "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+                writer.writeheader()
+                writer.writerows(rows)
+
+        print("[LP hit-rate detour]")
+        print("summary:", summary_path)
+        print("details:", details_path)
+        print("endpoint_hit_rate:", endpoint_hit_rate)
 
     def sample_block_from_linkpred_threshold_subgraph(
             self,
@@ -1748,7 +2101,7 @@ class PRBCD(SparseAttack):
 
         self.pgd_forward = fwd
 
-    def resample_random_block(self, n_perturbations: int): #TODO: still work to be split_by_eps
+    def resample_random_block(self, n_perturbations: int, mod_block_size: int): #TODO: still work to be split_by_eps
         if self.keep_heuristic == 'WeightOnly':
             sorted_idx = torch.argsort(self.perturbed_edge_weight)
             idx_keep = (self.perturbed_edge_weight <= self.eps).sum().long()
@@ -1765,7 +2118,7 @@ class PRBCD(SparseAttack):
 
         # Sample until enough edges were drawn
         for i in range(self.max_final_samples):
-            n_edges_resample = self.block_size - self.current_search_space.size(0)
+            n_edges_resample = mod_block_size - self.current_search_space.size(0)
             lin_index = torch.randint(self.n_possible_edges, (n_edges_resample,), device=self.device)
 
             self.current_search_space, unique_idx = torch.unique(
@@ -2315,6 +2668,7 @@ class PRBCD(SparseAttack):
 
     def label_edge_flips_prbcd_selfsample_fast(
             self,
+            n_perturbations,
             n_candidates_one_sample: int = 2000,
             n_candidates_k_sample: int = 2000,
             p_add: float = 0.06,  # unused in uniform flip
@@ -2322,17 +2676,18 @@ class PRBCD(SparseAttack):
             acc_drop_threshold_one_sample: float = 3e-3,
             acc_drop_threshold_k_samples: float = -1,
             acc_drop_threshold_k_hop: float = 1e-2,
-            drop_mode: str = "acc",  # "acc" | "loss" | "endpoint"
+            drop_mode: str = "acc",  # "acc" | "loss" | "endpoint" | "endpointPRBCD"
             loss_drop_threshold_one_sample: float = 1e-3,
             loss_drop_threshold_k_samples: float = 1e-3,
             loss_drop_threshold_k_hop: float = 1e-3,
             rng_seed: int = 0,
             max_sampling_tries: int = 100_000,
-            mode: str = "k_hop",  # # one_sample | k_action | k_action_individual | k_hop
+            mode: str = "k_hop",  # one_sample | node_matching | k_action | k_action_individual | k_hop
             k_samples_batch: int = 10,  # only used in k_action
             n_candidates_k_hop_sample: int = 2000,  # target # of harmful flips in k_hop mode
             k_hop: int = 2,  # hop radius for k_hop mode
             prev_tried_set: "Set[tuple[int, float]] | None" = None,
+            training_data_node_cap: int = 0
     ) -> tuple[torch.Tensor,
     torch.Tensor,
     torch.Tensor,
@@ -2348,11 +2703,23 @@ class PRBCD(SparseAttack):
         if n <= 1:
             raise ValueError("Graph must have at least 2 nodes.")
 
+        training_data_node_cap = int(training_data_node_cap)
+        if training_data_node_cap < 0:
+            raise ValueError("training_data_node_cap must be >= 0. Use 0 to disable the cap.")
+
+        if drop_mode == "endpointPRBCD" and mode not in ("one_sample", "node_matching"):
+            raise ValueError(
+                "drop_mode='endpointPRBCD' only supports mode='one_sample' "
+                "or mode='node_matching'."
+            )
+
         # ---- base adjacency
         ei_base = self.edge_index.to(device=device, dtype=torch.long).contiguous()  # (2,E)
-        ew_base = (self.edge_weight.to(device).float()
-                   if getattr(self, "edge_weight", None) is not None
-                   else torch.ones(ei_base.size(1), device=device, dtype=torch.float32)).contiguous()
+        ew_base = (
+            self.edge_weight.to(device).float()
+            if getattr(self, "edge_weight", None) is not None
+            else torch.ones(ei_base.size(1), device=device, dtype=torch.float32)
+        ).contiguous()
 
         # ---- build undirected membership bitset
         present = PRBCD._build_uppertri_bitset(ei_base, n)  # (num_pairs,) bool
@@ -2387,16 +2754,23 @@ class PRBCD(SparseAttack):
             thr_one = loss_drop_threshold_one_sample
             thr_k = loss_drop_threshold_k_samples
             thr_khop = loss_drop_threshold_k_hop
-        elif drop_mode == "endpoint":
+        elif drop_mode in ("endpoint", "endpointPRBCD"):
             thr_one = None
             thr_k = None
             thr_khop = None
         else:
-            raise ValueError(f"Unknown drop_mode='{drop_mode}'. Use 'acc' or 'loss'.")
+            raise ValueError(
+                f"Unknown drop_mode='{drop_mode}'. "
+                "Use 'acc', 'loss', 'endpoint', or 'endpointPRBCD'."
+            )
 
         # ---- outputs over *all* upper-tri pairs
         num_pairs = n * (n - 1) // 2
         y_out = torch.zeros(num_pairs, dtype=torch.uint8, device=device)
+
+        # Base sampling pool for normal endpoint mode: all possible upper-triangle pairs.
+        # If training_data_node_cap == 0, this pool is never restricted by node cap.
+        endpoint_all_pool_idx = torch.arange(num_pairs, dtype=torch.long, device=device)
 
         # ---- lists to collect labeled pairs (only tried pairs)
         lab_u: list[int] = []
@@ -2404,8 +2778,22 @@ class PRBCD(SparseAttack):
         lab_k: list[int] = []  # linear indices k_lin for those pairs
 
         # start tried_set from previous run if given
-        tried_set: Set[Tuple[int, float]] = set(prev_tried_set) if prev_tried_set is not None else set()
-        harmful_set: Set[Tuple[int, float]] = set()
+        tried_set: Set[Tuple[int, float | None]] = (
+            set(prev_tried_set) if prev_tried_set is not None else set()
+        )
+        harmful_set: Set[Tuple[int, float | None]] = set()
+
+        # Only used for endpoint-style training-data construction.
+        # cap=0 means disabled. If cap>0, the sampling pool itself is
+        # restricted after a node reaches `training_data_node_cap`, so newly
+        # sampled/evaluated endpoint candidates cannot touch capped nodes.
+        endpoint_node_harmful_count = [0 for _ in range(n)]
+
+        # Tracks which capped nodes were already printed, so each node is reported only once.
+        endpoint_capped_nodes_reported: set[int] = set()
+
+        # Fast duplicate check for harmful edge ids.
+        harmful_k_seen: set[int] = set()
 
         # ---- seen mask to avoid duplicate candidates (device-side)
         seen = torch.zeros(num_pairs, dtype=torch.bool, device=device)
@@ -2423,7 +2811,42 @@ class PRBCD(SparseAttack):
 
         flips_done, tries = 0, 0
 
-        # ----- helper: compute drop for purturbation selection -----
+        # -------------------------------------------------------------------------
+        # endpointPRBCD candidate block
+        # -------------------------------------------------------------------------
+        prbcd_block_idx: Optional[torch.Tensor] = None
+
+        if drop_mode == "endpointPRBCD":
+            prbcd_block_idx = self._run_prbcd_for_endpoint_candidate_block(
+                rng_seed=int(rng_seed),
+                n_perturbations=n_perturbations,
+            )
+
+            prbcd_block_idx = prbcd_block_idx.to(device=device, dtype=torch.long).flatten()
+
+            # keep only valid upper-tri pair indices
+            prbcd_block_idx = prbcd_block_idx[
+                (prbcd_block_idx >= 0) & (prbcd_block_idx < num_pairs)
+                ]
+
+            # unique block indices
+            prbcd_block_idx = torch.unique(prbcd_block_idx, sorted=False)
+
+            if prbcd_block_idx.numel() == 0:
+                raise RuntimeError(
+                    "endpointPRBCD produced an empty candidate block. "
+                    "The PRBCD helper must return at least one valid upper-tri edge index."
+                )
+
+            # remove pairs already tried in prev_tried_set
+            prbcd_block_idx = prbcd_block_idx[~seen[prbcd_block_idx]]
+
+            if prbcd_block_idx.numel() == 0:
+                raise RuntimeError(
+                    "endpointPRBCD candidate block contains only previously tried edges."
+                )
+
+        # ----- helper: endpoint criterion -----
         def _endpoint_flipped_correct_to_incorrect(
                 u: int,
                 v: int,
@@ -2443,11 +2866,142 @@ class PRBCD(SparseAttack):
 
             return u_flip or v_flip
 
-        # ----- helper: compute drop for purturbation selection -----
+        # ----- helper: endpoint harmful-set node cap via sampling-pool restriction -----
+        def _endpoint_node_cap_active() -> bool:
+            return (
+                    drop_mode in ("endpoint", "endpointPRBCD")
+                    and training_data_node_cap > 0
+            )
+
+        def _restrict_endpoint_pool_by_node_cap(pool_idx: torch.Tensor) -> torch.Tensor:
+            """
+            Restrict a linear upper-triangle edge pool by removing all edges
+            touching nodes that have already reached training_data_node_cap.
+
+            Important: if training_data_node_cap == 0, this returns the pool
+            unchanged, apart from normal tensor/device cleanup.
+            """
+            if pool_idx is None:
+                return torch.empty(0, dtype=torch.long, device=device)
+
+            pool_idx = pool_idx.to(device=device, dtype=torch.long).flatten()
+
+            if pool_idx.numel() == 0:
+                return pool_idx
+
+            # Always keep the pool within the valid linear index range.
+            pool_idx = pool_idx[(pool_idx >= 0) & (pool_idx < num_pairs)]
+
+            # No node-cap restriction when cap is disabled.
+            if not _endpoint_node_cap_active():
+                return pool_idx
+
+            counts = torch.tensor(
+                endpoint_node_harmful_count,
+                dtype=torch.long,
+                device=device,
+            )
+            allowed_nodes = counts < int(training_data_node_cap)
+
+            if bool(allowed_nodes.all().item()):
+                return pool_idx
+
+            uv = PRBCD.linear_to_triu_idx(n, pool_idx)
+            u = uv[0]
+            v = uv[1]
+
+            keep = allowed_nodes[u] & allowed_nodes[v]
+            return pool_idx[keep]
+
+        def _available_from_endpoint_pool(pool_idx: torch.Tensor) -> torch.Tensor:
+            """
+            Apply the current endpoint sampling-pool rules:
+              1. use the mode-specific base pool
+                 - endpoint: all possible edges
+                 - endpointPRBCD: PRBCD block
+              2. remove already-seen/evaluated edges
+              3. if nodecap > 0, remove edges touching capped nodes
+            """
+            pool_idx = _restrict_endpoint_pool_by_node_cap(pool_idx)
+
+            if pool_idx.numel() == 0:
+                return pool_idx
+
+            return pool_idx[~seen[pool_idx]]
+
+        def _refresh_endpoint_sampling_pool_after_harmful() -> None:
+            """
+            After a new harmful edge is accepted, node counts may have changed.
+            If a node just became capped, restrict the active sampling pool so
+            future samples cannot touch capped nodes.
+            """
+            nonlocal endpoint_all_pool_idx, prbcd_block_idx
+
+            if not _endpoint_node_cap_active():
+                return
+
+            if drop_mode == "endpointPRBCD":
+                if prbcd_block_idx is not None:
+                    prbcd_block_idx = _restrict_endpoint_pool_by_node_cap(prbcd_block_idx)
+            else:
+                endpoint_all_pool_idx = _restrict_endpoint_pool_by_node_cap(endpoint_all_pool_idx)
+
+        def _report_newly_capped_nodes(edge_u: int, edge_v: int, edge_k: int) -> None:
+            """
+            Print a message exactly once for each node when it first reaches
+            training_data_node_cap.
+            """
+            if not _endpoint_node_cap_active():
+                return
+
+            for node in (int(edge_u), int(edge_v)):
+                if (
+                        endpoint_node_harmful_count[node] >= int(training_data_node_cap)
+                        and node not in endpoint_capped_nodes_reported
+                ):
+                    endpoint_capped_nodes_reported.add(node)
+                    print(
+                        f"[NODE CAP REACHED] "
+                        f"node={node} | "
+                        f"count={endpoint_node_harmful_count[node]}/"
+                        f"{int(training_data_node_cap)} | "
+                        f"trigger_edge=({int(edge_u)}, {int(edge_v)}) | "
+                        f"k={int(edge_k)} | "
+                        f"mode={drop_mode}"
+                    )
+
+        def _record_endpoint_harmful(u: int, v: int, k_lin: int) -> bool:
+            """
+            Records an endpoint-harmful edge as positive training data.
+
+            The node cap is enforced by restricting the sampling pool, not by
+            throwing out already-sampled harmful edges after evaluation.
+            If a node reaches the cap because of this edge, it is printed once,
+            and the active endpoint sampling pool is refreshed immediately.
+            """
+            k_lin = int(k_lin)
+
+            if k_lin in harmful_k_seen:
+                return False
+
+            harmful_k_seen.add(k_lin)
+            y_out[k_lin] = 1
+            harmful_set.add((k_lin, None))
+
+            if _endpoint_node_cap_active():
+                endpoint_node_harmful_count[int(u)] += 1
+                endpoint_node_harmful_count[int(v)] += 1
+                _report_newly_capped_nodes(int(u), int(v), k_lin)
+                _refresh_endpoint_sampling_pool_after_harmful()
+
+            return True
+
+        # ----- helper: compute drop for perturbation selection -----
         def _compute_drop(logits_pert: torch.Tensor) -> float | None:
             if drop_mode == "acc":
                 acc_pert = utils.accuracy(logits_pert, labels_dev, idx_attack)
                 return float(acc_clean - acc_pert)
+
             elif drop_mode == "loss":
                 loss_pert = F.cross_entropy(
                     logits_pert[idx_attack],
@@ -2455,10 +3009,15 @@ class PRBCD(SparseAttack):
                     reduction="mean",
                 )
                 return float((loss_pert - loss_clean).item())
-            elif drop_mode == "endpoint":
-                pass
+
+            elif drop_mode in ("endpoint", "endpointPRBCD"):
+                return None
+
             else:
-                raise ValueError(f"Unknown drop_mode='{drop_mode}'. Use 'acc' or 'loss'.")
+                raise ValueError(
+                    f"Unknown drop_mode='{drop_mode}'. "
+                    "Use 'acc', 'loss', 'endpoint', or 'endpointPRBCD'."
+                )
 
         # ----- helper: build perturbed adjacency fresh from a batch of flips -----
         def _build_perturbed_adj(flips):
@@ -2477,9 +3036,11 @@ class PRBCD(SparseAttack):
                     idx = int(dir_pos[u, v].item())
                     if idx >= 0:
                         del_indices.append(idx)
+
                     idx2 = int(dir_pos[v, u].item())
                     if idx2 >= 0:
                         del_indices.append(idx2)
+
                 else:  # "add"
                     add_edges.append((u, v))
                     add_edges.append((v, u))
@@ -2498,52 +3059,116 @@ class PRBCD(SparseAttack):
 
             return ei_use, ew_use
 
-        # ----- helper: builds n/2 flips -----
+        # ----- helper: convert upper-tri linear index to flip tuple -----
+        def _k_lin_to_flip(k_lin: int):
+            k_tensor = torch.tensor([int(k_lin)], device=device, dtype=torch.long)
+            uv = PRBCD.linear_to_triu_idx(n, k_tensor)
+
+            u = int(uv[0, 0].item())
+            v = int(uv[1, 0].item())
+
+            action = "del" if bool(present[int(k_lin)].item()) else "add"
+
+            return u, v, action, int(k_lin)
+
+        # ----- helper: sample one flip from a mode-specific endpoint pool -----
+        def _sample_one_flip_from_endpoint_pool(pool_idx: torch.Tensor):
+            """
+            Samples one flip from the current restricted endpoint pool.
+
+            endpoint:      pool_idx = endpoint_all_pool_idx
+            endpointPRBCD: pool_idx = prbcd_block_idx
+
+            If training_data_node_cap == 0, no node-cap restriction is applied.
+            """
+            available = _available_from_endpoint_pool(pool_idx)
+
+            if available.numel() == 0:
+                return None
+
+            pos = torch.randint(
+                available.numel(),
+                (1,),
+                generator=g,
+                device=device,
+            ).item()
+
+            k_lin = int(available[pos].item())
+            return _k_lin_to_flip(k_lin)
+
+        # ----- helper: builds n/2 matching-style flips from full endpoint pool -----
         def _sample_node_matching_batch():
             """
-            Returns a batch of unique undirected pairs covering each node at most once.
-            Size ~ floor(n/2). Skips already-seen k_lin and re-draws a few times if needed.
+            Returns a matching-style batch from the endpoint sampling pool.
+
+            For endpoint mode, the base pool is all possible upper-triangle
+            edges. The current pool is then restricted by seen edges and, only
+            when training_data_node_cap > 0, by capped nodes.
             """
-            # target unique undirected edges this batch
             target = n // 2
+            available = _available_from_endpoint_pool(endpoint_all_pool_idx)
+
+            if available.numel() == 0:
+                return []
+
+            perm = torch.randperm(available.numel(), generator=g, device=device)
+            available = available[perm]
+
+            used_nodes: set[int] = set()
             batch = []
-            local_tries = 0
-            max_local_tries = 50  # cheap; each try is just a randperm
 
-            while len(batch) < target and local_tries < max_local_tries:
-                perm = torch.randperm(n, generator=g, device=device)
-                # pair consecutive nodes
-                u_all = perm[0:2 * target:2]
-                v_all = perm[1:2 * target:2]
+            for k_tensor in available:
+                k_lin = int(k_tensor.item())
+                u, v, action, k_lin = _k_lin_to_flip(k_lin)
 
-                # enforce u < v for upper-tri indexing
-                uu = torch.minimum(u_all, v_all)
-                vv = torch.maximum(u_all, v_all)
-
-                # compute linear indices (upper-tri)
-                # full_idx shape (2, m)
-                full_idx = torch.stack([uu, vv], dim=0)
-                k_all = PRBCD.triu_idx_to_linear_idx(n, full_idx).long()  # (m,)
-
-                # filter: not already seen
-                not_seen = ~seen[k_all]
-                uu = uu[not_seen]
-                vv = vv[not_seen]
-                k_all = k_all[not_seen]
-
-                if k_all.numel() == 0:
-                    local_tries += 1
+                if u in used_nodes or v in used_nodes:
                     continue
 
-                # action from membership bitset
-                # present[k] == True => edge exists => "del", else "add"
-                for u, v, k_lin in zip(uu.tolist(), vv.tolist(), k_all.tolist()):
-                    action = "del" if bool(present[k_lin].item()) else "add"
-                    batch.append((int(u), int(v), action, int(k_lin)))
-                    if len(batch) >= target:
-                        break
+                used_nodes.add(u)
+                used_nodes.add(v)
+                batch.append((u, v, action, k_lin))
 
-                local_tries += 1
+                if len(batch) >= target:
+                    break
+
+            return batch
+
+        # ----- helper: builds n/2 matching-style flips from PRBCD block -----
+        def _sample_node_matching_batch_from_prbcd_block():
+            """
+            Returns a matching-style batch from the endpointPRBCD sampling pool.
+
+            The base pool is the PRBCD candidate block. The current pool is
+            then restricted by seen edges and, only when
+            training_data_node_cap > 0, by capped nodes.
+            """
+            assert prbcd_block_idx is not None
+
+            target = n // 2
+            available = _available_from_endpoint_pool(prbcd_block_idx)
+
+            if available.numel() == 0:
+                return []
+
+            perm = torch.randperm(available.numel(), generator=g, device=device)
+            available = available[perm]
+
+            used_nodes: set[int] = set()
+            batch = []
+
+            for k_tensor in available:
+                k_lin = int(k_tensor.item())
+                u, v, action, k_lin = _k_lin_to_flip(k_lin)
+
+                if u in used_nodes or v in used_nodes:
+                    continue
+
+                used_nodes.add(u)
+                used_nodes.add(v)
+                batch.append((u, v, action, k_lin))
+
+                if len(batch) >= target:
+                    break
 
             return batch
 
@@ -2554,16 +3179,36 @@ class PRBCD(SparseAttack):
             adj_list = [[] for _ in range(n)]
             src = ei_cpu[0].tolist()
             dst = ei_cpu[1].tolist()
+
             for u, v in zip(src, dst):
                 adj_list[u].append(v)
 
-        # -------- switch: sampling mode --------
+        # -------------------------------------------------------------------------
+        # switch: sampling mode
+        # -------------------------------------------------------------------------
         if mode == "one_sample":
             while (flips_done == 0 or flips_done < n_candidates_one_sample) and tries < max_sampling_tries:
-                u, v, action, k_lin = PRBCD._sample_one_flip(n, present, g, device)
-                tries += 1
-                if seen[k_lin]:
-                    continue
+
+                if drop_mode in ("endpoint", "endpointPRBCD"):
+                    if drop_mode == "endpointPRBCD":
+                        sampled = _sample_one_flip_from_endpoint_pool(prbcd_block_idx)
+                    else:
+                        sampled = _sample_one_flip_from_endpoint_pool(endpoint_all_pool_idx)
+
+                    tries += 1
+
+                    if sampled is None:
+                        break
+
+                    u, v, action, k_lin = sampled
+
+                else:
+                    u, v, action, k_lin = PRBCD._sample_one_flip(n, present, g, device)
+                    tries += 1
+
+                    if seen[k_lin]:
+                        continue
+
                 seen[k_lin] = True
 
                 batch = [(u, v, action, k_lin)]
@@ -2585,19 +3230,42 @@ class PRBCD(SparseAttack):
                         y_out[k_lin] = 1
                         harmful_set.add((int(k_lin), drop))
                         flips_done += 1
+
+                        print(
+                            f"[HARMFUL EDGE FOUND] "
+                            f"k={int(k_lin)} | edge=({int(u)}, {int(v)}) | "
+                            f"action={action} | drop={drop:.6f} | "
+                            f"found={flips_done}/{n_candidates_one_sample}"
+                        )
+
                 else:
+                    # endpoint and endpointPRBCD
                     if _endpoint_flipped_correct_to_incorrect(u, v, logits_pert):
-                        y_out[k_lin] = 1
-                        harmful_set.add((int(k_lin), drop))
-                        flips_done += 1
+                        if _record_endpoint_harmful(u, v, k_lin):
+                            flips_done += 1
+
+                            print(
+                                f"[HARMFUL EDGE FOUND] "
+                                f"k={int(k_lin)} | edge=({int(u)}, {int(v)}) | "
+                                f"action={action} | mode={drop_mode} | "
+                                f"found={flips_done}/{n_candidates_one_sample}"
+                            )
 
         elif mode == "node_matching":
-            if drop_mode != "endpoint":
-                raise ValueError("mode='node_matching' is intended for drop_mode='endpoint' (batched endpoint check).")
+            if drop_mode not in ("endpoint", "endpointPRBCD"):
+                raise ValueError(
+                    "mode='node_matching' is intended for drop_mode='endpoint' "
+                    "or drop_mode='endpointPRBCD' (batched endpoint check)."
+                )
 
             # collect harmful edges until target reached
             while (flips_done == 0 or flips_done < n_candidates_k_hop_sample) and tries < max_sampling_tries:
-                batch = _sample_node_matching_batch()
+
+                if drop_mode == "endpointPRBCD":
+                    batch = _sample_node_matching_batch_from_prbcd_block()
+                else:
+                    batch = _sample_node_matching_batch()
+
                 if not batch:
                     break
 
@@ -2614,19 +3282,18 @@ class PRBCD(SparseAttack):
 
                 # endpoint labeling per edge in the batch
                 for (u, v, _action, k_lin) in batch:
-                    # store tried (drop is None in endpoint mode)
                     tried_set.add((int(k_lin), None))
+
                     lab_u.append(int(u))
                     lab_v.append(int(v))
                     lab_k.append(int(k_lin))
 
                     if _endpoint_flipped_correct_to_incorrect(u, v, logits_pert):
-                        y_out[k_lin] = 1
-                        harmful_set.add((int(k_lin), None))
-                        flips_done += 1
+                        if _record_endpoint_harmful(u, v, k_lin):
+                            flips_done += 1
 
-                # optional: stop early if you already have enough harmful flips
-                if flips_done >= n_candidates_one_sample:
+                # keep original stopping behavior, but use the node_matching target consistently
+                if flips_done >= n_candidates_k_hop_sample:
                     break
 
         elif mode == "k_action":
@@ -2639,6 +3306,7 @@ class PRBCD(SparseAttack):
                     k=int(k_samples_batch),
                     seen=seen,
                 )
+
                 if not batch:
                     break
 
@@ -2677,6 +3345,7 @@ class PRBCD(SparseAttack):
                     k=int(k_samples_batch),
                     seen=seen,
                 )
+
                 if not batch:
                     break
 
@@ -2700,6 +3369,7 @@ class PRBCD(SparseAttack):
                         lab_u.append(int(u))
                         lab_v.append(int(v))
                         lab_k.append(int(k_lin))
+
                     continue
 
                 # --- if batch IS harmful, re-evaluate each edge individually ---
@@ -2718,7 +3388,7 @@ class PRBCD(SparseAttack):
                     lab_k.append(int(k_lin))
 
                     # label harmful edges using INDIVIDUAL drop
-                    if drop_ind > thr_k/k_samples_batch: #TODO: hier individual drop festlegen
+                    if drop_ind > thr_k / k_samples_batch:  # TODO: hier individual drop festlegen
                         y_out[k_lin] = 1
                         harmful_set.add((int(k_lin), drop_ind))
                         flips_done += 1
@@ -2740,6 +3410,7 @@ class PRBCD(SparseAttack):
                     adj_list=adj_list,
                     max_root_tries=max_root_tries,
                 )
+
                 if not batch:
                     break
 
@@ -2766,6 +3437,7 @@ class PRBCD(SparseAttack):
                     for (_u, _v, _action, k_lin) in batch:
                         y_out[k_lin] = 1
                         harmful_set.add((int(k_lin), drop))
+
                     flips_done += len(batch)
 
             if flips_done > n_candidates_k_hop_sample:
@@ -2775,11 +3447,19 @@ class PRBCD(SparseAttack):
 
                 y_out[remove] = 0
                 keep_set = set(int(i.item()) for i in keep)
-                harmful_set = {(idx, drop) for (idx, drop) in harmful_set if idx in keep_set}
+                harmful_set = {
+                    (idx, drop)
+                    for (idx, drop) in harmful_set
+                    if idx in keep_set
+                }
                 flips_done = n_candidates_k_hop_sample
 
         else:
-            raise ValueError(f"Unknown mode '{mode}'. Use 'one_sample', 'k_action' or 'k_hop'.")
+            raise ValueError(
+                f"Unknown mode '{mode}'. "
+                "Use 'one_sample', 'node_matching', 'k_action', "
+                "'k_action_individual', or 'k_hop'."
+            )
 
         # ---- build edge_index_lab and y_label ----
         # create mapping from k_lin -> (u, v) for all actually evaluated pairs
@@ -2790,27 +3470,34 @@ class PRBCD(SparseAttack):
             y_label = torch.empty((0,), device=device, dtype=torch.uint8)
             return y_out, edge_index_lab, y_label, tried_set, harmful_set
 
-        # ---------------- endpoint mode: balanced labels ----------------
-        if drop_mode == "endpoint":
+        # ---------------- endpoint / endpointPRBCD mode: balanced labels ----------------
+        if drop_mode in ("endpoint", "endpointPRBCD"):
             # Extract k_lin indices from sets of (k_lin, drop)
             harmful_k = {int(k) for (k, _d) in harmful_set}
             tried_k = {int(k) for (k, _d) in tried_set}
 
             # only keep those we can map to (u,v)
             harmful_k = [k for k in harmful_k if k in k_to_uv]
+
             if len(harmful_k) == 0:
                 edge_index_lab = torch.empty((2, 0), device=device, dtype=torch.long)
                 y_label = torch.empty((0,), device=device, dtype=torch.uint8)
                 return y_out, edge_index_lab, y_label, tried_set, harmful_set
 
+            harmful_k_set = set(harmful_k)
+
             # candidate negatives = tried but not harmful
-            neg_candidates = [k for k in tried_k if (k not in set(harmful_k)) and (k in k_to_uv)]
+            neg_candidates = [
+                k for k in tried_k
+                if (k not in harmful_k_set)
+                   and (k in k_to_uv)
+            ]
 
             # sample same number of negatives as positives (or as many as available)
             n_pos = len(harmful_k)
             n_neg = min(len(neg_candidates), n_pos)
 
-            # reproducible RNG (use your existing rng_seed)
+            # reproducible RNG
             import random
             rnd = random.Random(int(rng_seed))
             rnd.shuffle(neg_candidates)
@@ -2842,6 +3529,7 @@ class PRBCD(SparseAttack):
             edge_index_lab = torch.stack([u_tensor, v_tensor], dim=0)
 
             y_label = torch.tensor(sel_y, device=device, dtype=torch.uint8)
+
             return y_out, edge_index_lab, y_label, tried_set, harmful_set
 
         # ---------------- acc/loss mode: keep your old drop-based selection ----------------
@@ -2868,6 +3556,7 @@ class PRBCD(SparseAttack):
         for k_lin, _drop in low_part:
             if k_lin not in k_to_uv:
                 continue
+
             u, v = k_to_uv[k_lin]
             sel_u.append(u)
             sel_v.append(v)
@@ -2876,6 +3565,7 @@ class PRBCD(SparseAttack):
         for k_lin, _drop in high_part:
             if k_lin not in k_to_uv:
                 continue
+
             u, v = k_to_uv[k_lin]
             sel_u.append(u)
             sel_v.append(v)
@@ -2891,6 +3581,7 @@ class PRBCD(SparseAttack):
         edge_index_lab = torch.stack([u_tensor, v_tensor], dim=0)
 
         y_label = torch.tensor(sel_y, device=device, dtype=torch.uint8)
+
         return y_out, edge_index_lab, y_label, tried_set, harmful_set
 
     def label_edge_flips_prbcd_subgraph_endpoint_one_sample(
@@ -3138,6 +3829,103 @@ class PRBCD(SparseAttack):
 
         y_label = torch.tensor(sel_y, device=device, dtype=torch.uint8)
         return y_out, edge_index_lab, y_label, edge_index_lab_local, tried_set, harmful_set
+
+    def _run_prbcd_for_endpoint_candidate_block(
+            self,
+            n_perturbations,
+            n_candidates: int = 2_000_000,
+            rng_seed: int = 0,
+            epochs: int = 5,
+            **kwargs,
+    ) -> torch.Tensor:
+        """
+        Placeholder for endpointPRBCD mode.
+
+        This function should run a PRBCD attack or PRBCD-style candidate selection
+        and return a 1D tensor of upper-triangular linear edge indices.
+
+        Expected return:
+            block_lin: torch.Tensor of shape (B,), dtype=torch.long
+                       containing candidate edge indices in PRBCD upper-tri format.
+
+        Important:
+            The returned indices must refer to the same linear indexing scheme used by
+            PRBCD.triu_idx_to_linear_idx(n, ...).
+        """
+
+        # TODO:
+        # 1. Run PRBCD attack / construct PRBCD search block.
+        # 2. Extract the resulting block, e.g. self.current_search_space.
+        # 3. Return it as a 1D long tensor on self.device.
+
+        self.sample_random_block(n_perturbations, n_candidates)
+        # Accuracy and attack statistics before the attack even started
+        with torch.no_grad():
+
+            logits = self._get_logits(self.attr, self.edge_index, self.edge_weight)
+            loss = self.calculate_loss(logits[self.idx_attack], self.labels[self.idx_attack])
+            accuracy = utils.accuracy(logits, self.labels, self.idx_attack)
+
+            logging.info(f'\nBefore the attack - Loss: {loss.item()} Accuracy: {100 * accuracy:.3f} %\n')
+
+            self._append_attack_statistics(loss.item(), accuracy, 0., 0.)
+
+            del logits, loss
+
+        # Loop over the epochs (Algorithm 1, line 5)
+        for epoch in tqdm(range(epochs)):
+            self.perturbed_edge_weight.requires_grad = True
+
+            # Retreive sparse perturbed adjacency matrix `A \oplus p_{t-1}` (Algorithm 1, line 6)
+            edge_index, edge_weight = self.get_modified_adj()
+
+            if torch.cuda.is_available() and self.do_synchronize:
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+
+            # Calculate logits for each node (Algorithm 1, line 6)
+            logits = self._get_logits(self.attr, edge_index, edge_weight)
+            # Calculate loss combining all each node (Algorithm 1, line 7)
+            loss = self.calculate_loss(logits[self.idx_attack], self.labels[
+                self.idx_attack])  # Todo: Hier wird der loss und gradient für perturbed edge weight erzeugt.
+            # Retreive gradient towards the current block (Algorithm 1, line 7)
+            gradient = utils.grad_with_checkpoint(loss, self.perturbed_edge_weight)[0]
+            self.gradient = gradient
+
+            if torch.cuda.is_available() and self.do_synchronize:
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+
+            with torch.no_grad():
+                # Gradient update step (Algorithm 1, line 7)
+                edge_weight = self.update_edge_weights(n_candidates, epoch, gradient)[1]
+                # For monitoring
+                probability_mass_update = self.perturbed_edge_weight.sum().item()
+                # Projection to stay within relaxed `L_0` budget (Algorithm 1, line 8)
+                self.perturbed_edge_weight = Attack.project(
+                    n_candidates, self.perturbed_edge_weight, self.eps)
+                # For monitoring
+                probability_mass_projected = self.perturbed_edge_weight.sum().item()
+
+                # Calculate accuracy after the current epoch (overhead for monitoring and early stopping)
+                edge_index, edge_weight = self.get_modified_adj()
+                logits = self.attacked_model(data=self.attr.to(self.device), adj=(edge_index, edge_weight))
+                accuracy = utils.accuracy(logits, self.labels, self.idx_attack)
+
+                del edge_index, edge_weight, logits
+
+                if epoch % self.display_step == 0:
+                    logging.info(f'\nEpoch: {epoch} Loss: {loss} Accuracy: {100 * accuracy:.3f} %\n')
+
+                # Resampling of search space (Algorithm 1, line 9-14)
+                self.resample_random_block(n_perturbations, n_candidates)
+
+        # Sample final discrete graph (Algorithm 1, line 16)
+        edge_index = self.sample_final_edges(50000)[0]
+
+        edge_index_flat = PRBCD.triu_idx_to_linear_idx(int(self.n),edge_index)
+
+        return edge_index_flat
 
     def label_edge_flips_prbcd_k_action(
             self,
@@ -3898,11 +4686,19 @@ class PRBCD(SparseAttack):
             y_dst_label: torch.Tensor | None = None,
             aux_loss_weight: float = 0.5,
             # ---- early stopping / best checkpoint ----
+            min_epochs_before_early_stop: int = 40,
             early_stop: bool = True,
-            early_stop_metric: str = "auc",  # "auc" | "ap" | "val_loss" | "val_acc"
-            early_stop_patience: int = 15,
+            early_stop_metric: str = "val_f1",
+            # allowed:
+            # "val_auc" | "val_ap" | "val_loss" | "val_acc" | "val_f1" | "val_recall"
+            early_stop_patience: int = 10,
             early_stop_min_delta: float = 1e-4,
             restore_best: bool = True,
+            # ---- split ratios ----
+            train_ratio: float = 0.7,
+            val_ratio: float = 0.15,
+            test_ratio: float = 0.15,
+            threshold: float = 0.5,
     ):
         x = x.to(device)
         edge_index_struct = edge_index_struct.to(device)
@@ -3915,6 +4711,7 @@ class PRBCD(SparseAttack):
             y_dst_label = y_dst_label.float().to(device)
 
         M = edge_index_lab.size(1)
+
         if M == 0:
             print("[LP-GNN] No labeled pairs. Returning untrained model.")
             model = LinkPredictionGNN(
@@ -3925,29 +4722,41 @@ class PRBCD(SparseAttack):
             return model
 
         assert M == y_label.numel(), "edge_index_lab and y_label must have the same number of examples"
+
         if y_src_label is not None:
             assert M == y_src_label.numel(), "edge_index_lab and y_src_label must have the same number of examples"
+
         if y_dst_label is not None:
             assert M == y_dst_label.numel(), "edge_index_lab and y_dst_label must have the same number of examples"
+
+        ratio_sum = train_ratio + val_ratio + test_ratio
+        assert abs(ratio_sum - 1.0) < 1e-6, "train_ratio + val_ratio + test_ratio must equal 1.0"
 
         use_aux = (y_src_label is not None) and (y_dst_label is not None)
 
         y_int = y_label.long()
+
         if verbose:
             msg = (
                 f"[LP-GNN] Labeled pairs: M={M} | "
                 f"pos={(y_int == 1).sum().item()} | neg={(y_int == 0).sum().item()}"
             )
+
             if use_aux:
                 msg += (
                     f" | src_pos={(y_src_label.long() == 1).sum().item()} "
                     f"| dst_pos={(y_dst_label.long() == 1).sum().item()} "
                     f"| aux_loss_weight={aux_loss_weight}"
                 )
+
             print(msg)
 
-        # ---- split ----
-        assert M % 2 == 0, "Expected equal number of negatives/positives (M must be even)."
+        # ======================================================
+        # Stratified train / validation / test split
+        # ======================================================
+
+        assert M % 2 == 0, "Expected equal number of negatives/positives. M must be even."
+
         half = M // 2
 
         neg_idx_all = torch.arange(0, half, device=device)
@@ -3956,25 +4765,63 @@ class PRBCD(SparseAttack):
         neg_perm = neg_idx_all[torch.randperm(half, device=device)]
         pos_perm = pos_idx_all[torch.randperm(half, device=device)]
 
-        train_size_per_class = int(0.8 * half)
+        train_size_per_class = int(train_ratio * half)
+        val_size_per_class = int(val_ratio * half)
 
-        train_idx = torch.cat([neg_perm[:train_size_per_class], pos_perm[:train_size_per_class]])
-        val_idx = torch.cat([neg_perm[train_size_per_class:], pos_perm[train_size_per_class:]])
+        # Everything left goes to test so that no samples are lost
+        test_size_per_class = half - train_size_per_class - val_size_per_class
+
+        if train_size_per_class <= 0 or val_size_per_class <= 0 or test_size_per_class <= 0:
+            raise ValueError(
+                "[LP-GNN] Split too small. Need at least one positive and one negative sample "
+                "in train, validation, and test."
+            )
+
+        neg_train = neg_perm[:train_size_per_class]
+        neg_val = neg_perm[train_size_per_class:train_size_per_class + val_size_per_class]
+        neg_test = neg_perm[train_size_per_class + val_size_per_class:]
+
+        pos_train = pos_perm[:train_size_per_class]
+        pos_val = pos_perm[train_size_per_class:train_size_per_class + val_size_per_class]
+        pos_test = pos_perm[train_size_per_class + val_size_per_class:]
+
+        train_idx = torch.cat([neg_train, pos_train])
+        val_idx = torch.cat([neg_val, pos_val])
+        test_idx = torch.cat([neg_test, pos_test])
 
         train_idx = train_idx[torch.randperm(train_idx.numel(), device=device)]
         val_idx = val_idx[torch.randperm(val_idx.numel(), device=device)]
+        test_idx = test_idx[torch.randperm(test_idx.numel(), device=device)]
 
-        # ---- model ----
+        if verbose:
+            print(
+                f"[LP-GNN] Split: "
+                f"train={train_idx.numel()} | "
+                f"val={val_idx.numel()} | "
+                f"test={test_idx.numel()}"
+            )
+
+        # ======================================================
+        # Model
+        # ======================================================
+
         model = LinkPredictionGNN(
             in_dim=x.size(1),
             hidden_dim=hidden_dim,
             out_dim=out_dim,
         ).to(device)
 
-        optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+        optimizer = torch.optim.Adam(
+            model.parameters(),
+            lr=lr,
+            weight_decay=weight_decay,
+        )
 
         pos_weight = (len(neg_idx_all) / len(pos_idx_all)) if len(pos_idx_all) > 0 else 1.0
-        loss_fn = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pos_weight, device=device))
+
+        loss_fn = nn.BCEWithLogitsLoss(
+            pos_weight=torch.tensor(pos_weight, device=device)
+        )
 
         if use_aux:
             src_pos = float((y_src_label == 1).sum().item())
@@ -3988,31 +4835,164 @@ class PRBCD(SparseAttack):
             loss_fn_src = nn.BCEWithLogitsLoss(
                 pos_weight=torch.tensor(src_pos_weight, device=device)
             )
+
             loss_fn_dst = nn.BCEWithLogitsLoss(
                 pos_weight=torch.tensor(dst_pos_weight, device=device)
             )
 
-        # ---- CSV logger ----
+        # ======================================================
+        # Evaluation helper
+        # ======================================================
+
+        def _safe_div(num: float, den: float) -> float:
+            return float(num / den) if den > 0 else 0.0
+
+        def _compute_metrics_from_logits(logits: torch.Tensor, labels_int: torch.Tensor):
+            logits = logits.view(-1)
+            labels_int = labels_int.long().view(-1)
+
+            probs = torch.sigmoid(logits)
+            preds = (probs >= threshold).long()
+
+            loss_val = loss_fn(logits, labels_int.float())
+
+            tp, fp, tn, fn = PRBCD._confusion_counts(preds, labels_int)
+
+            total = tp + fp + tn + fn
+
+            acc = _safe_div(tp + tn, total)
+            precision = _safe_div(tp, tp + fp)
+            recall = _safe_div(tp, tp + fn)
+            specificity = _safe_div(tn, tn + fp)
+
+            f1 = (
+                2.0 * precision * recall / (precision + recall)
+                if (precision + recall) > 0
+                else 0.0
+            )
+
+            auc, ap = PRBCD._safe_auc_ap_sklearn(probs, labels_int)
+
+            pmin = float(probs.min().item()) if probs.numel() > 0 else float("nan")
+            pmean = float(probs.mean().item()) if probs.numel() > 0 else float("nan")
+            pmax = float(probs.max().item()) if probs.numel() > 0 else float("nan")
+
+            return {
+                "loss": float(loss_val.item()),
+                "acc": float(acc),
+                "precision": float(precision),
+                "recall": float(recall),
+                "f1": float(f1),
+                "specificity": float(specificity),
+                "auc": auc,
+                "ap": ap,
+                "tp": int(tp),
+                "fp": int(fp),
+                "tn": int(tn),
+                "fn": int(fn),
+                "p_min": pmin,
+                "p_mean": pmean,
+                "p_max": pmax,
+            }
+
+        def _evaluate_split(split_idx: torch.Tensor):
+            model.eval()
+
+            with torch.no_grad():
+                if use_aux:
+                    out = model(
+                        x,
+                        edge_index_struct,
+                        edge_index_lab[:, split_idx],
+                        return_aux=True,
+                    )
+                    logits = out["edge_logits"].view(-1)
+                else:
+                    logits = model(
+                        x,
+                        edge_index_struct,
+                        edge_index_lab[:, split_idx],
+                    ).view(-1)
+
+                if torch.isnan(logits).any() or torch.isinf(logits).any():
+                    return None
+
+                labels = y_int[split_idx]
+
+                return _compute_metrics_from_logits(logits, labels)
+
+        # ======================================================
+        # CSV logger
+        # ======================================================
+
         csv_fields = [
             "epoch",
+
             "train_loss",
             "val_loss",
+            "test_loss",
+
+            "train_acc",
             "val_acc",
-            "acc_pos",
-            "acc_neg",
-            "auc",
-            "ap",
-            "tp",
-            "fp",
-            "tn",
-            "fn",
-            "p_min",
-            "p_mean",
-            "p_max",
+            "test_acc",
+
+            "train_precision",
+            "val_precision",
+            "test_precision",
+
+            "train_recall",
+            "val_recall",
+            "test_recall",
+
+            "train_f1",
+            "val_f1",
+            "test_f1",
+
+            "train_specificity",
+            "val_specificity",
+            "test_specificity",
+
+            "train_auc",
+            "val_auc",
+            "test_auc",
+
+            "train_ap",
+            "val_ap",
+            "test_ap",
+
+            "train_tp",
+            "train_fp",
+            "train_tn",
+            "train_fn",
+
+            "val_tp",
+            "val_fp",
+            "val_tn",
+            "val_fn",
+
+            "test_tp",
+            "test_fp",
+            "test_tn",
+            "test_fn",
+
+            "train_p_min",
+            "train_p_mean",
+            "train_p_max",
+
+            "val_p_min",
+            "val_p_mean",
+            "val_p_max",
+
+            "test_p_min",
+            "test_p_mean",
+            "test_p_max",
+
             "grad_norm",
             "best_metric",
             "is_best",
         ]
+
+        csv_path_was_auto = csv_path is None
 
         if csv_path is None:
             csv_path = PRBCD.make_selector_gnn_log_path(
@@ -4031,17 +5011,33 @@ class PRBCD(SparseAttack):
             append=csv_append,
         )
 
-        # ---- helpers for early stopping ----
+        # ======================================================
+        # Early stopping
+        # ======================================================
+
         metric_mode = {
-            "auc": "max",
-            "ap": "max",
+            "val_auc": "max",
+            "val_ap": "max",
             "val_acc": "max",
+            "val_f1": "max",
+            "val_recall": "max",
             "val_loss": "min",
         }
+
+        # Backward compatibility with your old names
+        if early_stop_metric == "auc":
+            early_stop_metric = "val_auc"
+        elif early_stop_metric == "ap":
+            early_stop_metric = "val_ap"
+
         if early_stop_metric not in metric_mode:
-            raise ValueError(f"early_stop_metric must be one of {list(metric_mode.keys())}")
+            raise ValueError(
+                f"early_stop_metric must be one of {list(metric_mode.keys())}, "
+                f"or old aliases 'auc' / 'ap'."
+            )
 
         want = metric_mode[early_stop_metric]
+
         best_metric = -float("inf") if want == "max" else float("inf")
         best_epoch = -1
         best_state = None
@@ -4054,10 +5050,17 @@ class PRBCD(SparseAttack):
 
         patience_left = int(early_stop_patience)
 
+        stopped_epoch = 0
+        stopped_metric_value = None
+        early_stopped = False
+
         epoch_iter = tqdm(range(num_epochs), desc="[LP-GNN] Training") if use_tqdm else range(num_epochs)
 
+        # ======================================================
+        # Training loop
+        # ======================================================
+
         for epoch in epoch_iter:
-            # ---- train ----
             model.train()
             optimizer.zero_grad()
 
@@ -4068,94 +5071,95 @@ class PRBCD(SparseAttack):
                     edge_index_lab[:, train_idx],
                     return_aux=True,
                 )
+
                 logits_train = out_train["edge_logits"].view(-1)
 
                 if torch.isnan(logits_train).any() or torch.isinf(logits_train).any():
                     print(f"[LP-GNN][ERROR] NaN/Inf in train edge logits at epoch {epoch + 1}")
                     break
 
-                loss_edge = loss_fn(logits_train, y_label[train_idx])
+                loss_edge = loss_fn(
+                    logits_train,
+                    y_label[train_idx],
+                )
+
                 loss_src = loss_fn_src(
                     out_train["src_flip_logits"].view(-1),
                     y_src_label[train_idx],
                 )
+
                 loss_dst = loss_fn_dst(
                     out_train["dst_flip_logits"].view(-1),
                     y_dst_label[train_idx],
                 )
+
                 loss = loss_edge + aux_loss_weight * (loss_src + loss_dst)
+
             else:
-                logits_train = model(x, edge_index_struct, edge_index_lab[:, train_idx]).view(-1)
+                logits_train = model(
+                    x,
+                    edge_index_struct,
+                    edge_index_lab[:, train_idx],
+                ).view(-1)
 
                 if torch.isnan(logits_train).any() or torch.isinf(logits_train).any():
                     print(f"[LP-GNN][ERROR] NaN/Inf in train logits at epoch {epoch + 1}")
                     break
 
-                # loss = loss_fn(logits_train, y_label[train_idx]) TODO: decide on loss function
+                label_smoothing = 0.1
 
-                label_smoothing = 0.1  # good starting point
+                y_train_soft = (
+                        y_label[train_idx] * (1.0 - label_smoothing)
+                        + 0.5 * label_smoothing
+                )
 
-                y_train_soft = y_label[train_idx] * (1.0 - label_smoothing) + 0.5 * label_smoothing
                 loss = loss_fn(logits_train, y_train_soft)
 
             loss.backward()
 
             grad_norm_val = None
+
             if log_grad_norm:
                 total_norm = 0.0
+
                 for p in model.parameters():
                     if p.grad is not None:
                         total_norm += p.grad.data.norm(2).item() ** 2
+
                 grad_norm_val = total_norm ** 0.5
 
             optimizer.step()
 
-            # ---- validation ----
-            model.eval()
-            with torch.no_grad():
-                if use_aux:
-                    out_val = model(
-                        x,
-                        edge_index_struct,
-                        edge_index_lab[:, val_idx],
-                        return_aux=True,
-                    )
-                    logits_val = out_val["edge_logits"].view(-1)
-                else:
-                    logits_val = model(x, edge_index_struct, edge_index_lab[:, val_idx]).view(-1)
+            # ==================================================
+            # Evaluate train / validation / test
+            # ==================================================
 
-                if torch.isnan(logits_val).any() or torch.isinf(logits_val).any():
-                    print(f"[LP-GNN][ERROR] NaN/Inf in val logits at epoch {epoch + 1}")
-                    break
+            train_metrics = _evaluate_split(train_idx)
+            val_metrics = _evaluate_split(val_idx)
+            test_metrics = _evaluate_split(test_idx)
 
-                val_loss = loss_fn(logits_val, y_label[val_idx])
+            if train_metrics is None:
+                print(f"[LP-GNN][ERROR] NaN/Inf during train evaluation at epoch {epoch + 1}")
+                break
 
-                probs_val = torch.sigmoid(logits_val)
-                preds_val = (probs_val >= 0.5).long()
-                yv = y_int[val_idx]
+            if val_metrics is None:
+                print(f"[LP-GNN][ERROR] NaN/Inf during validation evaluation at epoch {epoch + 1}")
+                break
 
-                acc_val = float((preds_val == yv).float().mean().item())
-                acc_pos = float((preds_val[yv == 1] == 1).float().mean().item()) if (yv == 1).any() else float("nan")
-                acc_neg = float((preds_val[yv == 0] == 0).float().mean().item()) if (yv == 0).any() else float("nan")
+            if test_metrics is None:
+                print(f"[LP-GNN][ERROR] NaN/Inf during test evaluation at epoch {epoch + 1}")
+                break
 
-                tp, fp, tn, fn = PRBCD._confusion_counts(preds_val, yv)
-                auc, ap = PRBCD._safe_auc_ap_sklearn(probs_val, yv)
+            # Keep your old behavior:
+            # train_loss logs the actual training loss, including label smoothing / aux loss.
+            train_metrics["loss"] = float(loss.item())
 
-                pmin = float(probs_val.min().item())
-                pmean = float(probs_val.mean().item())
-                pmax = float(probs_val.max().item())
-
-            metric_val = None
-            if early_stop_metric == "auc":
-                metric_val = auc
-            elif early_stop_metric == "ap":
-                metric_val = ap
-            elif early_stop_metric == "val_acc":
-                metric_val = acc_val
-            elif early_stop_metric == "val_loss":
-                metric_val = float(val_loss.item())
+            metric_val = val_metrics[early_stop_metric.replace("val_", "")]
+            stopped_epoch = epoch + 1
+            stopped_metric_value = float(metric_val) if metric_val is not None else None
 
             is_best = False
+
             if metric_val is not None:
                 if _is_improvement(float(metric_val), float(best_metric)):
                     best_metric = float(metric_val)
@@ -4166,79 +5170,216 @@ class PRBCD(SparseAttack):
                 else:
                     patience_left -= 1
 
-            # ---- CSV log ----
+            # ==================================================
+            # CSV log
+            # ==================================================
+
             logger.log({
                 "epoch": epoch + 1,
-                "train_loss": float(loss.item()),
-                "val_loss": float(val_loss.item()),
-                "val_acc": acc_val,
-                "acc_pos": acc_pos,
-                "acc_neg": acc_neg,
-                "auc": auc,
-                "ap": ap,
-                "tp": tp,
-                "fp": fp,
-                "tn": tn,
-                "fn": fn,
-                "p_min": pmin,
-                "p_mean": pmean,
-                "p_max": pmax,
+
+                "train_loss": train_metrics["loss"],
+                "val_loss": val_metrics["loss"],
+                "test_loss": test_metrics["loss"],
+
+                "train_acc": train_metrics["acc"],
+                "val_acc": val_metrics["acc"],
+                "test_acc": test_metrics["acc"],
+
+                "train_precision": train_metrics["precision"],
+                "val_precision": val_metrics["precision"],
+                "test_precision": test_metrics["precision"],
+
+                "train_recall": train_metrics["recall"],
+                "val_recall": val_metrics["recall"],
+                "test_recall": test_metrics["recall"],
+
+                "train_f1": train_metrics["f1"],
+                "val_f1": val_metrics["f1"],
+                "test_f1": test_metrics["f1"],
+
+                "train_specificity": train_metrics["specificity"],
+                "val_specificity": val_metrics["specificity"],
+                "test_specificity": test_metrics["specificity"],
+
+                "train_auc": train_metrics["auc"],
+                "val_auc": val_metrics["auc"],
+                "test_auc": test_metrics["auc"],
+
+                "train_ap": train_metrics["ap"],
+                "val_ap": val_metrics["ap"],
+                "test_ap": test_metrics["ap"],
+
+                "train_tp": train_metrics["tp"],
+                "train_fp": train_metrics["fp"],
+                "train_tn": train_metrics["tn"],
+                "train_fn": train_metrics["fn"],
+
+                "val_tp": val_metrics["tp"],
+                "val_fp": val_metrics["fp"],
+                "val_tn": val_metrics["tn"],
+                "val_fn": val_metrics["fn"],
+
+                "test_tp": test_metrics["tp"],
+                "test_fp": test_metrics["fp"],
+                "test_tn": test_metrics["tn"],
+                "test_fn": test_metrics["fn"],
+
+                "train_p_min": train_metrics["p_min"],
+                "train_p_mean": train_metrics["p_mean"],
+                "train_p_max": train_metrics["p_max"],
+
+                "val_p_min": val_metrics["p_min"],
+                "val_p_mean": val_metrics["p_mean"],
+                "val_p_max": val_metrics["p_max"],
+
+                "test_p_min": test_metrics["p_min"],
+                "test_p_mean": test_metrics["p_mean"],
+                "test_p_max": test_metrics["p_max"],
+
                 "grad_norm": grad_norm_val,
                 "best_metric": float(best_metric) if best_epoch != -1 else float("nan"),
                 "is_best": 1 if is_best else 0,
             })
 
-            # ---- tqdm ----
+            # ==================================================
+            # tqdm
+            # ==================================================
+
             if use_tqdm:
                 postfix = {
-                    "tr_loss": f"{loss.item():.4f}",
-                    "va_loss": f"{val_loss.item():.4f}",
-                    "va_acc": f"{acc_val:.3f}",
+                    "tr_loss": f"{train_metrics['loss']:.4f}",
+                    "va_loss": f"{val_metrics['loss']:.4f}",
+                    "te_loss": f"{test_metrics['loss']:.4f}",
+                    "va_acc": f"{val_metrics['acc']:.3f}",
+                    "va_f1": f"{val_metrics['f1']:.3f}",
+                    "va_rec": f"{val_metrics['recall']:.3f}",
+                    "pat": patience_left if metric_val is not None else "n/a",
                 }
-                if auc is not None:
-                    postfix["auc"] = f"{auc:.3f}"
-                if ap is not None:
-                    postfix["ap"] = f"{ap:.3f}"
-                postfix["pat"] = patience_left if metric_val is not None else "n/a"
+
+                if val_metrics["auc"] is not None:
+                    postfix["va_auc"] = f"{val_metrics['auc']:.3f}"
+
+                if val_metrics["ap"] is not None:
+                    postfix["va_ap"] = f"{val_metrics['ap']:.3f}"
+
                 epoch_iter.set_postfix(postfix)
 
-            # ---- print ----
-            if verbose and ((epoch + 1) % log_every == 0 or epoch == 0 or (epoch + 1) == num_epochs):
+            # ==================================================
+            # Print
+            # ==================================================
+
+            if verbose and (
+                    (epoch + 1) % log_every == 0
+                    or epoch == 0
+                    or (epoch + 1) == num_epochs
+            ):
                 msg = (
                     f"[LP-GNN] Epoch {epoch + 1:03d}/{num_epochs} | "
-                    f"train_loss={loss.item():.4f} | val_loss={val_loss.item():.4f} | "
-                    f"val_acc={acc_val:.4f} | acc_pos={acc_pos:.4f} | acc_neg={acc_neg:.4f} | "
-                    f"TP/FP/TN/FN={tp}/{fp}/{tn}/{fn} | "
-                    f"p(min/mean/max)={pmin:.3f}/{pmean:.3f}/{pmax:.3f}"
+                    f"train_loss={train_metrics['loss']:.4f} | "
+                    f"val_loss={val_metrics['loss']:.4f} | "
+                    f"test_loss={test_metrics['loss']:.4f} | "
+                    f"train_acc={train_metrics['acc']:.4f} | "
+                    f"val_acc={val_metrics['acc']:.4f} | "
+                    f"test_acc={test_metrics['acc']:.4f} | "
+                    f"val_precision={val_metrics['precision']:.4f} | "
+                    f"val_recall={val_metrics['recall']:.4f} | "
+                    f"val_f1={val_metrics['f1']:.4f} | "
+                    f"val_TP/FP/TN/FN="
+                    f"{val_metrics['tp']}/{val_metrics['fp']}/"
+                    f"{val_metrics['tn']}/{val_metrics['fn']} | "
+                    f"val_p(min/mean/max)="
+                    f"{val_metrics['p_min']:.3f}/"
+                    f"{val_metrics['p_mean']:.3f}/"
+                    f"{val_metrics['p_max']:.3f}"
                 )
-                if auc is not None:
-                    msg += f" | AUC={auc:.4f}"
-                if ap is not None:
-                    msg += f" | AP={ap:.4f}"
+
+                if val_metrics["auc"] is not None:
+                    msg += f" | val_AUC={val_metrics['auc']:.4f}"
+
+                if val_metrics["ap"] is not None:
+                    msg += f" | val_AP={val_metrics['ap']:.4f}"
+
                 if metric_val is not None:
-                    msg += f" | best_{early_stop_metric}={best_metric:.4f} (epoch {best_epoch})"
+                    msg += (
+                        f" | best_{early_stop_metric}="
+                        f"{best_metric:.4f} "
+                        f"(epoch {best_epoch})"
+                    )
+
                 if grad_norm_val is not None:
                     msg += f" | grad_norm={grad_norm_val:.3e}"
+
                 if use_aux:
                     msg += " | multitask_aux=on"
+
                 print(msg)
 
-            # ---- early stop ----
-            if early_stop and metric_val is not None and patience_left <= 0:
+            # ==================================================
+            # Early stopping
+            # ==================================================
+
+            if (
+                    early_stop
+                    and metric_val is not None
+                    and (epoch + 1) >= min_epochs_before_early_stop
+                    and patience_left <= 0
+            ):
+                early_stopped = True
                 if verbose:
                     print(
                         f"[LP-GNN] Early stopping at epoch {epoch + 1}. "
-                        f"Best {early_stop_metric}={best_metric:.4f} at epoch {best_epoch}."
+                        f"Best {early_stop_metric}={best_metric:.4f} "
+                        f"at epoch {best_epoch}."
                     )
                 break
 
         logger.close()
 
-        # ---- restore best ----
+        if csv_path_was_auto and not csv_append:
+            import os
+
+            def _filename_safe(value) -> str:
+                text = str(value)
+                return (
+                    text.replace("/", "-")
+                    .replace("\\", "-")
+                    .replace(" ", "")
+                    .replace(":", "-")
+                    .replace(".", "p")
+                )
+
+            metric_name_safe = _filename_safe(early_stop_metric)
+            metric_value_safe = (
+                _filename_safe(f"{stopped_metric_value:.6g}")
+                if stopped_metric_value is not None
+                else "nan"
+            )
+            stop_state = "earlystop" if early_stopped else "completed"
+            stop_suffix = (
+                f"_{stop_state}_esm-{metric_name_safe}"
+                f"_stop-e{int(stopped_epoch):03d}"
+                f"_stopval-{metric_value_safe}"
+            )
+
+            root, ext = os.path.splitext(csv_path)
+            csv_path_with_stop_info = f"{root}{stop_suffix}{ext}"
+
+            if csv_path_with_stop_info != csv_path:
+                os.replace(csv_path, csv_path_with_stop_info)
+                csv_path = csv_path_with_stop_info
+
+        # ======================================================
+        # Restore best validation model
+        # ======================================================
+
         if restore_best and best_state is not None:
             model.load_state_dict(best_state)
+
             if verbose:
-                print(f"[LP-GNN] Restored best model from epoch {best_epoch} ({early_stop_metric}={best_metric:.4f}).")
+                print(
+                    f"[LP-GNN] Restored best model from epoch {best_epoch} "
+                    f"({early_stop_metric}={best_metric:.4f})."
+                )
 
         if verbose:
             print(f"[LP-GNN] Training complete. Metrics saved to '{csv_path}'")
@@ -4767,3 +5908,405 @@ class PRBCD(SparseAttack):
             "exclude_tried",
             True,
         )
+
+        self.lp_hit_rate_detour = selector_params.get("lp_hit_rate_detour", False)
+        self.lp_hit_rate_top_k = selector_params.get("lp_hit_rate_top_k", 200)
+        self.lp_hit_rate_out_dir = selector_params.get(
+            "lp_hit_rate_out_dir",
+            "extendedPlotting/lpEndpointHitRate",
+        )
+
+        self.training_data_node_cap = selector_params.get("training_data_node_cap", 0)
+
+    @staticmethod
+    def print_linear_edge_set_node_dominance(
+            name: str,
+            edge_set,
+            n_nodes: int,
+            top_k: int = 10,
+            device=None,
+    ):
+        """
+        Prints node dominance statistics for an edge set containing entries like:
+            (linear_edge_index, drop)
+
+        The linear edge index is interpreted as an upper-triangle PRBCD edge index.
+        """
+        if edge_set is None or len(edge_set) == 0:
+            print(f"[{name} NODE STATS] empty set; no node dominance statistics available.")
+            return
+
+        if device is None:
+            device = torch.device("cpu")
+
+        lin_indices = torch.tensor(
+            [int(item[0]) for item in edge_set],
+            dtype=torch.long,
+            device=device,
+        )
+
+        # Convert linear upper-triangle indices back to endpoint pairs.
+        edge_index = PRBCD.linear_to_triu_idx(int(n_nodes), lin_indices)
+
+        endpoints = edge_index.reshape(-1).detach().cpu()
+
+        node_counts = torch.bincount(endpoints, minlength=int(n_nodes))
+        active_counts = node_counts[node_counts > 0]
+
+        n_edges = len(edge_set)
+        n_endpoint_occurrences = int(endpoints.numel())
+        n_active_nodes = int(active_counts.numel())
+
+        top_k = min(top_k, n_active_nodes)
+        top_counts, top_nodes = torch.topk(node_counts, k=top_k)
+
+        top1_share = float(top_counts[:1].sum().item() / n_endpoint_occurrences)
+        top5_share = float(top_counts[:min(5, top_k)].sum().item() / n_endpoint_occurrences)
+        top10_share = float(top_counts[:min(10, top_k)].sum().item() / n_endpoint_occurrences)
+
+        # Effective number of nodes:
+        # lower = stronger domination by few nodes
+        probs = active_counts.float() / active_counts.sum().float()
+        effective_nodes = float(1.0 / torch.sum(probs ** 2).item())
+
+        # Gini coefficient:
+        # 0 = even distribution, close to 1 = concentrated on few nodes
+        sorted_counts = torch.sort(active_counts.float()).values
+        m = sorted_counts.numel()
+
+        if m > 1:
+            idx = torch.arange(1, m + 1, dtype=torch.float32)
+            gini = float(
+                (2.0 * torch.sum(idx * sorted_counts) / (m * torch.sum(sorted_counts)))
+                - (m + 1.0) / m
+            )
+        else:
+            gini = 0.0
+
+        print(
+            f"[{name} NODE STATS] edges={n_edges} | "
+            f"endpoint_occurrences={n_endpoint_occurrences} | "
+            f"active_nodes={n_active_nodes}/{int(n_nodes)} | "
+            f"effective_nodes={effective_nodes:.2f} | "
+            f"gini={gini:.4f} | "
+            f"top1_endpoint_share={100.0 * top1_share:.2f}% | "
+            f"top5_endpoint_share={100.0 * top5_share:.2f}% | "
+            f"top10_endpoint_share={100.0 * top10_share:.2f}%"
+        )
+
+        print(
+            f"[{name} NODE TOP{top_k}] "
+            + ", ".join(
+                f"node={int(node)}:count={int(count)}"
+                for node, count in zip(top_nodes.tolist(), top_counts.tolist())
+                if count > 0
+            )
+        )
+
+    @staticmethod
+    def print_linear_tensor_node_dominance(
+            name: str,
+            lin_indices: torch.Tensor,
+            n_nodes: int,
+            top_k: int = 10,
+            device=None,
+    ):
+        """
+        Prints node dominance statistics for a tensor of PRBCD upper-tri
+        linear edge indices, e.g. self.current_search_space.
+        """
+        if lin_indices is None or lin_indices.numel() == 0:
+            print(f"[{name} NODE STATS] empty tensor; no node dominance statistics available.")
+            return
+
+        if device is None:
+            device = torch.device("cpu")
+
+        lin_indices = lin_indices.detach().to(device=device, dtype=torch.long)
+
+        # Convert PRBCD upper-triangle linear indices back to endpoint pairs.
+        edge_index = PRBCD.linear_to_triu_idx(int(n_nodes), lin_indices)
+
+        endpoints = edge_index.reshape(-1).detach().cpu()
+        node_counts = torch.bincount(endpoints, minlength=int(n_nodes))
+        active_counts = node_counts[node_counts > 0]
+
+        n_edges = int(lin_indices.numel())
+        n_endpoint_occurrences = int(endpoints.numel())
+        n_active_nodes = int(active_counts.numel())
+
+        if n_active_nodes == 0:
+            print(f"[{name} NODE STATS] no active nodes.")
+            return
+
+        top_k = min(int(top_k), n_active_nodes)
+        top_counts, top_nodes = torch.topk(node_counts, k=top_k)
+
+        top1_share = float(top_counts[:1].sum().item() / n_endpoint_occurrences)
+        top5_share = float(top_counts[:min(5, top_k)].sum().item() / n_endpoint_occurrences)
+        top10_share = float(top_counts[:min(10, top_k)].sum().item() / n_endpoint_occurrences)
+
+        probs = active_counts.float() / active_counts.sum().float()
+        effective_nodes = float(1.0 / torch.sum(probs ** 2).item())
+
+        sorted_counts = torch.sort(active_counts.float()).values
+        m = sorted_counts.numel()
+
+        if m > 1:
+            idx = torch.arange(1, m + 1, dtype=torch.float32)
+            gini = float(
+                (2.0 * torch.sum(idx * sorted_counts) / (m * torch.sum(sorted_counts)))
+                - (m + 1.0) / m
+            )
+        else:
+            gini = 0.0
+
+        print(
+            f"[{name} NODE STATS] edges={n_edges} | "
+            f"endpoint_occurrences={n_endpoint_occurrences} | "
+            f"active_nodes={n_active_nodes}/{int(n_nodes)} | "
+            f"effective_nodes={effective_nodes:.2f} | "
+            f"gini={gini:.4f} | "
+            f"top1_endpoint_share={100.0 * top1_share:.2f}% | "
+            f"top5_endpoint_share={100.0 * top5_share:.2f}% | "
+            f"top10_endpoint_share={100.0 * top10_share:.2f}%"
+        )
+
+        print(f"[{name} TOP NODES]")
+        for node, count in zip(top_nodes.tolist(), top_counts.tolist()):
+            share = 100.0 * float(count) / float(n_endpoint_occurrences)
+            print(f"  node={node} | endpoint_count={count} | endpoint_share={share:.2f}%")
+
+    @staticmethod
+    def _append_dict_to_csv(csv_path: str, row: dict):
+        import csv
+        import os
+
+        if csv_path is None:
+            return
+
+        directory = os.path.dirname(csv_path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+
+        file_exists = os.path.exists(csv_path)
+
+        with open(csv_path, mode="a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow(row)
+
+    @staticmethod
+    def _linear_edge_set_node_dominance_stats(
+            name: str,
+            edge_set,
+            n_nodes: int,
+            top_k: int = 10,
+            device=None,
+            extra: dict | None = None,
+    ) -> dict:
+        import torch
+
+        if extra is None:
+            extra = {}
+
+        if device is None:
+            device = torch.device("cpu")
+
+        base = {
+            **extra,
+            "name": str(name),
+            "edges": 0,
+            "endpoint_occurrences": 0,
+            "active_nodes": 0,
+            "n_nodes": int(n_nodes),
+            "effective_nodes": 0.0,
+            "gini": 0.0,
+            "top1_endpoint_share": 0.0,
+            "top5_endpoint_share": 0.0,
+            "top10_endpoint_share": 0.0,
+            "top_nodes": "",
+            "top_counts": "",
+        }
+
+        if edge_set is None or len(edge_set) == 0:
+            return base
+
+        lin_indices = torch.tensor(
+            [int(item[0]) for item in edge_set],
+            dtype=torch.long,
+            device=device,
+        )
+
+        edge_index = PRBCD.linear_to_triu_idx(int(n_nodes), lin_indices)
+        endpoints = edge_index.reshape(-1).detach().cpu()
+
+        node_counts = torch.bincount(endpoints, minlength=int(n_nodes))
+        active_counts = node_counts[node_counts > 0]
+
+        n_edges = int(len(edge_set))
+        n_endpoint_occurrences = int(endpoints.numel())
+        n_active_nodes = int(active_counts.numel())
+
+        top_k = min(int(top_k), n_active_nodes)
+        if top_k > 0:
+            top_counts, top_nodes = torch.topk(node_counts, k=top_k)
+        else:
+            top_counts = torch.empty(0, dtype=torch.long)
+            top_nodes = torch.empty(0, dtype=torch.long)
+
+        top1_share = float(top_counts[:1].sum().item() / n_endpoint_occurrences) if n_endpoint_occurrences else 0.0
+        top5_share = float(top_counts[:min(5, top_k)].sum().item() / n_endpoint_occurrences) if n_endpoint_occurrences else 0.0
+        top10_share = float(top_counts[:min(10, top_k)].sum().item() / n_endpoint_occurrences) if n_endpoint_occurrences else 0.0
+
+        probs = active_counts.float() / active_counts.sum().float()
+        effective_nodes = float(1.0 / torch.sum(probs ** 2).item()) if active_counts.numel() > 0 else 0.0
+
+        sorted_counts = torch.sort(active_counts.float()).values
+        m = sorted_counts.numel()
+
+        if m > 1:
+            idx = torch.arange(1, m + 1, dtype=torch.float32)
+            gini = float(
+                (2.0 * torch.sum(idx * sorted_counts) / (m * torch.sum(sorted_counts)))
+                - (m + 1.0) / m
+            )
+        else:
+            gini = 0.0
+
+        top_items = [
+            (int(node), int(count))
+            for node, count in zip(top_nodes.tolist(), top_counts.tolist())
+            if int(count) > 0
+        ]
+
+        return {
+            **base,
+            "edges": n_edges,
+            "endpoint_occurrences": n_endpoint_occurrences,
+            "active_nodes": n_active_nodes,
+            "effective_nodes": float(effective_nodes),
+            "gini": float(gini),
+            "top1_endpoint_share": float(top1_share),
+            "top5_endpoint_share": float(top5_share),
+            "top10_endpoint_share": float(top10_share),
+            "top_nodes": ";".join(str(node) for node, _count in top_items),
+            "top_counts": ";".join(str(count) for _node, count in top_items),
+        }
+
+    @staticmethod
+    def _print_node_dominance_stats(stats: dict, top_k: int = 10):
+        name = stats["name"]
+
+        if int(stats["edges"]) == 0:
+            print(f"[{name} NODE STATS] empty set; no node dominance statistics available.")
+            return
+
+        print(
+            f"[{name} NODE STATS] edges={int(stats['edges'])} | "
+            f"endpoint_occurrences={int(stats['endpoint_occurrences'])} | "
+            f"active_nodes={int(stats['active_nodes'])}/{int(stats['n_nodes'])} | "
+            f"effective_nodes={float(stats['effective_nodes']):.2f} | "
+            f"gini={float(stats['gini']):.4f} | "
+            f"top1_endpoint_share={100.0 * float(stats['top1_endpoint_share']):.2f}% | "
+            f"top5_endpoint_share={100.0 * float(stats['top5_endpoint_share']):.2f}% | "
+            f"top10_endpoint_share={100.0 * float(stats['top10_endpoint_share']):.2f}%"
+        )
+
+        top_nodes = [x for x in str(stats.get("top_nodes", "")).split(";") if x != ""]
+        top_counts = [x for x in str(stats.get("top_counts", "")).split(";") if x != ""]
+        top_items = list(zip(top_nodes, top_counts))[:int(top_k)]
+
+        print(
+            f"[{name} NODE TOP{len(top_items)}] "
+            + ", ".join(
+                f"node={int(node)}:count={int(count)}"
+                for node, count in top_items
+            )
+        )
+
+    @staticmethod
+    def record_selection_statistics(
+            tried_set,
+            harmful_set,
+            n_nodes: int,
+            device=None,
+            stats_dir: str = "cache",
+            csv_prefix: str = "selection",
+            top_k: int = 10,
+            extra: dict | None = None,
+    ) -> dict:
+        """
+        Prints and records all selection statistics in CSV files.
+
+        This replaces the inline block that printed:
+          - TRIED node dominance
+          - HARMFUL node dominance
+          - tried/harmful ratio
+
+        It writes two CSVs:
+          - {stats_dir}/{csv_prefix}_node_dominance.csv
+          - {stats_dir}/{csv_prefix}_selection_stats.csv
+        """
+        import os
+
+        if extra is None:
+            extra = {}
+
+        os.makedirs(stats_dir, exist_ok=True)
+
+        node_stats_csv_path = os.path.join(stats_dir, f"{csv_prefix}_node_dominance.csv")
+        selection_stats_csv_path = os.path.join(stats_dir, f"{csv_prefix}_selection_stats.csv")
+
+        n_tried = int(len(tried_set) if tried_set is not None else 0)
+        n_harmful = int(len(harmful_set) if harmful_set is not None else 0)
+        harmful_ratio = float(n_harmful / n_tried) if n_tried > 0 else 0.0
+
+        tried_node_stats = PRBCD._linear_edge_set_node_dominance_stats(
+            name="TRIED",
+            edge_set=tried_set,
+            n_nodes=int(n_nodes),
+            top_k=int(top_k),
+            device=device,
+            extra=extra,
+        )
+        harmful_node_stats = PRBCD._linear_edge_set_node_dominance_stats(
+            name="HARMFUL",
+            edge_set=harmful_set,
+            n_nodes=int(n_nodes),
+            top_k=int(top_k),
+            device=device,
+            extra=extra,
+        )
+
+        PRBCD._print_node_dominance_stats(tried_node_stats, top_k=top_k)
+        PRBCD._print_node_dominance_stats(harmful_node_stats, top_k=top_k)
+
+        PRBCD._append_dict_to_csv(node_stats_csv_path, tried_node_stats)
+        PRBCD._append_dict_to_csv(node_stats_csv_path, harmful_node_stats)
+
+        selection_stats = {
+            **extra,
+            "tried_edges": n_tried,
+            "harmful_edges": n_harmful,
+            "harmful_ratio": harmful_ratio,
+            "harmful_ratio_percent": 100.0 * harmful_ratio,
+        }
+
+        PRBCD._append_dict_to_csv(selection_stats_csv_path, selection_stats)
+
+        print(
+            f"[SELECTION STATS] tried_edges={n_tried} | "
+            f"harmful_edges={n_harmful} | "
+            f"harmful/tried={harmful_ratio:.4f} "
+            f"({100.0 * harmful_ratio:.2f}%)"
+        )
+
+        return {
+            "tried_node_stats": tried_node_stats,
+            "harmful_node_stats": harmful_node_stats,
+            "selection_stats": selection_stats,
+            "node_stats_csv_path": node_stats_csv_path,
+            "selection_stats_csv_path": selection_stats_csv_path,
+        }

@@ -73,7 +73,7 @@ class GreedyRBCD(PRBCD):
 
         for step_size in tqdm(steps):
             # Sample initial search space (Algorithm 2, line 3-4)
-            self.sample_random_block(step_size)
+            self.sample_random_block(step_size, self.block_size)
             # Retreive sparse perturbed adjacency matrix `A \oplus p_{t-1}` (Algorithm 2, line 7)
             edge_index, edge_weight = self.get_modified_adj()
 
