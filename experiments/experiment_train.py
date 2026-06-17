@@ -1,6 +1,6 @@
 
 import logging
-from typing import Any, Dict, Union
+from typing import Any, Dict, Union, Optional, Tuple
 
 import numpy as np
 from sacred import Experiment
@@ -69,11 +69,51 @@ def config():
     display_steps = 100
     debug_level = "info"
 
+def random_ratio_split(
+    labels,
+    train_ratio: float,
+    val_ratio: float,
+    test_ratio: float,
+    seed: int,
+):
+    labels_np = labels.detach().cpu().numpy() if torch.is_tensor(labels) else np.asarray(labels)
+
+    if np.issubdtype(labels_np.dtype, np.floating):
+        valid_idx = np.where(~np.isnan(labels_np))[0]
+    else:
+        valid_idx = np.arange(labels_np.shape[0])
+
+    ratio_sum = train_ratio + val_ratio + test_ratio
+
+    if ratio_sum <= 0:
+        raise ValueError(f"At least one split ratio must be > 0, got {ratio_sum:.4f}")
+
+    if ratio_sum > 1.0:
+        raise ValueError(f"Split ratios must sum to <= 1.0, got {ratio_sum:.4f}")
+
+    rng = np.random.default_rng(seed)
+    perm = rng.permutation(valid_idx)
+
+    n_total = len(perm)
+
+    n_train = int(round(train_ratio * n_total))
+    n_val = int(round(val_ratio * n_total))
+    n_test = int(round(test_ratio * n_total))
+
+    idx_train = perm[:n_train]
+    idx_val = perm[n_train:n_train + n_val]
+    idx_test = perm[n_train + n_val:n_train + n_val + n_test]
+
+    idx_unused = perm[n_train + n_val + n_test:]
+
+    return idx_train, idx_val, idx_test, idx_unused
+
 
 @ex.automain
 def run(data_dir: str, dataset: str, model_params: Dict[str, Any], train_params: Dict[str, Any], binary_attr: bool,
         make_undirected: bool, seed: int, artifact_dir: str, model_storage_type: str, ppr_cache_params: Dict[str, str],
-        device: Union[str, int], data_device: Union[str, int], display_steps: int, debug_level: str):
+        device: Union[str, int], data_device: Union[str, int], display_steps: int, debug_level: str,
+        custom_split_ratios: Optional[Tuple[float, float, float]] = None):
     """
     Instantiates a sacred experiment executing a training run for a given model configuration.
     Saves the model to storage and evaluates its accuracy. 
@@ -150,8 +190,23 @@ def run(data_dir: str, dataset: str, model_params: Dict[str, Any], train_params:
                        binary_attr=binary_attr, return_original_split=dataset.startswith('ogbn'))
 
     attr, adj, labels = graph[:3]
-    if len(graph) == 3 or graph[3] is None:  # TODO: This is weird
+
+    if custom_split_ratios is not None:
+        logging.info(f"Using custom random split ratios: {custom_split_ratios}")
+
+        idx_train, idx_val, idx_test, idx_unused = random_ratio_split(
+            labels=labels,
+            train_ratio=custom_split_ratios[0],
+            val_ratio=custom_split_ratios[1],
+            test_ratio=custom_split_ratios[2],
+            seed=seed,
+        )
+
+        logging.info(f"Unused node count: {len(idx_unused)}")
+
+    elif len(graph) == 3 or graph[3] is None:  # TODO: This is weird
         idx_train, idx_val, idx_test = split(labels.cpu().numpy())
+
     else:
         idx_train, idx_val, idx_test = graph[3]['train'], graph[3]['valid'], graph[3]['test']
 
@@ -225,5 +280,10 @@ def run(data_dir: str, dataset: str, model_params: Dict[str, Any], train_params:
         'accuracy': test_accuracy,
         'trace_val': trace_val,
         'trace_train': trace_train,
-        'model_path': model_path
+        'model_path': model_path,
+        'model': model,
+        'graph': graph,
+        'idx_train': idx_train,
+        'idx_val': idx_val,
+        'idx_test': idx_test,
     }

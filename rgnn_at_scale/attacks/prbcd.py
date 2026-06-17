@@ -176,6 +176,9 @@ class PRBCD(SparseAttack):
                 }
                 PRBCD.save_selection(cache_path, y_out, edge_index_lab, y_label, tried_set, harmful_set, meta=meta)
 
+                #Todo: flip harmful edges for testing harmful edge set
+                #Todo: Take all the impactful edges make an attack by adding them. True values from harmful set + prediction!
+
             # ---- selection statistics: tried vs harmful ----
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -209,12 +212,30 @@ class PRBCD(SparseAttack):
             X, edge_index_struct = self.extract_X_and_edge_index_from_sparsegraph(graph)
             stats = PRBCD.tried_add_del_proportion(tried_set, edge_index_struct, n=int(self.n))
             print(stats)
+            print(edge_index_struct)
+            print(edge_index_lab)
+            print(y_label)
+
+            edge_index_lab_small, y_label_small = (
+                PRBCD.reduce_balanced_edge_training_set(
+                    edge_index_lab=edge_index_lab,
+                    y_label=y_label,
+                    total_size=2184,
+                )
+            )
+
+            print(
+                f"Reduced set: M={y_label_small.numel()} | "
+                f"pos={(y_label_small == 1).sum().item()} | "
+                f"neg={(y_label_small == 0).sum().item()} | "
+                f"edge_index shape={tuple(edge_index_lab_small.shape)}"
+            )
 
             self.lp_model = self.train_link_prediction_gnn(
                 x=X,
                 edge_index_struct=edge_index_struct,
-                edge_index_lab=edge_index_lab,
-                y_label=y_label,
+                edge_index_lab=edge_index_lab_small,
+                y_label=y_label_small,
                 device=self.device,
                 num_epochs=200,
                 use_tqdm=True,
@@ -328,11 +349,27 @@ class PRBCD(SparseAttack):
         else:
             print(use_cert, "run sampling with no certificate")
             self.sample_random_block(n_perturbations, self.block_size)
+
+            torch.save(
+                {
+                    "current_search_space": self.current_search_space.detach().cpu(),
+                    "modified_edge_index": self.modified_edge_index.detach().cpu(),
+                    "perturbed_edge_weight": self.perturbed_edge_weight.detach().cpu(),
+
+                    "n": int(self.n),
+                    "block_size": int(self.block_size),
+                    "make_undirected": bool(self.make_undirected),
+                    "n_possible_edges": int(self.n_possible_edges),
+                    "eps": float(self.eps),
+                },
+                "fixed_prbcd_block.pt"
+            )
         # Accuracy and attack statistics before the attack even started
         with torch.no_grad():
 
             logits = self._get_logits(self.attr, self.edge_index, self.edge_weight)
             loss = self.calculate_loss(logits[self.idx_attack], self.labels[self.idx_attack])
+            print(self.attacked_model)
             accuracy = utils.accuracy(logits, self.labels, self.idx_attack)
 
             logging.info(f'\nBefore the attack - Loss: {loss.item()} Accuracy: {100 * accuracy:.3f} %\n')
@@ -400,9 +437,9 @@ class PRBCD(SparseAttack):
                     if use_cert in ("accuracy_drop_selector", "accuracy_drop_selector_subgraph", "accuracy_drop_selector_with_resampling"):
                         print(use_cert, "run resampling with no certificate")
                         if use_cert in ("accuracy_drop_selector_with_resampling", ):
-                            if epoch % 2 == 0:
+                            if epoch % 1 == 0:
                                 self.resample_block_from_linkpred_threshold(graph=graph,
-                                                                            n_perturbations=n_perturbations, score_batch_size=int(self.block_size/10), tau=0.7-epoch*0.04)
+                                                                            n_perturbations=n_perturbations, score_batch_size=int(self.block_size/10), tau=max(self.tau-epoch*0.04,0.0))
                         else:
                             self.resample_random_block(n_perturbations=n_perturbations, mod_block_size=self.block_size)
                         pass
@@ -750,7 +787,7 @@ class PRBCD(SparseAttack):
             graph,
             n_perturbations: int = 0,
             tau: float = 0.8,
-            max_sampling_tries: int = 2_000_000,
+            max_sampling_tries: int = 4_000_000,
             score_batch_size: int = 1000,
             rng_seed: int = 0,
             exclude_tried: bool = False,
@@ -2310,7 +2347,7 @@ class PRBCD(SparseAttack):
             graph,
             n_perturbations: int,
             tau: float = 0.7,
-            max_sampling_tries: int = 2_000_000,
+            max_sampling_tries: int = 4_000_000,
             score_batch_size: int = 10000,
             rng_seed: int = 0,
             exclude_tried: bool = True,
@@ -6310,3 +6347,91 @@ class PRBCD(SparseAttack):
             "node_stats_csv_path": node_stats_csv_path,
             "selection_stats_csv_path": selection_stats_csv_path,
         }
+
+    @staticmethod
+    def reduce_balanced_edge_training_set(
+            edge_index_lab: torch.Tensor,
+            y_label: torch.Tensor,
+            total_size: int = 2184,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Reduce an ordered balanced edge dataset.
+
+        Assumes:
+        - edge_index_lab has shape (2, M)
+        - y_label has shape (M,)
+        - all positive labels come first
+        - all negative labels come second
+        - the two classes currently have equal size
+
+        Returns:
+        - reduced_edge_index_lab with shape (2, total_size)
+        - reduced_y_label with shape (total_size,)
+        """
+        if edge_index_lab.ndim != 2 or edge_index_lab.size(0) != 2:
+            raise ValueError(
+                "edge_index_lab must have shape (2, M), "
+                f"got {tuple(edge_index_lab.shape)}."
+            )
+
+        y_label = y_label.view(-1)
+        num_examples = y_label.numel()
+
+        if edge_index_lab.size(1) != num_examples:
+            raise ValueError(
+                "edge_index_lab and y_label must contain the "
+                "same number of examples."
+            )
+
+        if num_examples % 2 != 0:
+            raise ValueError(
+                "Expected an even number of examples because "
+                "the dataset is assumed to contain two equal halves."
+            )
+
+        if total_size % 2 != 0:
+            raise ValueError(
+                "total_size must be even so both classes remain balanced."
+            )
+
+        half = num_examples // 2
+        n_per_class = total_size // 2
+
+        if n_per_class > half:
+            raise ValueError(
+                f"Requested {n_per_class} examples per class, "
+                f"but only {half} are available."
+            )
+
+        # Verify the assumed ordering.
+        first_half = y_label[:half]
+        second_half = y_label[half:]
+
+        if not torch.all(first_half == 1):
+            raise ValueError(
+                "The first half of y_label does not contain only 1 labels."
+            )
+
+        if not torch.all(second_half == 0):
+            raise ValueError(
+                "The second half of y_label does not contain only 0 labels."
+            )
+
+        pos_idx = torch.arange(
+            0,
+            n_per_class,
+            device=y_label.device,
+        )
+
+        neg_idx = torch.arange(
+            half,
+            half + n_per_class,
+            device=y_label.device,
+        )
+
+        keep_idx = torch.cat([pos_idx, neg_idx])
+
+        reduced_edge_index_lab = edge_index_lab[:, keep_idx]
+        reduced_y_label = y_label[keep_idx]
+
+        return reduced_edge_index_lab, reduced_y_label
