@@ -1440,8 +1440,12 @@ def train_link_prediction_gnn(
     early_stop: bool = True,
     early_stop_metric: str = "val_ap",
     # allowed:
-    # "val_auc" | "val_ap" | "val_loss" |
-    # "val_acc" | "val_f1" | "val_recall"
+    # classification/thresholded metrics:
+    # "val_auc" | "val_ap" | "val_acc" |
+    # "val_f1" | "val_recall"
+    # continuous-target metrics:
+    # "val_loss" | "val_mae" | "val_mse" |
+    # "val_rmse" | "val_r2" | "val_pearson"
     early_stop_patience: int = 15,
     early_stop_min_delta: float = 1e-4,
     restore_best: bool = True,
@@ -1451,6 +1455,27 @@ def train_link_prediction_gnn(
     test_ratio: float = 0.15,
     threshold: float = 0.5,
 ):
+    """Train a binary link-prediction GNN with hard or soft targets.
+
+    ``y_label`` may contain either hard binary labels {0, 1} or soft labels
+    anywhere in [0, 1]. In both cases the edge head must return one logit per
+    labeled edge and training uses ``BCEWithLogitsLoss``.
+
+    For soft labels, MAE/MSE/RMSE/R2/Pearson are computed directly against the
+    sigmoid probabilities. Binary metrics are still available, but they use
+    ``threshold`` to convert both targets and probabilities to hard classes.
+
+    The auxiliary source/destination labels, when supplied, may also be hard or
+    soft values in [0, 1].
+    """
+    import copy
+    import math
+
+    import torch
+    import torch.nn as nn
+    from sklearn.metrics import average_precision_score, roc_auc_score
+    from tqdm import tqdm
+
     # ======================================================
     # Validate configuration
     # ======================================================
@@ -1486,10 +1511,23 @@ def train_link_prediction_gnn(
         )
 
     # Backward-compatible aliases.
-    if early_stop_metric == "auc":
-        early_stop_metric = "val_auc"
-    elif early_stop_metric == "ap":
-        early_stop_metric = "val_ap"
+    metric_aliases = {
+        "auc": "val_auc",
+        "ap": "val_ap",
+        "acc": "val_acc",
+        "f1": "val_f1",
+        "recall": "val_recall",
+        "loss": "val_loss",
+        "mae": "val_mae",
+        "mse": "val_mse",
+        "rmse": "val_rmse",
+        "r2": "val_r2",
+        "pearson": "val_pearson",
+    }
+    early_stop_metric = metric_aliases.get(
+        early_stop_metric,
+        early_stop_metric,
+    )
 
     metric_mode = {
         "val_auc": "max",
@@ -1498,12 +1536,18 @@ def train_link_prediction_gnn(
         "val_f1": "max",
         "val_recall": "max",
         "val_loss": "min",
+        "val_mae": "min",
+        "val_mse": "min",
+        "val_rmse": "min",
+        "val_r2": "max",
+        "val_pearson": "max",
     }
 
     if early_stop_metric not in metric_mode:
         raise ValueError(
             f"early_stop_metric must be one of "
-            f"{list(metric_mode.keys())}, or aliases 'auc'/'ap'."
+            f"{list(metric_mode.keys())}, or one of the aliases "
+            f"{list(metric_aliases.keys())}."
         )
 
     ratio_sum = train_ratio + val_ratio + test_ratio
@@ -1518,8 +1562,11 @@ def train_link_prediction_gnn(
             "train_ratio, val_ratio and test_ratio must all be positive."
         )
 
+    if log_every < 1:
+        raise ValueError("log_every must be at least 1.")
+
     # ======================================================
-    # Move tensors to device
+    # Move tensors to device and validate targets
     # ======================================================
 
     x = x.to(device)
@@ -1545,14 +1592,70 @@ def train_link_prediction_gnn(
 
     M = edge_index_lab.size(1)
 
+    def _validate_unit_interval(
+        values: torch.Tensor,
+        name: str,
+    ) -> torch.Tensor:
+        if not bool(torch.isfinite(values).all().item()):
+            raise ValueError(f"{name} contains NaN or infinite values.")
+
+        tolerance = 1e-7
+        min_value = float(values.min().item()) if values.numel() else 0.0
+        max_value = float(values.max().item()) if values.numel() else 1.0
+
+        if min_value < -tolerance or max_value > 1.0 + tolerance:
+            raise ValueError(
+                f"{name} must contain values in [0, 1]. "
+                f"Found range [{min_value}, {max_value}]."
+            )
+
+        # Remove harmless floating-point spillover such as 1.00000001.
+        return values.clamp(0.0, 1.0)
+
+    y_label = _validate_unit_interval(y_label, "y_label")
+
+    if y_src_label is not None:
+        y_src_label = _validate_unit_interval(
+            y_src_label,
+            "y_src_label",
+        )
+
+    if y_dst_label is not None:
+        y_dst_label = _validate_unit_interval(
+            y_dst_label,
+            "y_dst_label",
+        )
+
+    def _contains_only_hard_labels(values: torch.Tensor) -> bool:
+        if values.numel() == 0:
+            return True
+
+        is_zero = torch.isclose(
+            values,
+            torch.zeros_like(values),
+            atol=1e-7,
+            rtol=0.0,
+        )
+        is_one = torch.isclose(
+            values,
+            torch.ones_like(values),
+            atol=1e-7,
+            rtol=0.0,
+        )
+        return bool((is_zero | is_one).all().item())
+
+    hard_label_mode = _contains_only_hard_labels(y_label)
+    label_mode = "hard_binary" if hard_label_mode else "soft_binary"
+
     # ======================================================
     # Empty input
     # ======================================================
 
     if M == 0:
-        print(
-            "[LP-GNN] No labeled pairs. Returning untrained model."
-        )
+        if verbose:
+            print(
+                "[LP-GNN] No labeled pairs. Returning untrained model."
+            )
 
         model = LinkPredictionGNN(
             in_dim=x.size(1),
@@ -1568,6 +1671,11 @@ def train_link_prediction_gnn(
             "val_ap": [],
             "val_auc": [],
             "val_f1": [],
+            "val_mae": [],
+            "val_mse": [],
+            "val_rmse": [],
+            "val_r2": [],
+            "val_pearson": [],
             "early_stop_metric_history": [],
             "patience_history": [],
             "stopped_at": 0,
@@ -1585,6 +1693,9 @@ def train_link_prediction_gnn(
             "train_idx": torch.empty(0, dtype=torch.long),
             "val_idx": torch.empty(0, dtype=torch.long),
             "test_idx": torch.empty(0, dtype=torch.long),
+            "label_mode": label_mode,
+            "threshold": float(threshold),
+            "split_strategy": None,
         }
 
         return model
@@ -1607,194 +1718,242 @@ def train_link_prediction_gnn(
             "same number of examples."
         )
 
-    # This function is a binary classifier.
-    valid_binary_labels = (y_label == 0.0) | (y_label == 1.0)
-
-    if not bool(valid_binary_labels.all()):
-        unique_values = torch.unique(
-            y_label
-        ).detach().cpu().tolist()
-
-        raise ValueError(
-            "y_label must contain only binary values 0 and 1. "
-            f"Found values: {unique_values}"
-        )
-
     use_aux = (
         y_src_label is not None
         and y_dst_label is not None
     )
 
-    if use_aux:
-        valid_src = (
-            (y_src_label == 0.0)
-            | (y_src_label == 1.0)
-        )
-
-        valid_dst = (
-            (y_dst_label == 0.0)
-            | (y_dst_label == 1.0)
-        )
-
-        if not bool(valid_src.all()):
-            raise ValueError(
-                "y_src_label must contain only 0 and 1."
-            )
-
-        if not bool(valid_dst.all()):
-            raise ValueError(
-                "y_dst_label must contain only 0 and 1."
-            )
-
-    y_int = y_label.long()
+    # Soft targets are thresholded only for stratification and binary metrics.
+    y_hard = (y_label >= threshold).long()
+    n_neg = int((y_hard == 0).sum().item())
+    n_pos = int((y_hard == 1).sum().item())
 
     if verbose:
-        msg = (
-            f"[LP-GNN] Labeled pairs: M={M} | "
-            f"pos={(y_int == 1).sum().item()} | "
-            f"neg={(y_int == 0).sum().item()}"
-        )
+        if hard_label_mode:
+            msg = (
+                f"[LP-GNN] Labeled pairs: M={M} | mode=hard_binary | "
+                f"pos={n_pos} | neg={n_neg}"
+            )
+        else:
+            msg = (
+                f"[LP-GNN] Labeled pairs: M={M} | mode=soft_binary | "
+                f"target_min={y_label.min().item():.4f} | "
+                f"target_mean={y_label.mean().item():.4f} | "
+                f"target_max={y_label.max().item():.4f} | "
+                f"thresholded_pos={n_pos} | thresholded_neg={n_neg}"
+            )
 
         if use_aux:
+            src_mode = (
+                "hard"
+                if _contains_only_hard_labels(y_src_label)
+                else "soft"
+            )
+            dst_mode = (
+                "hard"
+                if _contains_only_hard_labels(y_dst_label)
+                else "soft"
+            )
             msg += (
-                f" | src_pos="
-                f"{(y_src_label.long() == 1).sum().item()} "
-                f"| dst_pos="
-                f"{(y_dst_label.long() == 1).sum().item()} "
+                f" | src_labels={src_mode} | dst_labels={dst_mode} "
                 f"| aux_loss_weight={aux_loss_weight}"
             )
 
         print(msg)
 
     # ======================================================
-    # Stratified train / validation / test split
+    # Train / validation / test split
     # ======================================================
-
-    neg_idx_all = torch.nonzero(
-        y_int == 0,
-        as_tuple=True,
-    )[0]
-
-    pos_idx_all = torch.nonzero(
-        y_int == 1,
-        as_tuple=True,
-    )[0]
-
-    n_neg = int(neg_idx_all.numel())
-    n_pos = int(pos_idx_all.numel())
-
-    if n_neg == 0 or n_pos == 0:
-        raise ValueError(
-            f"Both classes are required, got "
-            f"pos={n_pos}, neg={n_neg}."
-        )
 
     split_generator = torch.Generator(
         device="cpu"
     ).manual_seed(42)
 
-    neg_order = torch.randperm(
-        n_neg,
-        generator=split_generator,
-    ).to(device)
+    def _split_counts(count: int) -> tuple[int, int, int]:
+        n_train_local = int(train_ratio * count)
+        n_val_local = int(val_ratio * count)
+        n_test_local = count - n_train_local - n_val_local
+        return n_train_local, n_val_local, n_test_local
 
-    pos_order = torch.randperm(
-        n_pos,
-        generator=split_generator,
-    ).to(device)
-
-    neg_perm = neg_idx_all[neg_order]
-    pos_perm = pos_idx_all[pos_order]
-
-    def split_class_indices(
+    def _split_one_group(
         indices: torch.Tensor,
-    ) -> tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-    ]:
+        group_name: str,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         count = int(indices.numel())
+        n_train_local, n_val_local, n_test_local = _split_counts(count)
 
-        n_train = int(train_ratio * count)
-        n_val = int(val_ratio * count)
-        n_test = count - n_train - n_val
+        if min(n_train_local, n_val_local, n_test_local) <= 0:
+            raise ValueError(
+                f"Group '{group_name}' needs at least one example in "
+                "train, validation and test. "
+                f"Group size={count}, resulting split="
+                f"{n_train_local}/{n_val_local}/{n_test_local}."
+            )
+
+        order = torch.randperm(
+            count,
+            generator=split_generator,
+        ).to(device)
+        shuffled = indices[order]
+
+        train_local = shuffled[:n_train_local]
+        val_local = shuffled[
+            n_train_local:n_train_local + n_val_local
+        ]
+        test_local = shuffled[n_train_local + n_val_local:]
+
+        return train_local, val_local, test_local
+
+    classification_metric_names = {
+        "val_auc",
+        "val_ap",
+        "val_acc",
+        "val_f1",
+        "val_recall",
+    }
+
+    threshold_groups_can_be_stratified = False
+    if n_neg > 0 and n_pos > 0:
+        neg_counts = _split_counts(n_neg)
+        pos_counts = _split_counts(n_pos)
+        threshold_groups_can_be_stratified = (
+            min(*neg_counts, *pos_counts) > 0
+        )
+
+    if threshold_groups_can_be_stratified:
+        neg_idx_all = torch.nonzero(
+            y_hard == 0,
+            as_tuple=True,
+        )[0]
+        pos_idx_all = torch.nonzero(
+            y_hard == 1,
+            as_tuple=True,
+        )[0]
+
+        neg_train, neg_val, neg_test = _split_one_group(
+            neg_idx_all,
+            "target<threshold",
+        )
+        pos_train, pos_val, pos_test = _split_one_group(
+            pos_idx_all,
+            "target>=threshold",
+        )
+
+        train_idx = torch.cat([neg_train, pos_train])
+        val_idx = torch.cat([neg_val, pos_val])
+        test_idx = torch.cat([neg_test, pos_test])
+        split_strategy = "threshold_stratified"
+
+    else:
+        if hard_label_mode:
+            if n_neg == 0 or n_pos == 0:
+                raise ValueError(
+                    f"Hard binary training requires both classes, got "
+                    f"pos={n_pos}, neg={n_neg}."
+                )
+
+            raise ValueError(
+                "Each hard class needs enough examples to place at least "
+                "one item in train, validation and test. "
+                f"Got pos={n_pos}, neg={n_neg}."
+            )
+
+        if early_stop_metric in classification_metric_names:
+            if n_neg == 0 or n_pos == 0:
+                raise ValueError(
+                    f"{early_stop_metric} requires soft targets on both "
+                    f"sides of threshold={threshold}, but got "
+                    f"thresholded_pos={n_pos}, thresholded_neg={n_neg}. "
+                    "Use early_stop_metric='val_loss', 'val_mae', "
+                    "'val_rmse', 'val_r2', or 'val_pearson'."
+                )
+
+            raise ValueError(
+                f"{early_stop_metric} requires enough thresholded positive "
+                "and negative targets for all three splits. "
+                f"Got thresholded_pos={n_pos}, thresholded_neg={n_neg}. "
+                "Use a continuous early-stopping metric or provide more data."
+            )
+
+        n_train, n_val, n_test = _split_counts(M)
 
         if min(n_train, n_val, n_test) <= 0:
             raise ValueError(
-                "Each class needs at least one example in train, "
-                "validation and test. "
-                f"Class size={count}, resulting split="
-                f"{n_train}/{n_val}/{n_test}."
+                "Not enough labeled pairs for train, validation and test. "
+                f"M={M}, resulting split={n_train}/{n_val}/{n_test}."
             )
 
-        train = indices[:n_train]
-        val = indices[n_train:n_train + n_val]
-        test = indices[n_train + n_val:]
+        # Rank-bin stratification preserves the soft-target distribution better
+        # than a purely random split. Each bin is split independently.
+        min_bin_size = max(
+            3,
+            math.ceil(1.0 / min(train_ratio, val_ratio, test_ratio)),
+        )
+        num_bins = max(1, min(10, M // min_bin_size))
 
-        return train, val, test
+        random_tiebreak = torch.rand(
+            M,
+            generator=split_generator,
+        )
+        # Stable sorting is not available in all supported torch versions;
+        # a tiny random jitter only determines ordering among near-equal values.
+        y_for_sort = y_label.detach().cpu() + 1e-12 * random_tiebreak
+        sorted_cpu_idx = torch.argsort(y_for_sort)
+        rank_bins = torch.tensor_split(sorted_cpu_idx, num_bins)
 
-    neg_train, neg_val, neg_test = split_class_indices(
-        neg_perm
-    )
+        train_parts: list[torch.Tensor] = []
+        val_parts: list[torch.Tensor] = []
+        test_parts: list[torch.Tensor] = []
 
-    pos_train, pos_val, pos_test = split_class_indices(
-        pos_perm
-    )
+        for bin_number, bin_cpu_idx in enumerate(rank_bins):
+            bin_idx = bin_cpu_idx.to(device)
+            count = int(bin_idx.numel())
 
-    train_idx = torch.cat(
-        [neg_train, pos_train]
-    )
+            if count == 0:
+                continue
 
-    val_idx = torch.cat(
-        [neg_val, pos_val]
-    )
+            bin_train, bin_val, bin_test = _split_one_group(
+                bin_idx,
+                f"soft_rank_bin_{bin_number}",
+            )
+            train_parts.append(bin_train)
+            val_parts.append(bin_val)
+            test_parts.append(bin_test)
 
-    test_idx = torch.cat(
-        [neg_test, pos_test]
-    )
+        train_idx = torch.cat(train_parts)
+        val_idx = torch.cat(val_parts)
+        test_idx = torch.cat(test_parts)
+        split_strategy = f"soft_rank_bins_{num_bins}"
 
+    # Shuffle final indices so examples are not grouped by stratum/bin.
     train_idx = train_idx[
         torch.randperm(
             train_idx.numel(),
-            device=device,
-        )
+            generator=split_generator,
+        ).to(device)
     ]
-
     val_idx = val_idx[
         torch.randperm(
             val_idx.numel(),
-            device=device,
-        )
+            generator=split_generator,
+        ).to(device)
     ]
-
     test_idx = test_idx[
         torch.randperm(
             test_idx.numel(),
-            device=device,
-        )
+            generator=split_generator,
+        ).to(device)
     ]
 
-    # Verify stratification.
-    for split_name, split_idx in (
-        ("train", train_idx),
-        ("validation", val_idx),
-        ("test", test_idx),
-    ):
-        split_labels = y_int[split_idx]
+    if train_idx.numel() + val_idx.numel() + test_idx.numel() != M:
+        raise AssertionError("Split sizes do not add up to M.")
 
-        split_pos = int(
-            (split_labels == 1).sum().item()
+    if verbose:
+        print(
+            f"[LP-GNN] Split strategy={split_strategy} | "
+            f"train={train_idx.numel()} | val={val_idx.numel()} | "
+            f"test={test_idx.numel()}"
         )
-
-        split_neg = int(
-            (split_labels == 0).sum().item()
-        )
-
-        if split_pos == 0 or split_neg == 0:
-            raise AssertionError(
-                f"{split_name} split lost one class: "
-                f"pos={split_pos}, neg={split_neg}."
-            )
 
     # ======================================================
     # Model and losses
@@ -1812,18 +1971,22 @@ def train_link_prediction_gnn(
         weight_decay=weight_decay,
     )
 
-    # Compute class weight using training data only.
-    train_labels_int = y_int[train_idx]
+    def _effective_pos_weight(targets: torch.Tensor) -> float:
+        """Return neg/pos mass; identical to count ratio for hard labels."""
+        positive_mass = float(targets.sum().item())
+        negative_mass = float((1.0 - targets).sum().item())
 
-    train_pos = int(
-        (train_labels_int == 1).sum().item()
-    )
+        if positive_mass <= 1e-12 or negative_mass <= 1e-12:
+            return 1.0
 
-    train_neg = int(
-        (train_labels_int == 0).sum().item()
-    )
+        return negative_mass / positive_mass
 
-    pos_weight = train_neg / train_pos
+    train_targets = y_label[train_idx]
+
+    if hard_label_mode:
+        pos_weight = _effective_pos_weight(train_targets)
+    else:
+        pos_weight = 1.0
 
     loss_fn = nn.BCEWithLogitsLoss(
         pos_weight=torch.tensor(
@@ -1837,33 +2000,8 @@ def train_link_prediction_gnn(
         src_train = y_src_label[train_idx]
         dst_train = y_dst_label[train_idx]
 
-        src_pos = float(
-            (src_train == 1).sum().item()
-        )
-
-        src_neg = float(
-            (src_train == 0).sum().item()
-        )
-
-        dst_pos = float(
-            (dst_train == 1).sum().item()
-        )
-
-        dst_neg = float(
-            (dst_train == 0).sum().item()
-        )
-
-        src_pos_weight = (
-            src_neg / src_pos
-            if src_pos > 0
-            else 1.0
-        )
-
-        dst_pos_weight = (
-            dst_neg / dst_pos
-            if dst_pos > 0
-            else 1.0
-        )
+        src_pos_weight = _effective_pos_weight(src_train)
+        dst_pos_weight = _effective_pos_weight(dst_train)
 
         loss_fn_src = nn.BCEWithLogitsLoss(
             pos_weight=torch.tensor(
@@ -1872,7 +2010,6 @@ def train_link_prediction_gnn(
                 device=device,
             )
         )
-
         loss_fn_dst = nn.BCEWithLogitsLoss(
             pos_weight=torch.tensor(
                 dst_pos_weight,
@@ -1880,91 +2017,122 @@ def train_link_prediction_gnn(
                 device=device,
             )
         )
+    else:
+        src_pos_weight = None
+        dst_pos_weight = None
 
     # ======================================================
     # Evaluation helpers
     # ======================================================
 
-    def _safe_div(
-        num: float,
-        den: float,
-    ) -> float:
+    def _safe_div(num: float, den: float) -> float:
         return float(num / den) if den > 0 else 0.0
+
+    def _confusion_counts_local(
+        predictions: torch.Tensor,
+        labels: torch.Tensor,
+    ) -> tuple[int, int, int, int]:
+        predictions = predictions.long().view(-1)
+        labels = labels.long().view(-1)
+
+        tp = int(((predictions == 1) & (labels == 1)).sum().item())
+        fp = int(((predictions == 1) & (labels == 0)).sum().item())
+        tn = int(((predictions == 0) & (labels == 0)).sum().item())
+        fn = int(((predictions == 0) & (labels == 1)).sum().item())
+        return tp, fp, tn, fn
+
+    def _safe_auc_ap(
+        probabilities: torch.Tensor,
+        labels: torch.Tensor,
+    ) -> tuple[float | None, float | None]:
+        probabilities_np = probabilities.detach().cpu().numpy()
+        labels_np = labels.detach().cpu().numpy()
+
+        if len(set(labels_np.tolist())) < 2:
+            return None, None
+
+        try:
+            auc = float(roc_auc_score(labels_np, probabilities_np))
+        except ValueError:
+            auc = None
+
+        try:
+            ap = float(average_precision_score(labels_np, probabilities_np))
+        except ValueError:
+            ap = None
+
+        return auc, ap
 
     def _compute_metrics_from_logits(
         logits: torch.Tensor,
-        labels_int: torch.Tensor,
+        targets: torch.Tensor,
     ) -> dict:
         logits = logits.view(-1)
-        labels_int = labels_int.long().view(-1)
+        targets = targets.float().view(-1)
 
         probs = torch.sigmoid(logits)
-        preds = (probs >= threshold).long()
+        hard_targets = (targets >= threshold).long()
+        predictions = (probs >= threshold).long()
 
-        loss_val = loss_fn(
-            logits,
-            labels_int.float(),
+        loss_val = loss_fn(logits, targets)
+
+        errors = probs - targets
+        mae = torch.mean(torch.abs(errors))
+        mse = torch.mean(errors.square())
+        rmse = torch.sqrt(mse)
+
+        target_centered = targets - targets.mean()
+        prob_centered = probs - probs.mean()
+
+        ss_res = torch.sum(errors.square())
+        ss_tot = torch.sum(target_centered.square())
+
+        if float(ss_tot.item()) > 1e-12:
+            r2: float | None = float((1.0 - ss_res / ss_tot).item())
+        else:
+            r2 = None
+
+        pearson_denominator = torch.sqrt(
+            torch.sum(target_centered.square())
+            * torch.sum(prob_centered.square())
         )
 
-        tp, fp, tn, fn = _confusion_counts(
-            preds,
-            labels_int,
+        if float(pearson_denominator.item()) > 1e-12:
+            pearson: float | None = float(
+                (
+                    torch.sum(target_centered * prob_centered)
+                    / pearson_denominator
+                ).item()
+            )
+        else:
+            pearson = None
+
+        tp, fp, tn, fn = _confusion_counts_local(
+            predictions,
+            hard_targets,
         )
 
         total = tp + fp + tn + fn
-
-        acc = _safe_div(
-            tp + tn,
-            total,
-        )
-
-        precision = _safe_div(
-            tp,
-            tp + fp,
-        )
-
-        recall = _safe_div(
-            tp,
-            tp + fn,
-        )
-
-        specificity = _safe_div(
-            tn,
-            tn + fp,
-        )
-
+        acc = _safe_div(tp + tn, total)
+        precision = _safe_div(tp, tp + fp)
+        recall = _safe_div(tp, tp + fn)
+        specificity = _safe_div(tn, tn + fp)
         f1 = (
-            2.0 * precision * recall
-            / (precision + recall)
+            2.0 * precision * recall / (precision + recall)
             if precision + recall > 0
             else 0.0
         )
 
-        auc, ap = _safe_auc_ap_sklearn(
-            probs,
-            labels_int,
-        )
-
-        p_min = (
-            float(probs.min().item())
-            if probs.numel() > 0
-            else float("nan")
-        )
-
-        p_mean = (
-            float(probs.mean().item())
-            if probs.numel() > 0
-            else float("nan")
-        )
-
-        p_max = (
-            float(probs.max().item())
-            if probs.numel() > 0
-            else float("nan")
-        )
+        auc, ap = _safe_auc_ap(probs, hard_targets)
 
         return {
             "loss": float(loss_val.item()),
+            "mae": float(mae.item()),
+            "mse": float(mse.item()),
+            "rmse": float(rmse.item()),
+            "r2": r2,
+            "pearson": pearson,
+            # For soft targets, the following are thresholded metrics.
             "acc": float(acc),
             "precision": float(precision),
             "recall": float(recall),
@@ -1976,9 +2144,12 @@ def train_link_prediction_gnn(
             "fp": int(fp),
             "tn": int(tn),
             "fn": int(fn),
-            "p_min": p_min,
-            "p_mean": p_mean,
-            "p_max": p_max,
+            "target_min": float(targets.min().item()),
+            "target_mean": float(targets.mean().item()),
+            "target_max": float(targets.max().item()),
+            "p_min": float(probs.min().item()),
+            "p_mean": float(probs.mean().item()),
+            "p_max": float(probs.max().item()),
         }
 
     def _evaluate_split(
@@ -1994,11 +2165,7 @@ def train_link_prediction_gnn(
                     edge_index_lab[:, split_idx],
                     return_aux=True,
                 )
-
-                logits = output[
-                    "edge_logits"
-                ].view(-1)
-
+                logits = output["edge_logits"].view(-1)
             else:
                 logits = model(
                     x,
@@ -2012,80 +2179,52 @@ def train_link_prediction_gnn(
             ):
                 return None
 
-            labels = y_int[split_idx]
-
-            return _compute_metrics_from_logits(
-                logits,
-                labels,
-            )
+            targets = y_label[split_idx]
+            return _compute_metrics_from_logits(logits, targets)
 
     # ======================================================
     # Early stopping state
     # ======================================================
 
     want = metric_mode[early_stop_metric]
-
-    best_metric = (
-        -float("inf")
-        if want == "max"
-        else float("inf")
-    )
-
+    best_metric = -float("inf") if want == "max" else float("inf")
     best_epoch = -1
     best_state = None
-
-    patience_left = int(
-        early_stop_patience
-    )
+    patience_left = int(early_stop_patience)
 
     stopped_epoch = 0
     stopped_metric_value = None
     early_stopped = False
     stop_reason = "completed"
 
-    def _is_improvement(
-        current: float,
-        best: float,
-    ) -> bool:
+    def _is_improvement(current: float, best: float) -> bool:
         if want == "max":
-            return (
-                current
-                > best + early_stop_min_delta
-            )
-
-        return (
-            current
-            < best - early_stop_min_delta
-        )
+            return current > best + early_stop_min_delta
+        return current < best - early_stop_min_delta
 
     # ======================================================
     # Histories
     # ======================================================
 
-    # Comparable hard-label BCE losses.
     train_losses: list[float] = []
     val_losses: list[float] = []
     test_losses: list[float] = []
-
-    # Actual optimized objective, which may include smoothing
-    # or auxiliary losses.
     train_objective_losses: list[float] = []
 
     val_ap_history: list[float | None] = []
     val_auc_history: list[float | None] = []
     val_f1_history: list[float] = []
+    val_mae_history: list[float] = []
+    val_mse_history: list[float] = []
+    val_rmse_history: list[float] = []
+    val_r2_history: list[float | None] = []
+    val_pearson_history: list[float | None] = []
 
-    early_stop_metric_history: list[
-        float
-    ] = []
-
+    early_stop_metric_history: list[float] = []
     patience_history: list[int] = []
 
     epoch_iter = (
-        tqdm(
-            range(num_epochs),
-            desc="[LP-GNN] Training",
-        )
+        tqdm(range(num_epochs), desc="[LP-GNN] Training")
         if use_tqdm
         else range(num_epochs)
     )
@@ -2108,19 +2247,16 @@ def train_link_prediction_gnn(
                 return_aux=True,
             )
 
-            logits_train = out_train[
-                "edge_logits"
-            ].view(-1)
+            logits_train = out_train["edge_logits"].view(-1)
 
             if (
                 torch.isnan(logits_train).any()
                 or torch.isinf(logits_train).any()
             ):
                 print(
-                    "[LP-GNN][ERROR] NaN/Inf in train "
-                    f"edge logits at epoch {current_epoch}."
+                    "[LP-GNN][ERROR] NaN/Inf in train edge logits "
+                    f"at epoch {current_epoch}."
                 )
-
                 stop_reason = "non_finite_train_logits"
                 break
 
@@ -2128,25 +2264,18 @@ def train_link_prediction_gnn(
                 logits_train,
                 y_label[train_idx],
             )
-
             loss_src = loss_fn_src(
-                out_train[
-                    "src_flip_logits"
-                ].view(-1),
+                out_train["src_flip_logits"].view(-1),
                 y_src_label[train_idx],
             )
-
             loss_dst = loss_fn_dst(
-                out_train[
-                    "dst_flip_logits"
-                ].view(-1),
+                out_train["dst_flip_logits"].view(-1),
                 y_dst_label[train_idx],
             )
 
             loss = (
                 loss_edge
-                + aux_loss_weight
-                * (loss_src + loss_dst)
+                + aux_loss_weight * (loss_src + loss_dst)
             )
 
         else:
@@ -2161,57 +2290,48 @@ def train_link_prediction_gnn(
                 or torch.isinf(logits_train).any()
             ):
                 print(
-                    "[LP-GNN][ERROR] NaN/Inf in train "
-                    f"logits at epoch {current_epoch}."
+                    "[LP-GNN][ERROR] NaN/Inf in train logits "
+                    f"at epoch {current_epoch}."
                 )
-
                 stop_reason = "non_finite_train_logits"
                 break
 
-            label_smoothing = 0.1
-
-            y_train_soft = (
-                y_label[train_idx]
-                * (1.0 - label_smoothing)
-                + 0.5 * label_smoothing
-            )
+            # Preserve the old hard-label smoothing behavior, but do not
+            # smooth labels that are already soft.
+            if hard_label_mode:
+                label_smoothing = 0.1
+                train_targets_for_loss = (
+                    y_label[train_idx] * (1.0 - label_smoothing)
+                    + 0.5 * label_smoothing
+                )
+            else:
+                train_targets_for_loss = y_label[train_idx]
 
             loss = loss_fn(
                 logits_train,
-                y_train_soft,
+                train_targets_for_loss,
             )
 
-        if not bool(torch.isfinite(loss)):
+        if not bool(torch.isfinite(loss).item()):
             print(
-                "[LP-GNN][ERROR] Non-finite training "
-                f"loss at epoch {current_epoch}."
+                "[LP-GNN][ERROR] Non-finite training loss "
+                f"at epoch {current_epoch}."
             )
-
             stop_reason = "non_finite_train_loss"
             break
 
         loss.backward()
 
         grad_norm_val = None
-
         if log_grad_norm:
             total_norm_squared = 0.0
-
             for parameter in model.parameters():
                 if parameter.grad is not None:
                     parameter_norm = (
-                        parameter.grad.detach()
-                        .norm(2)
-                        .item()
+                        parameter.grad.detach().norm(2).item()
                     )
-
-                    total_norm_squared += (
-                        parameter_norm ** 2
-                    )
-
-            grad_norm_val = (
-                total_norm_squared ** 0.5
-            )
+                    total_norm_squared += parameter_norm ** 2
+            grad_norm_val = total_norm_squared ** 0.5
 
         optimizer.step()
 
@@ -2219,86 +2339,56 @@ def train_link_prediction_gnn(
         # Evaluate train / validation / test
         # ==================================================
 
-        train_metrics = _evaluate_split(
-            train_idx
-        )
-
-        val_metrics = _evaluate_split(
-            val_idx
-        )
-
-        test_metrics = _evaluate_split(
-            test_idx
-        )
+        train_metrics = _evaluate_split(train_idx)
+        val_metrics = _evaluate_split(val_idx)
+        test_metrics = _evaluate_split(test_idx)
 
         if train_metrics is None:
             print(
-                "[LP-GNN][ERROR] NaN/Inf during train "
-                f"evaluation at epoch {current_epoch}."
+                "[LP-GNN][ERROR] NaN/Inf during train evaluation "
+                f"at epoch {current_epoch}."
             )
-
             stop_reason = "non_finite_train_evaluation"
             break
 
         if val_metrics is None:
             print(
-                "[LP-GNN][ERROR] NaN/Inf during validation "
-                f"evaluation at epoch {current_epoch}."
+                "[LP-GNN][ERROR] NaN/Inf during validation evaluation "
+                f"at epoch {current_epoch}."
             )
-
             stop_reason = "non_finite_validation_evaluation"
             break
 
         if test_metrics is None:
             print(
-                "[LP-GNN][ERROR] NaN/Inf during test "
-                f"evaluation at epoch {current_epoch}."
+                "[LP-GNN][ERROR] NaN/Inf during test evaluation "
+                f"at epoch {current_epoch}."
             )
-
             stop_reason = "non_finite_test_evaluation"
             break
 
-        train_losses.append(
-            float(train_metrics["loss"])
-        )
+        train_losses.append(float(train_metrics["loss"]))
+        val_losses.append(float(val_metrics["loss"]))
+        test_losses.append(float(test_metrics["loss"]))
+        train_objective_losses.append(float(loss.item()))
 
-        val_losses.append(
-            float(val_metrics["loss"])
-        )
-
-        test_losses.append(
-            float(test_metrics["loss"])
-        )
-
-        train_objective_losses.append(
-            float(loss.item())
-        )
-
-        metric_key = early_stop_metric.replace(
-            "val_",
-            "",
-            1,
-        )
-
-        metric_val_raw = val_metrics[
-            metric_key
-        ]
+        metric_key = early_stop_metric.replace("val_", "", 1)
+        metric_val_raw = val_metrics[metric_key]
 
         if metric_val_raw is None:
             raise RuntimeError(
-                f"{early_stop_metric} is unavailable at "
-                f"epoch {current_epoch}. Ensure that the "
-                "validation split contains both classes."
+                f"{early_stop_metric} is unavailable at epoch "
+                f"{current_epoch}. This usually means that the validation "
+                "targets are constant for this metric. Choose val_loss, "
+                "val_mae, val_mse, or val_rmse instead."
             )
 
-        metric_val = float(
-            metric_val_raw
-        )
+        metric_val = float(metric_val_raw)
 
         if not math.isfinite(metric_val):
             raise RuntimeError(
-                f"Non-finite {early_stop_metric} at "
-                f"epoch {current_epoch}: {metric_val}"
+                f"Non-finite {early_stop_metric} at epoch "
+                f"{current_epoch}: {metric_val}"
             )
 
         stopped_epoch = current_epoch
@@ -2310,53 +2400,28 @@ def train_link_prediction_gnn(
 
         is_best = False
 
-        if _is_improvement(
-            metric_val,
-            best_metric,
-        ):
+        if _is_improvement(metric_val, best_metric):
             best_metric = metric_val
             best_epoch = current_epoch
-            best_state = copy.deepcopy(
-                model.state_dict()
-            )
-
-            patience_left = int(
-                early_stop_patience
-            )
-
+            best_state = copy.deepcopy(model.state_dict())
+            patience_left = int(early_stop_patience)
             is_best = True
-
         elif (
             early_stop
-            and current_epoch
-            >= min_epochs_before_early_stop
+            and current_epoch >= min_epochs_before_early_stop
         ):
-            # Warm-up epochs do not consume patience.
             patience_left -= 1
 
-        val_ap_history.append(
-            float(val_metrics["ap"])
-            if val_metrics["ap"] is not None
-            else None
-        )
-
-        val_auc_history.append(
-            float(val_metrics["auc"])
-            if val_metrics["auc"] is not None
-            else None
-        )
-
-        val_f1_history.append(
-            float(val_metrics["f1"])
-        )
-
-        early_stop_metric_history.append(
-            metric_val
-        )
-
-        patience_history.append(
-            int(patience_left)
-        )
+        val_ap_history.append(val_metrics["ap"])
+        val_auc_history.append(val_metrics["auc"])
+        val_f1_history.append(float(val_metrics["f1"]))
+        val_mae_history.append(float(val_metrics["mae"]))
+        val_mse_history.append(float(val_metrics["mse"]))
+        val_rmse_history.append(float(val_metrics["rmse"]))
+        val_r2_history.append(val_metrics["r2"])
+        val_pearson_history.append(val_metrics["pearson"])
+        early_stop_metric_history.append(metric_val)
+        patience_history.append(int(patience_left))
 
         # ==================================================
         # tqdm output
@@ -2364,15 +2429,11 @@ def train_link_prediction_gnn(
 
         if use_tqdm:
             postfix = {
-                "tr_bce": (
-                    f"{train_metrics['loss']:.4f}"
-                ),
-                "tr_obj": (
-                    f"{loss.item():.4f}"
-                ),
-                "va_loss": (
-                    f"{val_metrics['loss']:.4f}"
-                ),
+                "tr_bce": f"{train_metrics['loss']:.4f}",
+                "tr_obj": f"{loss.item():.4f}",
+                "va_loss": f"{val_metrics['loss']:.4f}",
+                "va_mae": f"{val_metrics['mae']:.3f}",
+                "va_rmse": f"{val_metrics['rmse']:.3f}",
                 "va_ap": (
                     f"{val_metrics['ap']:.3f}"
                     if val_metrics["ap"] is not None
@@ -2383,19 +2444,10 @@ def train_link_prediction_gnn(
                     if val_metrics["auc"] is not None
                     else "n/a"
                 ),
-                "va_f1": (
-                    f"{val_metrics['f1']:.3f}"
-                ),
-                "pat": (
-                    patience_left
-                    if early_stop
-                    else "off"
-                ),
+                "va_f1": f"{val_metrics['f1']:.3f}",
+                "pat": patience_left if early_stop else "off",
             }
-
-            epoch_iter.set_postfix(
-                postfix
-            )
+            epoch_iter.set_postfix(postfix)
 
         # ==================================================
         # Console output
@@ -2406,57 +2458,61 @@ def train_link_prediction_gnn(
             or current_epoch == 1
             or current_epoch == num_epochs
         ):
+            threshold_metric_prefix = (
+                ""
+                if hard_label_mode
+                else f"thr@{threshold:.2f}_"
+            )
+
             message = (
-                f"[LP-GNN] Epoch "
-                f"{current_epoch:03d}/{num_epochs} | "
+                f"[LP-GNN] Epoch {current_epoch:03d}/{num_epochs} | "
                 f"train_bce={train_metrics['loss']:.4f} | "
                 f"train_objective={loss.item():.4f} | "
                 f"val_loss={val_metrics['loss']:.4f} | "
                 f"test_loss={test_metrics['loss']:.4f} | "
-                f"train_acc={train_metrics['acc']:.4f} | "
-                f"val_acc={val_metrics['acc']:.4f} | "
-                f"test_acc={test_metrics['acc']:.4f} | "
-                f"val_precision="
+                f"val_mae={val_metrics['mae']:.4f} | "
+                f"val_rmse={val_metrics['rmse']:.4f} | "
+                f"{threshold_metric_prefix}train_acc="
+                f"{train_metrics['acc']:.4f} | "
+                f"{threshold_metric_prefix}val_acc="
+                f"{val_metrics['acc']:.4f} | "
+                f"{threshold_metric_prefix}test_acc="
+                f"{test_metrics['acc']:.4f} | "
+                f"{threshold_metric_prefix}val_precision="
                 f"{val_metrics['precision']:.4f} | "
-                f"val_recall="
+                f"{threshold_metric_prefix}val_recall="
                 f"{val_metrics['recall']:.4f} | "
-                f"val_f1={val_metrics['f1']:.4f} | "
+                f"{threshold_metric_prefix}val_f1="
+                f"{val_metrics['f1']:.4f} | "
                 f"val_TP/FP/TN/FN="
-                f"{val_metrics['tp']}/"
-                f"{val_metrics['fp']}/"
-                f"{val_metrics['tn']}/"
-                f"{val_metrics['fn']}"
+                f"{val_metrics['tp']}/{val_metrics['fp']}/"
+                f"{val_metrics['tn']}/{val_metrics['fn']}"
             )
 
-            if val_metrics["auc"] is not None:
+            if val_metrics["r2"] is not None:
+                message += f" | val_R2={val_metrics['r2']:.4f}"
+
+            if val_metrics["pearson"] is not None:
                 message += (
-                    f" | val_AUC="
-                    f"{val_metrics['auc']:.4f}"
+                    f" | val_Pearson={val_metrics['pearson']:.4f}"
                 )
+
+            if val_metrics["auc"] is not None:
+                message += f" | val_AUC={val_metrics['auc']:.4f}"
 
             if val_metrics["ap"] is not None:
-                message += (
-                    f" | val_AP="
-                    f"{val_metrics['ap']:.4f}"
-                )
+                message += f" | val_AP={val_metrics['ap']:.4f}"
 
             message += (
-                f" | best_{early_stop_metric}="
-                f"{best_metric:.4f} "
+                f" | best_{early_stop_metric}={best_metric:.4f} "
                 f"(epoch {best_epoch})"
             )
 
             if early_stop:
-                message += (
-                    f" | patience_left="
-                    f"{patience_left}"
-                )
+                message += f" | patience_left={patience_left}"
 
             if grad_norm_val is not None:
-                message += (
-                    f" | grad_norm="
-                    f"{grad_norm_val:.3e}"
-                )
+                message += f" | grad_norm={grad_norm_val:.3e}"
 
             if use_aux:
                 message += " | multitask_aux=on"
@@ -2472,8 +2528,7 @@ def train_link_prediction_gnn(
 
         if (
             early_stop
-            and current_epoch
-            >= min_epochs_before_early_stop
+            and current_epoch >= min_epochs_before_early_stop
             and patience_left <= 0
         ):
             early_stopped = True
@@ -2486,7 +2541,6 @@ def train_link_prediction_gnn(
                     f"{early_stop_metric}={best_metric:.4f} "
                     f"at epoch {best_epoch}."
                 )
-
             break
 
     # ======================================================
@@ -2501,77 +2555,47 @@ def train_link_prediction_gnn(
         f"but stopped_epoch={stopped_epoch}."
     )
 
-    assert len(train_losses) == len(val_losses), (
-        "train_losses and val_losses have different lengths."
-    )
+    expected_history_length = stopped_at
+    histories_to_check = {
+        "val_losses": val_losses,
+        "test_losses": test_losses,
+        "train_objective_losses": train_objective_losses,
+        "val_ap": val_ap_history,
+        "val_auc": val_auc_history,
+        "val_f1": val_f1_history,
+        "val_mae": val_mae_history,
+        "val_mse": val_mse_history,
+        "val_rmse": val_rmse_history,
+        "val_r2": val_r2_history,
+        "val_pearson": val_pearson_history,
+        "early_stop_metric_history": early_stop_metric_history,
+        "patience_history": patience_history,
+    }
 
-    assert len(train_losses) == len(test_losses), (
-        "train_losses and test_losses have different lengths."
-    )
-
-    assert (
-        len(train_losses)
-        == len(train_objective_losses)
-    ), (
-        "train loss histories have different lengths."
-    )
-
-    assert (
-        len(train_losses)
-        == len(early_stop_metric_history)
-    ), (
-        "Metric history does not match the number of "
-        "completed epochs."
-    )
-
-    assert (
-        len(train_losses)
-        == len(patience_history)
-    ), (
-        "Patience history does not match the number of "
-        "completed epochs."
-    )
+    for history_name, history_values in histories_to_check.items():
+        assert len(history_values) == expected_history_length, (
+            f"{history_name} does not match the number of completed epochs."
+        )
 
     if stopped_at > 0:
         assert best_state is not None, (
-            "At least one epoch completed but no best "
-            "checkpoint was recorded."
+            "At least one epoch completed but no best checkpoint was recorded."
         )
-
         assert 1 <= best_epoch <= stopped_at, (
-            f"Invalid best_epoch={best_epoch} for "
-            f"stopped_at={stopped_at}."
+            f"Invalid best_epoch={best_epoch} for stopped_at={stopped_at}."
         )
-
         assert math.isfinite(best_metric), (
             "The recorded best metric is not finite."
         )
 
     if early_stopped:
-        assert early_stop, (
-            "early_stopped=True although early_stop=False."
-        )
-
-        assert (
-            stopped_at
-            >= min_epochs_before_early_stop
-        ), (
-            "Training stopped before the minimum early-stop "
-            "epoch."
-        )
-
-        assert patience_left <= 0, (
-            "Training stopped before patience was exhausted."
-        )
-
-        assert stop_reason == "early_stopping", (
-            "Early stopping has an inconsistent stop reason."
-        )
+        assert early_stop
+        assert stopped_at >= min_epochs_before_early_stop
+        assert patience_left <= 0
+        assert stop_reason == "early_stopping"
 
     if not early_stop:
-        assert not early_stopped, (
-            "Early stopping occurred although it was disabled."
-        )
+        assert not early_stopped
 
     # ======================================================
     # Restore best validation checkpoint
@@ -2580,17 +2604,13 @@ def train_link_prediction_gnn(
     restored_best = False
 
     if restore_best and best_state is not None:
-        model.load_state_dict(
-            best_state
-        )
-
+        model.load_state_dict(best_state)
         restored_best = True
 
         if verbose:
             print(
-                f"[LP-GNN] Restored best model from "
-                f"epoch {best_epoch} "
-                f"({early_stop_metric}="
+                f"[LP-GNN] Restored best model from epoch "
+                f"{best_epoch} ({early_stop_metric}="
                 f"{best_metric:.4f})."
             )
 
@@ -2600,69 +2620,63 @@ def train_link_prediction_gnn(
 
     model.training_history = {
         "train_losses": train_losses,
-        "train_objective_losses": (
-            train_objective_losses
-        ),
+        "train_objective_losses": train_objective_losses,
         "val_losses": val_losses,
         "test_losses": test_losses,
         "val_ap": val_ap_history,
         "val_auc": val_auc_history,
         "val_f1": val_f1_history,
-        "early_stop_metric_history": (
-            early_stop_metric_history
-        ),
+        "val_mae": val_mae_history,
+        "val_mse": val_mse_history,
+        "val_rmse": val_rmse_history,
+        "val_r2": val_r2_history,
+        "val_pearson": val_pearson_history,
+        "early_stop_metric_history": early_stop_metric_history,
         "patience_history": patience_history,
         "stopped_at": stopped_at,
-        "best_epoch": (
-            best_epoch
-            if best_epoch >= 1
-            else None
-        ),
+        "best_epoch": best_epoch if best_epoch >= 1 else None,
         "best_metric": (
-            float(best_metric)
-            if best_epoch >= 1
-            else None
+            float(best_metric) if best_epoch >= 1 else None
         ),
         "early_stopped": early_stopped,
         "early_stop_enabled": early_stop,
         "early_stop_metric": early_stop_metric,
-        "early_stop_patience": (
-            early_stop_patience
-        ),
-        "early_stop_min_delta": (
-            early_stop_min_delta
-        ),
-        "min_epochs_before_early_stop": (
-            min_epochs_before_early_stop
-        ),
-        "stopped_metric_value": (
-            stopped_metric_value
-        ),
+        "early_stop_patience": early_stop_patience,
+        "early_stop_min_delta": early_stop_min_delta,
+        "min_epochs_before_early_stop": min_epochs_before_early_stop,
+        "stopped_metric_value": stopped_metric_value,
         "restored_best": restored_best,
         "stop_reason": stop_reason,
         "train_idx": train_idx.detach().cpu(),
         "val_idx": val_idx.detach().cpu(),
         "test_idx": test_idx.detach().cpu(),
-        "positive_class_weight": float(
-            pos_weight
+        "positive_class_weight": float(pos_weight),
+        "src_positive_class_weight": (
+            float(src_pos_weight) if src_pos_weight is not None else None
         ),
-        # Accepted for compatibility. Your CSV logger is
-        # currently inactive.
+        "dst_positive_class_weight": (
+            float(dst_pos_weight) if dst_pos_weight is not None else None
+        ),
+        "label_mode": label_mode,
+        "hard_label_mode": hard_label_mode,
+        "threshold": float(threshold),
+        "split_strategy": split_strategy,
         "csv_path": csv_path,
         "csv_append": csv_append,
     }
 
     if verbose:
         print(
-            f"[LP-GNN] Training complete after "
-            f"{stopped_at} epoch(s). "
+            f"[LP-GNN] Training complete after {stopped_at} epoch(s). "
             f"stop_reason={stop_reason} | "
-            f"best_epoch={model.training_history['best_epoch']} "
-            f"| best_{early_stop_metric}="
+            f"label_mode={label_mode} | "
+            f"best_epoch={model.training_history['best_epoch']} | "
+            f"best_{early_stop_metric}="
             f"{model.training_history['best_metric']}."
         )
 
     return model
+
 
 @torch.no_grad()
 def mine_candidate_edge_scores(

@@ -46,8 +46,11 @@ class PRBCD(SparseAttack):
                  eps: float = 1e-7,
                  max_final_samples: int = 20,
                  pre_hidden: int = 64, # New
+                 lp_model: Optional[torch.nn.Module] = None,
                  **kwargs):
         super().__init__(**kwargs)
+
+        self.lp_model = lp_model
 
         self.keep_heuristic = keep_heuristic
         self.display_step = display_step
@@ -231,17 +234,35 @@ class PRBCD(SparseAttack):
                 f"edge_index shape={tuple(edge_index_lab_small.shape)}"
             )
 
-            self.lp_model = self.train_link_prediction_gnn(
-                x=X,
-                edge_index_struct=edge_index_struct,
-                edge_index_lab=edge_index_lab_small,
-                y_label=y_label_small,
-                device=self.device,
-                num_epochs=200,
-                use_tqdm=True,
-                verbose=True,
+            if self.lp_model is None:
+                print("[LP-GNN] No pretrained LP model supplied. Training a new model.")
+
+                self.lp_model = self.train_link_prediction_gnn(
+                    x=X,
+                    edge_index_struct=edge_index_struct,
+                    edge_index_lab=edge_index_lab_small,
+                    y_label=y_label_small,
+                    device=self.device,
+                    num_epochs=200,
+                    use_tqdm=True,
+                    verbose=True,
+                )
+            else:
+                print("[LP-GNN] Using supplied pretrained LP model. Skipping training.")
+
+                self.lp_model = self.lp_model.to(self.device)
+                self.lp_model.eval()
+
+            self.sample_block_from_linkpred_threshold(
+                graph=graph,
+                n_perturbations=n_perturbations,
+                tau=self.tau,
+                score_batch_size=self.score_batch_size,
+                max_sampling_tries=self.max_sampling_tries,
+                rng_seed=int(self.seed or 0),
+                exclude_tried=self.exclude_tried,
             )
-            self.sample_block_from_linkpred_threshold(graph=graph, n_perturbations=n_perturbations, tau=self.tau)
+
             self.tried_set = tried_set
         elif use_cert in ("accuracy_drop_selector_subgraph_random", "accuracy_drop_selector_subgraph_khop", "accuracy_drop_selector_subgraph_growhop"):
             print(use_cert, "-> sampling with accuracy drop selector subgraph")
