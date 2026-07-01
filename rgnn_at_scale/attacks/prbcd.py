@@ -3,7 +3,7 @@ import logging
 
 from collections import defaultdict
 import math
-from typing import List, Tuple, Optional, Set, Dict
+from typing import List, Tuple, Optional, Set, Dict, DefaultDict, Any
 
 from torch import Tensor
 from tqdm import tqdm
@@ -34,23 +34,41 @@ class PRBCD(SparseAttack):
     """Sampled and hence scalable PGD attack for graph data.
     """
 
-    def __init__(self,
-                 keep_heuristic: str = 'WeightOnly',
-                 lr_factor: float = 100,
-                 display_step: int = 20,
-                 epochs: int = 400,
-                 fine_tune_epochs: int = 100,
-                 block_size: int = 1_000_000,
-                 with_early_stopping: bool = True,
-                 do_synchronize: bool = False,
-                 eps: float = 1e-7,
-                 max_final_samples: int = 20,
-                 pre_hidden: int = 64, # New
-                 lp_model: Optional[torch.nn.Module] = None,
-                 **kwargs):
+    def __init__(
+            self,
+            keep_heuristic: str = "WeightOnly",
+            lr_factor: float = 100,
+            display_step: int = 20,
+            epochs: int = 400,
+            fine_tune_epochs: int = 100,
+            block_size: int = 1_000_000,
+            with_early_stopping: bool = True,
+            do_synchronize: bool = False,
+            eps: float = 1e-7,
+            max_final_samples: int = 20,
+            pre_hidden: int = 64,
+            lp_model: Optional[torch.nn.Module] = None,
+
+            # RQ1
+            rq1_enabled: bool = False,
+            rq1_is_reference: bool = False,
+            rq1_sampling_seed: Optional[int] = None,
+
+            **kwargs,
+    ):
         super().__init__(**kwargs)
 
+        # Existing initialization
         self.lp_model = lp_model
+
+        # RQ1 configuration
+        self.rq1_enabled = bool(rq1_enabled)
+        self.rq1_is_reference = bool(rq1_is_reference)
+        self.rq1_sampling_seed = (
+            int(rq1_sampling_seed)
+            if rq1_sampling_seed is not None
+            else 0
+        )
 
         self.keep_heuristic = keep_heuristic
         self.display_step = display_step
@@ -101,6 +119,19 @@ class PRBCD(SparseAttack):
         self.use_cert = use_cert
         self.dataset = kwargs.get('dataset')
         self.seed = kwargs.get('seed')
+
+        attack_sampling_seed = (
+            int(self.rq1_sampling_seed)
+            if self.rq1_enabled
+            else int(self.seed or 0)
+        )
+
+        if self.rq1_enabled:
+            torch.manual_seed(attack_sampling_seed)
+
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(attack_sampling_seed)
+
         selector_params = kwargs.get("selector_params", {}) or {}
 
         assert self.block_size > n_perturbations, \
@@ -112,130 +143,335 @@ class PRBCD(SparseAttack):
         best_epoch = float('-Inf')
 
         # For collecting attack statistics
-        self.attack_statistics = defaultdict(list)
+        self.attack_statistics: DefaultDict[str, Any] = defaultdict(list)
+
+        if self.rq1_enabled:
+            self.attack_statistics["rq1"] = {
+                "final_linear_ids": torch.empty(
+                    0,
+                    dtype=torch.long,
+                ),
+                "initial_block": None,
+                "epoch_blocks": {},
+                "resample_events": [],
+                "positive_gradient_sum": None,
+                "max_weight": None,
+                "times_seen": None,
+                "metadata": {
+                    "block_size": int(self.block_size),
+                    "n_perturbations": int(n_perturbations),
+                    "sampling_seed": int(self.rq1_sampling_seed),
+                    "is_reference": bool(self.rq1_is_reference),
+                    "use_cert": str(use_cert),
+                },
+            }
+
+            if self.rq1_is_reference:
+                rq1 = self.attack_statistics["rq1"]
+
+                rq1["positive_gradient_sum"] = torch.zeros(
+                    self.n_possible_edges,
+                    dtype=torch.float32,
+                )
+
+                rq1["max_weight"] = torch.zeros(
+                    self.n_possible_edges,
+                    dtype=torch.float32,
+                )
+
+                rq1["times_seen"] = torch.zeros(
+                    self.n_possible_edges,
+                    dtype=torch.int32,
+                )
 
         #tried_mask for selector exclusion
         self.tried_mask = torch.zeros(self.n_possible_edges, device=self.device, dtype=torch.bool)
 
+        breakpoint()
+
         # Sample initial search space (Algorithm 1, line 3-4)
-        if use_cert in ("accuracy_drop_selector", "accuracy_drop_selector_with_resampling"):
-            print(use_cert, "-> sampling with accuracy drop selector")
-
-            self._load_selector_params(selector_params, ads_mode=ads_mode)
-
-            if self.drop_mode == "acc": #TODO: logging für alle ads_modes+drop_modes
-                cache_path = f"cache/selection_dataset{self.dataset}_seed{self.seed}_ads_{ads_mode}_k{self.n_candidates_k_sample}_bt{self.k_samples_batch}_drpmd{self.drop_mode}_drp{self.acc_drop_threshold_k_samples}.pt"
-            elif self.drop_mode == "loss":
-                cache_path = f"cache/selection_dataset{self.dataset}_seed{self.seed}_ads_{ads_mode}_k{self.n_candidates_k_sample}_bt{self.k_samples_batch}_drpmd{self.drop_mode}_drp{self.loss_drop_threshold_k_samples}.pt"
-            elif self.drop_mode == "endpoint":
-                if self.training_data_node_cap > 0:
-                    cache_path = f"cache/selection_dataset{self.dataset}_seed{self.seed}_ads_{ads_mode}_k{self.n_candidates_one_sample}_drpmd{self.drop_mode}_trnodecap{self.training_data_node_cap}"
-                else:
-                    cache_path = f"cache/selection_dataset{self.dataset}_seed{self.seed}_ads_{ads_mode}_k{self.n_candidates_one_sample}_drpmd{self.drop_mode}.pt"
-            elif self.drop_mode == "endpointPRBCD":
-                if self.training_data_node_cap > 0:
-                    cache_path = f"cache/selection_dataset{self.dataset}_seed{self.seed}_ads_{ads_mode}_k{self.n_candidates_one_sample}_drpmd{self.drop_mode}_trnodecap{self.training_data_node_cap}"
-                else:
-                    cache_path = f"cache/selection_dataset{self.dataset}_seed{self.seed}_ads_{ads_mode}_k{self.n_candidates_one_sample}_drpmd{self.drop_mode}.pt"
-
-            if os.path.exists(cache_path):
-                print("[CACHE] loading selection:", cache_path)
-                (
-                    y_out,
-                    edge_index_lab,
-                    y_label,
-                    tried_set,
-                    harmful_set,
-                    sub_nodes,
-                    edge_index_sub,
-                    edge_weight_sub,
-                    edge_index_lab_local,
-                    X_sub,
-                    edge_index_struct_local,
-                    meta,
-                ) = PRBCD.load_selection(
-                    cache_path,
-                    device=self.device,
-                )
-            else:
-                print("[CACHE] computing selection and saving:", cache_path)
-
-                y_out, edge_index_lab, y_label, tried_set, harmful_set = self.label_edge_flips_prbcd_selfsample_fast(
-                    n_perturbations=n_perturbations,
-                    mode=ads_mode,
-                    drop_mode=self.drop_mode,
-                    n_candidates_k_sample=self.n_candidates_k_sample,
-                    n_candidates_one_sample=self.n_candidates_one_sample,
-                    acc_drop_threshold_k_samples=self.acc_drop_threshold_k_samples,
-                    loss_drop_threshold_k_samples=self.loss_drop_threshold_k_samples,
-                    k_samples_batch=self.k_samples_batch,
-                    training_data_node_cap=self.training_data_node_cap,
-                )
-                meta = {
-                    "ads_mode": self.ads_mode,
-                    "n_candidates_k_sample": self.n_candidates_k_sample,
-                    "acc_drop_threshold_k_samples": self.acc_drop_threshold_k_samples,
-                    "loss_drop_threshold_k_samples": self.loss_drop_threshold_k_samples,
-                }
-                PRBCD.save_selection(cache_path, y_out, edge_index_lab, y_label, tried_set, harmful_set, meta=meta)
-
-                #Todo: flip harmful edges for testing harmful edge set
-                #Todo: Take all the impactful edges make an attack by adding them. True values from harmful set + prediction!
-
-            # ---- selection statistics: tried vs harmful ----
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-            PRBCD.record_selection_statistics(
-                tried_set=tried_set,
-                harmful_set=harmful_set,
-                n_nodes=int(self.n),
-                device=self.device,
-                stats_dir="Plotting_Data/TrainingDataStats",
-                csv_prefix=(
-                    f"{timestamp}_"
-                    f"selection_dataset{self.dataset}_seed{self.seed}_"
-                    f"ads_{ads_mode}_drpmd{self.drop_mode}_"
-                    f"trnodecap{getattr(self, 'training_data_node_cap', 0)}"
-                ),
-                top_k=10,
-                extra={
-                    "timestamp": timestamp,
-                    "dataset": self.dataset,
-                    "seed": self.seed,
-                    "ads_mode": ads_mode,
-                    "drop_mode": self.drop_mode,
-                    "training_data_node_cap": int(getattr(self, "training_data_node_cap", 0)),
-                    "n_candidates_one_sample": int(getattr(self, "n_candidates_one_sample", 0)),
-                    "n_candidates_k_sample": int(getattr(self, "n_candidates_k_sample", 0)),
-                    "k_samples_batch": int(getattr(self, "k_samples_batch", 0)),
-                    "tau": float(getattr(self, "tau", 0.0)),
-                },
+        # Sample initial search space (Algorithm 1, line 3-4)
+        if use_cert in (
+                "accuracy_drop_selector",
+                "accuracy_drop_selector_with_resampling",
+        ):
+            print(
+                use_cert,
+                "-> sampling with accuracy drop selector",
             )
 
-            X, edge_index_struct = self.extract_X_and_edge_index_from_sparsegraph(graph)
-            stats = PRBCD.tried_add_del_proportion(tried_set, edge_index_struct, n=int(self.n))
-            print(stats)
-            print(edge_index_struct)
-            print(edge_index_lab)
-            print(y_label)
+            self._load_selector_params(
+                selector_params,
+                ads_mode=ads_mode,
+            )
 
-            edge_index_lab_small, y_label_small = (
-                PRBCD.reduce_balanced_edge_training_set(
+            # ==========================================================
+            # No LP model supplied:
+            # generate/load training data and train a new LP model
+            # ==========================================================
+
+            if self.lp_model is None:
+                print(
+                    "[LP-GNN] No LP model supplied. "
+                    "Generating/loading training data and training a model."
+                )
+
+                # ------------------------------------------------------
+                # Build training-data cache path
+                # ------------------------------------------------------
+
+                if self.drop_mode == "acc":
+                    cache_path = (
+                        f"cache/selection_dataset{self.dataset}"
+                        f"_seed{self.seed}"
+                        f"_ads_{ads_mode}"
+                        f"_k{self.n_candidates_k_sample}"
+                        f"_bt{self.k_samples_batch}"
+                        f"_drpmd{self.drop_mode}"
+                        f"_drp{self.acc_drop_threshold_k_samples}.pt"
+                    )
+
+                elif self.drop_mode == "loss":
+                    cache_path = (
+                        f"cache/selection_dataset{self.dataset}"
+                        f"_seed{self.seed}"
+                        f"_ads_{ads_mode}"
+                        f"_k{self.n_candidates_k_sample}"
+                        f"_bt{self.k_samples_batch}"
+                        f"_drpmd{self.drop_mode}"
+                        f"_drp{self.loss_drop_threshold_k_samples}.pt"
+                    )
+
+                elif self.drop_mode == "endpoint":
+                    if self.training_data_node_cap > 0:
+                        cache_path = (
+                            f"cache/selection_dataset{self.dataset}"
+                            f"_seed{self.seed}"
+                            f"_ads_{ads_mode}"
+                            f"_k{self.n_candidates_one_sample}"
+                            f"_drpmd{self.drop_mode}"
+                            f"_trnodecap{self.training_data_node_cap}.pt"
+                        )
+                    else:
+                        cache_path = (
+                            f"cache/selection_dataset{self.dataset}"
+                            f"_seed{self.seed}"
+                            f"_ads_{ads_mode}"
+                            f"_k{self.n_candidates_one_sample}"
+                            f"_drpmd{self.drop_mode}.pt"
+                        )
+
+                elif self.drop_mode == "endpointPRBCD":
+                    if self.training_data_node_cap > 0:
+                        cache_path = (
+                            f"cache/selection_dataset{self.dataset}"
+                            f"_seed{self.seed}"
+                            f"_ads_{ads_mode}"
+                            f"_k{self.n_candidates_one_sample}"
+                            f"_drpmd{self.drop_mode}"
+                            f"_trnodecap{self.training_data_node_cap}.pt"
+                        )
+                    else:
+                        cache_path = (
+                            f"cache/selection_dataset{self.dataset}"
+                            f"_seed{self.seed}"
+                            f"_ads_{ads_mode}"
+                            f"_k{self.n_candidates_one_sample}"
+                            f"_drpmd{self.drop_mode}.pt"
+                        )
+
+                else:
+                    raise ValueError(
+                        f"Unknown drop_mode: {self.drop_mode}"
+                    )
+
+                # ------------------------------------------------------
+                # Load or generate LP training data
+                # ------------------------------------------------------
+
+                if os.path.exists(cache_path):
+                    print("[CACHE] loading selection:", cache_path)
+
+                    (
+                        y_out,
+                        edge_index_lab,
+                        y_label,
+                        tried_set,
+                        harmful_set,
+                        sub_nodes,
+                        edge_index_sub,
+                        edge_weight_sub,
+                        edge_index_lab_local,
+                        X_sub,
+                        edge_index_struct_local,
+                        meta,
+                    ) = PRBCD.load_selection(
+                        cache_path,
+                        device=self.device,
+                    )
+
+                else:
+                    print(
+                        "[CACHE] computing selection and saving:",
+                        cache_path,
+                    )
+
+                    (
+                        y_out,
+                        edge_index_lab,
+                        y_label,
+                        tried_set,
+                        harmful_set,
+                    ) = self.label_edge_flips_prbcd_selfsample_fast(
+                        n_perturbations=n_perturbations,
+                        mode=ads_mode,
+                        drop_mode=self.drop_mode,
+                        n_candidates_k_sample=(
+                            self.n_candidates_k_sample
+                        ),
+                        n_candidates_one_sample=(
+                            self.n_candidates_one_sample
+                        ),
+                        acc_drop_threshold_k_samples=(
+                            self.acc_drop_threshold_k_samples
+                        ),
+                        loss_drop_threshold_k_samples=(
+                            self.loss_drop_threshold_k_samples
+                        ),
+                        k_samples_batch=self.k_samples_batch,
+                        training_data_node_cap=(
+                            self.training_data_node_cap
+                        ),
+                    )
+
+                    meta = {
+                        "ads_mode": self.ads_mode,
+                        "n_candidates_k_sample": (
+                            self.n_candidates_k_sample
+                        ),
+                        "acc_drop_threshold_k_samples": (
+                            self.acc_drop_threshold_k_samples
+                        ),
+                        "loss_drop_threshold_k_samples": (
+                            self.loss_drop_threshold_k_samples
+                        ),
+                    }
+
+                    PRBCD.save_selection(
+                        cache_path,
+                        y_out,
+                        edge_index_lab,
+                        y_label,
+                        tried_set,
+                        harmful_set,
+                        meta=meta,
+                    )
+
+                # ------------------------------------------------------
+                # Training-data statistics
+                # ------------------------------------------------------
+
+                timestamp = datetime.now().strftime(
+                    "%Y%m%d_%H%M%S"
+                )
+
+                PRBCD.record_selection_statistics(
+                    tried_set=tried_set,
+                    harmful_set=harmful_set,
+                    n_nodes=int(self.n),
+                    device=self.device,
+                    stats_dir="Plotting_Data/TrainingDataStats",
+                    csv_prefix=(
+                        f"{timestamp}_"
+                        f"selection_dataset{self.dataset}"
+                        f"_seed{self.seed}_"
+                        f"ads_{ads_mode}"
+                        f"_drpmd{self.drop_mode}_"
+                        f"trnodecap"
+                        f"{getattr(self, 'training_data_node_cap', 0)}"
+                    ),
+                    top_k=10,
+                    extra={
+                        "timestamp": timestamp,
+                        "dataset": self.dataset,
+                        "seed": self.seed,
+                        "ads_mode": ads_mode,
+                        "drop_mode": self.drop_mode,
+                        "training_data_node_cap": int(
+                            getattr(
+                                self,
+                                "training_data_node_cap",
+                                0,
+                            )
+                        ),
+                        "n_candidates_one_sample": int(
+                            getattr(
+                                self,
+                                "n_candidates_one_sample",
+                                0,
+                            )
+                        ),
+                        "n_candidates_k_sample": int(
+                            getattr(
+                                self,
+                                "n_candidates_k_sample",
+                                0,
+                            )
+                        ),
+                        "k_samples_batch": int(
+                            getattr(
+                                self,
+                                "k_samples_batch",
+                                0,
+                            )
+                        ),
+                        "tau": float(
+                            getattr(self, "tau", 0.0)
+                        ),
+                    },
+                )
+
+                # ------------------------------------------------------
+                # Prepare LP inputs
+                # ------------------------------------------------------
+
+                X, edge_index_struct = (
+                    self.extract_X_and_edge_index_from_sparsegraph(
+                        graph
+                    )
+                )
+
+                stats = PRBCD.tried_add_del_proportion(
+                    tried_set,
+                    edge_index_struct,
+                    n=int(self.n),
+                )
+
+                print(stats)
+                print(edge_index_struct)
+                print(edge_index_lab)
+                print(y_label)
+
+                (
+                    edge_index_lab_small,
+                    y_label_small,
+                ) = PRBCD.reduce_balanced_edge_training_set(
                     edge_index_lab=edge_index_lab,
                     y_label=y_label,
                     total_size=2184,
                 )
-            )
 
-            print(
-                f"Reduced set: M={y_label_small.numel()} | "
-                f"pos={(y_label_small == 1).sum().item()} | "
-                f"neg={(y_label_small == 0).sum().item()} | "
-                f"edge_index shape={tuple(edge_index_lab_small.shape)}"
-            )
+                print(
+                    f"Reduced set: M={y_label_small.numel()} | "
+                    f"pos={(y_label_small == 1).sum().item()} | "
+                    f"neg={(y_label_small == 0).sum().item()} | "
+                    f"edge_index shape="
+                    f"{tuple(edge_index_lab_small.shape)}"
+                )
 
-            if self.lp_model is None:
-                print("[LP-GNN] No pretrained LP model supplied. Training a new model.")
+                # ------------------------------------------------------
+                # Train LP model
+                # ------------------------------------------------------
 
                 self.lp_model = self.train_link_prediction_gnn(
                     x=X,
@@ -247,11 +483,37 @@ class PRBCD(SparseAttack):
                     use_tqdm=True,
                     verbose=True,
                 )
-            else:
-                print("[LP-GNN] Using supplied pretrained LP model. Skipping training.")
 
-                self.lp_model = self.lp_model.to(self.device)
+                'self.tried_set = tried_set'
+
+            # ==========================================================
+            # LP model already supplied:
+            # skip all data generation and training
+            # ==========================================================
+
+            else:
+                print(
+                    "[LP-GNN] Using supplied LP model. "
+                    "Skipping data generation and training."
+                )
+
+                self.lp_model = self.lp_model.to(
+                    self.device
+                )
                 self.lp_model.eval()
+
+                # No training candidates were generated in this attack
+                # execution.
+                self.tried_set = set()
+
+            # ==========================================================
+            # Shared LP-guided block construction
+            # ==========================================================
+
+            exclude_tried_for_sampling = (
+                    self.exclude_tried
+                    and len(self.tried_set) > 0
+            )
 
             self.sample_block_from_linkpred_threshold(
                 graph=graph,
@@ -259,11 +521,11 @@ class PRBCD(SparseAttack):
                 tau=self.tau,
                 score_batch_size=self.score_batch_size,
                 max_sampling_tries=self.max_sampling_tries,
-                rng_seed=int(self.seed or 0),
-                exclude_tried=self.exclude_tried,
+                rng_seed=attack_sampling_seed,
+                exclude_tried=exclude_tried_for_sampling,
             )
 
-            self.tried_set = tried_set
+            'self.tried_set = tried_set'
         elif use_cert in ("accuracy_drop_selector_subgraph_random", "accuracy_drop_selector_subgraph_khop", "accuracy_drop_selector_subgraph_growhop"):
             print(use_cert, "-> sampling with accuracy drop selector subgraph")
 
@@ -395,7 +657,14 @@ class PRBCD(SparseAttack):
 
             logging.info(f'\nBefore the attack - Loss: {loss.item()} Accuracy: {100 * accuracy:.3f} %\n')
 
-            self._append_attack_statistics(loss.item(), accuracy, 0., 0.)
+            self._append_attack_statistics(
+                loss=loss.item(),
+                accuracy=accuracy,
+                probability_mass_update=0.0,
+                probability_mass_projected=0.0,
+                epoch=None,
+                gradient=None,
+            )
 
             del logits, loss
 
@@ -451,23 +720,79 @@ class PRBCD(SparseAttack):
                     best_edge_index = self.modified_edge_index.clone().cpu()
                     best_edge_weight_diff = self.perturbed_edge_weight.detach().clone().cpu()
 
-                self._append_attack_statistics(loss, accuracy, probability_mass_update, probability_mass_projected)
+                self._append_attack_statistics(
+                    loss=loss,
+                    accuracy=accuracy,
+                    probability_mass_update=probability_mass_update,
+                    probability_mass_projected=probability_mass_projected,
+                    epoch=epoch,
+                    gradient=gradient,
+                )
 
                 # Resampling of search space (Algorithm 1, line 9-14)
+                # Resampling of search space
                 if epoch < self.epochs_resampling - 1:
-                    if use_cert in ("accuracy_drop_selector", "accuracy_drop_selector_subgraph", "accuracy_drop_selector_with_resampling"):
-                        print(use_cert, "run resampling with no certificate")
-                        if use_cert in ("accuracy_drop_selector_with_resampling", ):
-                            if epoch % 1 == 0:
-                                self.resample_block_from_linkpred_threshold(graph=graph,
-                                                                            n_perturbations=n_perturbations, score_batch_size=int(self.block_size/10), tau=max(self.tau-epoch*0.04,0.0))
+
+                    if self.rq1_enabled and not self.rq1_is_reference:
+                        rq1_before_resampling = (
+                            self.current_search_space
+                            .detach()
+                            .cpu()
+                            .long()
+                            .clone()
+                        )
+
+                    # ==========================================================
+                    # Keep your existing resampling logic here
+                    # ==========================================================
+
+                    if use_cert in (
+                            "accuracy_drop_selector",
+                            "accuracy_drop_selector_subgraph",
+                            "accuracy_drop_selector_with_resampling",
+                    ):
+                        if use_cert == "accuracy_drop_selector_with_resampling":
+                            self.resample_block_from_linkpred_threshold(
+                                graph=graph,
+                                n_perturbations=n_perturbations,
+                                score_batch_size=int(self.block_size / 10),
+                                tau=max(self.tau - epoch * 0.04, 0.0),
+
+                                # Give every resampling step a deterministic,
+                                # distinct stream.
+                                rng_seed=attack_sampling_seed + epoch + 1,
+                            )
                         else:
-                            self.resample_random_block(n_perturbations=n_perturbations, mod_block_size=self.block_size)
-                        pass
+                            self.resample_random_block(
+                                n_perturbations=n_perturbations,
+                                mod_block_size=self.block_size,
+                            )
                     else:
-                        print(use_cert, "run resampling with no certificate")
-                        self.resample_random_block(n_perturbations, mod_block_size=self.block_size)
-                        pass
+                        self.resample_random_block(
+                            n_perturbations=n_perturbations,
+                            mod_block_size=self.block_size,
+                        )
+
+                    # ==========================================================
+                    # Record the post-resampling block
+                    # ==========================================================
+
+                    if self.rq1_enabled and not self.rq1_is_reference:
+                        rq1_after_resampling = (
+                            self.current_search_space
+                            .detach()
+                            .cpu()
+                            .long()
+                            .clone()
+                        )
+
+                        self.attack_statistics["rq1"][
+                            "resample_events"
+                        ].append({
+                            "epoch": int(epoch),
+                            "before": rq1_before_resampling,
+                            "after": rq1_after_resampling,
+                        })
                 elif self.with_early_stopping and epoch == self.epochs_resampling - 1:
                     # Retreive best epoch if early stopping is active (not explicitly covered by pesudo code)
                     logging.info(
@@ -485,6 +810,36 @@ class PRBCD(SparseAttack):
 
         # Sample final discrete graph (Algorithm 1, line 16)
         edge_index = self.sample_final_edges(n_perturbations)[0]
+
+        if self.rq1_enabled:
+            final_space = (
+                self.current_search_space
+                .detach()
+                .cpu()
+                .long()
+            )
+
+            final_weights = (
+                self.perturbed_edge_weight
+                .detach()
+                .cpu()
+                .float()
+            )
+
+            if final_space.numel() != final_weights.numel():
+                raise RuntimeError(
+                    "Final current_search_space and "
+                    "perturbed_edge_weight are not aligned."
+                )
+
+            final_mask = final_weights > 0.5
+
+            self.attack_statistics["rq1"][
+                "final_linear_ids"
+            ] = torch.unique(
+                final_space[final_mask],
+                sorted=True,
+            )
 
         self.adj_adversary = SparseTensor.from_edge_index(
             edge_index,
@@ -3926,7 +4281,14 @@ class PRBCD(SparseAttack):
 
             logging.info(f'\nBefore the attack - Loss: {loss.item()} Accuracy: {100 * accuracy:.3f} %\n')
 
-            self._append_attack_statistics(loss.item(), accuracy, 0., 0.)
+            self._append_attack_statistics(
+                loss=loss,
+                accuracy=accuracy,
+                probability_mass_update=0.0,
+                probability_mass_projected=0.0,
+                epoch=None,
+                gradient=None,
+            )
 
             del logits, loss
 
@@ -5557,13 +5919,156 @@ class PRBCD(SparseAttack):
         self.current_node_search_space = torch.unique(torch.from_numpy(search_space), sorted=False)
         return
 
-    def _append_attack_statistics(self, loss: float, accuracy: float,
-                                  probability_mass_update: float, probability_mass_projected: float):
-        self.attack_statistics['loss'].append(loss)
-        self.attack_statistics['accuracy'].append(accuracy)
-        self.attack_statistics['nonzero_weights'].append((self.perturbed_edge_weight > self.eps).sum().item())
-        self.attack_statistics['probability_mass_update'].append(probability_mass_update)
-        self.attack_statistics['probability_mass_projected'].append(probability_mass_projected)
+    def _append_attack_statistics(
+            self,
+            loss,
+            accuracy,
+            probability_mass_update: float,
+            probability_mass_projected: float,
+            *,
+            epoch: Optional[int] = None,
+            gradient: Optional[torch.Tensor] = None,
+    ):
+        """
+        Record normal PRBCD metrics and the RQ1 state associated with the
+        current pre-resampling candidate block.
+
+        epoch=None represents the clean baseline before attack epoch 0.
+        """
+
+        def to_float(value) -> float:
+            if torch.is_tensor(value):
+                return float(value.detach().cpu().item())
+            return float(value)
+
+        loss_value = to_float(loss)
+        accuracy_value = to_float(accuracy)
+
+        # ----------------------------------------------------------
+        # Existing PRBCD statistics
+        # ----------------------------------------------------------
+
+        self.attack_statistics["loss"].append(loss_value)
+        self.attack_statistics["accuracy"].append(accuracy_value)
+
+        if getattr(self, "perturbed_edge_weight", None) is not None:
+            nonzero_weights = int(
+                (
+                        self.perturbed_edge_weight.detach()
+                        > self.eps
+                ).sum().item()
+            )
+        else:
+            nonzero_weights = 0
+
+        self.attack_statistics["nonzero_weights"].append(
+            nonzero_weights
+        )
+
+        self.attack_statistics[
+            "probability_mass_update"
+        ].append(float(probability_mass_update))
+
+        self.attack_statistics[
+            "probability_mass_projected"
+        ].append(float(probability_mass_projected))
+
+        # ----------------------------------------------------------
+        # No RQ1 recording requested
+        # ----------------------------------------------------------
+
+        if not self.rq1_enabled:
+            return
+
+        rq1 = self.attack_statistics["rq1"]
+
+        if getattr(self, "current_search_space", None) is None:
+            raise RuntimeError(
+                "RQ1 recording requires current_search_space."
+            )
+
+        current_ids = (
+            self.current_search_space
+            .detach()
+            .cpu()
+            .long()
+            .clone()
+        )
+
+        # ----------------------------------------------------------
+        # Clean baseline: save the initial sampled block
+        # ----------------------------------------------------------
+
+        if epoch is None:
+            rq1["initial_block"] = current_ids
+            return
+
+        current_weights = (
+            self.perturbed_edge_weight
+            .detach()
+            .cpu()
+            .float()
+            .clone()
+        )
+
+        if current_ids.numel() != current_weights.numel():
+            raise RuntimeError(
+                "current_search_space and perturbed_edge_weight "
+                "are not aligned."
+            )
+
+        # ----------------------------------------------------------
+        # Evaluation run: retain the actual block for each epoch
+        # ----------------------------------------------------------
+
+        if not self.rq1_is_reference:
+            rq1["epoch_blocks"][int(epoch)] = current_ids
+
+        # ----------------------------------------------------------
+        # Reference run: aggregate edge-level attack signals
+        # ----------------------------------------------------------
+
+        if self.rq1_is_reference:
+            if gradient is None:
+                gradient = getattr(self, "gradient", None)
+
+            if gradient is None:
+                raise RuntimeError(
+                    "RQ1 reference recording requires gradient."
+                )
+
+            current_gradient = (
+                gradient
+                .detach()
+                .cpu()
+                .float()
+                .clone()
+            )
+
+            if current_gradient.numel() != current_ids.numel():
+                raise RuntimeError(
+                    "gradient and current_search_space are not aligned."
+                )
+
+            rq1["positive_gradient_sum"].index_add_(
+                0,
+                current_ids,
+                current_gradient.clamp_min(0.0),
+            )
+
+            rq1["max_weight"][current_ids] = torch.maximum(
+                rq1["max_weight"][current_ids],
+                current_weights,
+            )
+
+            rq1["times_seen"].index_add_(
+                0,
+                current_ids,
+                torch.ones(
+                    current_ids.numel(),
+                    dtype=rq1["times_seen"].dtype,
+                ),
+            )
 
     def extract_X_and_edge_index_from_sparsegraph(self, graph):
         N, d = graph.attr_matrix.shape

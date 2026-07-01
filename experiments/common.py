@@ -114,26 +114,68 @@ def run_global_attack(
 
     n_perturbations = int(round(epsilon * m))
 
+    # ============================================================
+    # Build JSON-safe metadata for cache lookup and artifact saving
+    # ============================================================
+
+    cache_params = dict(pert_params)
+
+    # lp_model is usually nested inside attack_params.
+    if "attack_params" in cache_params:
+        cache_params["attack_params"] = dict(
+            cache_params["attack_params"]
+        )
+
+        lp_model_object = cache_params["attack_params"].pop(
+            "lp_model",
+            None,
+        )
+
+        if lp_model_object is not None:
+            cache_params["attack_params"]["lp_model_class"] = (
+                lp_model_object.__class__.__name__
+            )
+
+    # Handle the case where lp_model is directly inside pert_params.
+    lp_model_object = cache_params.pop("lp_model", None)
+
+    if lp_model_object is not None:
+        cache_params["lp_model_class"] = (
+            lp_model_object.__class__.__name__
+        )
+
+    artifact_params = {
+        **cache_params,
+        "epsilon": epsilon,
+    }
+
     pert_adj = storage.load_artifact(
         pert_adj_storage_type,
-        {**pert_params, **{"epsilon": epsilon}},
+        artifact_params,
     )
+
     pert_attr = storage.load_artifact(
         pert_attr_storage_type,
-        {**pert_params, **{"epsilon": epsilon}},
+        artifact_params,
     )
 
     gradient = None
 
     if pert_adj is not None and pert_attr is not None:
         logging.info(
-            f"Found cached perturbed adjacency and attribute matrix for model '{model_label}' and eps {epsilon}"
+            f"Found cached perturbed adjacency and attribute matrix "
+            f"for model '{model_label}' and eps {epsilon}"
         )
-        adversary.set_pertubations(pert_adj, pert_attr)
+
+        adversary.set_pertubations(
+            pert_adj,
+            pert_attr,
+        )
 
     else:
         logging.info(
-            f"No cached perturbations found for model '{model_label}' and eps {epsilon}. Execute attack..."
+            f"No cached perturbations found for model "
+            f"'{model_label}' and eps {epsilon}. Execute attack..."
         )
 
         import inspect
@@ -154,7 +196,8 @@ def run_global_attack(
             attack_kwargs["graph"] = graph
 
         # Backward compatibility:
-        # If PRBCD._attack still expects ads_mode explicitly, derive it from selector_params.
+        # If PRBCD._attack expects ads_mode explicitly,
+        # derive it from selector_params.
         attack_kwargs["ads_mode"] = selector_params.get(
             "accuracy_drop_selector_mode",
             "none",
@@ -167,12 +210,13 @@ def run_global_attack(
         if n_perturbations > 0:
             storage.save_artifact(
                 pert_adj_storage_type,
-                {**pert_params, **{"epsilon": epsilon}},
+                artifact_params,
                 pert_adj,
             )
+
             storage.save_artifact(
                 pert_attr_storage_type,
-                {**pert_params, **{"epsilon": epsilon}},
+                artifact_params,
                 pert_attr,
             )
 
