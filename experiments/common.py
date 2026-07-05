@@ -149,15 +149,24 @@ def run_global_attack(
         "epsilon": epsilon,
     }
 
-    pert_adj = storage.load_artifact(
-        pert_adj_storage_type,
-        artifact_params,
-    )
+    rq1_enabled = bool(getattr(adversary, "rq1_enabled", False))
 
-    pert_attr = storage.load_artifact(
-        pert_attr_storage_type,
-        artifact_params,
-    )
+    if rq1_enabled:
+        # RQ1 needs fresh per-epoch search-space diagnostics. Cached final
+        # perturbations contain only the final graph, not those diagnostics.
+        pert_adj = None
+        pert_attr = None
+        logging.info("RQ1 enabled: bypass perturbation cache.")
+    else:
+        pert_adj = storage.load_artifact(
+            pert_adj_storage_type,
+            artifact_params,
+        )
+
+        pert_attr = storage.load_artifact(
+            pert_attr_storage_type,
+            artifact_params,
+        )
 
     gradient = None
 
@@ -207,7 +216,7 @@ def run_global_attack(
 
         pert_adj, pert_attr = adversary.get_pertubations()
 
-        if n_perturbations > 0:
+        if n_perturbations > 0 and not rq1_enabled:
             storage.save_artifact(
                 pert_adj_storage_type,
                 artifact_params,

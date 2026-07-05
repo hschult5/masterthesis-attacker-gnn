@@ -84,16 +84,31 @@ def run(graph, data_dir: str, dataset: str, attack: str, attack_params: Dict[str
     last_gradient = None
     last_attack_stats = None
 
-    def _to_plain_list(seq):
-        out = []
-        for x in seq:
-            try:
-                out.append(float(x))
-            except Exception:
-                try:
-                    out.append(x.item())
-                except Exception:
-                    out.append(x)
+    def _copy_attack_statistics(obj):
+        """Detach/copy nested attack statistics without flattening dictionaries."""
+        if torch.is_tensor(obj):
+            value = obj.detach().cpu()
+            return value.item() if value.ndim == 0 else value.clone()
+
+        if isinstance(obj, np.ndarray):
+            return obj.copy()
+
+        if isinstance(obj, np.generic):
+            return obj.item()
+
+        if isinstance(obj, dict):
+            return {
+                key: _copy_attack_statistics(value)
+                for key, value in obj.items()
+            }
+
+        if isinstance(obj, list):
+            return [_copy_attack_statistics(value) for value in obj]
+
+        if isinstance(obj, tuple):
+            return tuple(_copy_attack_statistics(value) for value in obj)
+
+        return obj
         return out
 
     for model, hyperparams in models_and_hyperparams:
@@ -151,10 +166,22 @@ def run(graph, data_dir: str, dataset: str, attack: str, attack_params: Dict[str
             })
 
             stats_obj = getattr(adversary, "attack_statistics", None)
-            if stats_obj:
-                last_attack_stats = {k: _to_plain_list(v) for k, v in stats_obj.items()}
+            if stats_obj is not None:
+                last_attack_stats = _copy_attack_statistics(stats_obj)
             else:
                 last_attack_stats = {}
+
+            if getattr(adversary, "rq1_enabled", False):
+                rq1_stats = last_attack_stats.get("rq1")
+                if not isinstance(rq1_stats, dict):
+                    raise RuntimeError(
+                        "RQ1 is enabled, but attack_statistics['rq1'] "
+                        "was not returned as a dictionary."
+                    )
+                if "final_linear_ids" not in rq1_stats:
+                    raise RuntimeError(
+                        "RQ1 statistics are missing 'final_linear_ids'."
+                    )
 
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()

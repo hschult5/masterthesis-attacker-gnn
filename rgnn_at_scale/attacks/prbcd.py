@@ -105,7 +105,25 @@ class PRBCD(SparseAttack):
         else:
             self.n_possible_edges = self.n ** 2  # We filter self-loops later
 
-        self.lr_factor = lr_factor * max(math.log2(self.n_possible_edges / self.block_size), 1.)
+        # RQ1 reference runs use the complete edge-flip space as one fixed block.
+        # This makes all epochs behave like fine-tuning epochs: no block sampling
+        # or resampling is performed, and the learning-rate schedule starts in
+        # the fine-tuning regime immediately.
+        if self.rq1_is_reference:
+            self.block_size = int(self.n_possible_edges)
+            self.fine_tune_epochs = int(self.epochs)
+            self.epochs_resampling = 0
+
+        effective_block_size_for_lr = (
+            int(self.n_possible_edges)
+            if self.rq1_is_reference
+            else int(self.block_size)
+        )
+
+        self.lr_factor = lr_factor * max(
+            math.log2(self.n_possible_edges / effective_block_size_for_lr),
+            1.,
+        )
 
     def _attack(self, ads_mode, graph, n_perturbations, semi=False, use_cert="none", grid_radii: Optional[np.ndarray] = None, grid_binary_class: Optional[np.ndarray] = None, **kwargs):
         """Perform attack (`n_perturbations` is increasing as it was a greedy attack).
@@ -122,11 +140,11 @@ class PRBCD(SparseAttack):
 
         attack_sampling_seed = (
             int(self.rq1_sampling_seed)
-            if self.rq1_enabled
+            if (self.rq1_enabled or self.rq1_is_reference)
             else int(self.seed or 0)
         )
 
-        if self.rq1_enabled:
+        if self.rq1_enabled or self.rq1_is_reference:
             torch.manual_seed(attack_sampling_seed)
 
             if torch.cuda.is_available():
@@ -134,8 +152,14 @@ class PRBCD(SparseAttack):
 
         selector_params = kwargs.get("selector_params", {}) or {}
 
-        assert self.block_size > n_perturbations, \
-            f'The search space size ({self.block_size}) must be ' \
+        effective_search_space_size = (
+            int(self.n_possible_edges)
+            if self.rq1_is_reference
+            else int(self.block_size)
+        )
+
+        assert effective_search_space_size > n_perturbations, \
+            f'The search space size ({effective_search_space_size}) must be ' \
             + f'greater than the number of permutations ({n_perturbations})'
 
         # For early stopping (not explicitly covered by pesudo code)
@@ -163,6 +187,9 @@ class PRBCD(SparseAttack):
                     "sampling_seed": int(self.rq1_sampling_seed),
                     "is_reference": bool(self.rq1_is_reference),
                     "use_cert": str(use_cert),
+                    "full_space_reference": bool(self.rq1_is_reference),
+                    "n_possible_edges": int(self.n_possible_edges),
+                    "epochs_resampling": int(self.epochs_resampling),
                 },
             }
 
@@ -187,11 +214,19 @@ class PRBCD(SparseAttack):
         #tried_mask for selector exclusion
         self.tried_mask = torch.zeros(self.n_possible_edges, device=self.device, dtype=torch.bool)
 
-        breakpoint()
 
         # Sample initial search space (Algorithm 1, line 3-4)
-        # Sample initial search space (Algorithm 1, line 3-4)
-        if use_cert in (
+        # RQ1 reference: use the complete edge-flip space as a fixed block.
+        if self.rq1_is_reference:
+            print(
+                "[RQ1] reference run -> using full edge-flip search space "
+                "and disabling resampling"
+            )
+            self.sample_full_search_space(
+                n_perturbations=n_perturbations,
+            )
+
+        elif use_cert in (
                 "accuracy_drop_selector",
                 "accuracy_drop_selector_with_resampling",
         ):
@@ -730,8 +765,11 @@ class PRBCD(SparseAttack):
                 )
 
                 # Resampling of search space (Algorithm 1, line 9-14)
-                # Resampling of search space
-                if epoch < self.epochs_resampling - 1:
+                # RQ1 reference keeps the complete search space fixed for all epochs.
+                if self.rq1_is_reference:
+                    pass
+
+                elif epoch < self.epochs_resampling - 1:
 
                     if self.rq1_enabled and not self.rq1_is_reference:
                         rq1_before_resampling = (
@@ -1007,6 +1045,48 @@ class PRBCD(SparseAttack):
         self.perturbed_edge_weight.data[self.perturbed_edge_weight < self.eps] = self.eps
 
         return self.get_modified_adj()
+
+    def sample_full_search_space(self, n_perturbations: int = 0):
+        """Initialize the PRBCD block with every possible edge-flip variable.
+
+        This is intended for RQ1 reference runs. For undirected attacks, the
+        search space is exactly all upper-triangular node pairs. For directed
+        attacks, self-loops are removed after decoding, matching the existing
+        random-block behavior.
+        """
+        self.current_search_space = torch.arange(
+            self.n_possible_edges,
+            device=self.device,
+            dtype=torch.long,
+        )
+
+        if self.make_undirected:
+            self.modified_edge_index = PRBCD.linear_to_triu_idx(
+                self.n,
+                self.current_search_space,
+            )
+        else:
+            self.modified_edge_index = PRBCD.linear_to_full_idx(
+                self.n,
+                self.current_search_space,
+            )
+            is_not_self_loop = self.modified_edge_index[0] != self.modified_edge_index[1]
+            self.current_search_space = self.current_search_space[is_not_self_loop]
+            self.modified_edge_index = self.modified_edge_index[:, is_not_self_loop]
+
+        self.perturbed_edge_weight = torch.full_like(
+            self.current_search_space,
+            self.eps,
+            dtype=torch.float32,
+            requires_grad=True,
+        )
+
+        if self.current_search_space.size(0) < n_perturbations:
+            raise RuntimeError(
+                f"Full RQ1 reference search space has fewer edges "
+                f"({self.current_search_space.size(0)}) than "
+                f"n_perturbations={n_perturbations}."
+            )
 
     def sample_random_block(self, n_perturbations: int = 0, mod_block_size: int = 0):
         for _ in range(self.max_final_samples):
