@@ -14,7 +14,7 @@ import torch.nn.functional as F
 from sklearn.metrics import roc_auc_score, average_precision_score
 import torch_sparse
 from torch_sparse import SparseTensor
-from PriorSelector import PriorSelector
+from AttackerGNN.PriorSelector import PriorSelector
 from AttackerGNN.NodeBlockScorer import NodeBlockScorer
 import AttackerGNN.gnn_least_likely_edge as lle
 import AttackerGNN.gnn_score_all as sall
