@@ -14,7 +14,7 @@ import torch.nn.functional as F
 from sklearn.metrics import roc_auc_score, average_precision_score
 import torch_sparse
 from torch_sparse import SparseTensor
-from AttackerGNN.PriorSelector import PriorSelector
+from PriorSelector import PriorSelector
 from AttackerGNN.NodeBlockScorer import NodeBlockScorer
 import AttackerGNN.gnn_least_likely_edge as lle
 import AttackerGNN.gnn_score_all as sall
@@ -49,6 +49,14 @@ class PRBCD(SparseAttack):
             pre_hidden: int = 64,
             lp_model: Optional[torch.nn.Module] = None,
 
+            # Custom/fixed initial-block experiments (used by RQ2)
+            initial_block_linear_ids: Optional[List[int]] = None,
+            initial_block_path: Optional[str] = None,
+            initial_block_label: str = "",
+            resampling_enabled: bool = True,
+            block_diagnostics_enabled: bool = False,
+            attack_sampling_seed: Optional[int] = None,
+
             # RQ1
             rq1_enabled: bool = False,
             rq1_is_reference: bool = False,
@@ -61,6 +69,31 @@ class PRBCD(SparseAttack):
         # Existing initialization
         self.lp_model = lp_model
 
+        # Generic custom-block configuration.  A file path is preferred when
+        # attacks are launched through experiment runners that serialize their
+        # configuration.  The file may contain a tensor/list directly or a dict
+        # with one of: linear_ids, initial_block_linear_ids, current_search_space.
+        if initial_block_linear_ids is not None and initial_block_path is not None:
+            raise ValueError(
+                "Supply either initial_block_linear_ids or initial_block_path, not both."
+            )
+        self.initial_block_linear_ids = (
+            [int(value) for value in initial_block_linear_ids]
+            if initial_block_linear_ids is not None
+            else None
+        )
+        self.initial_block_path = (
+            str(initial_block_path) if initial_block_path is not None else None
+        )
+        self.initial_block_label = str(initial_block_label)
+        self.resampling_enabled = bool(resampling_enabled)
+        self.block_diagnostics_enabled = bool(block_diagnostics_enabled)
+        self.attack_sampling_seed = (
+            int(attack_sampling_seed)
+            if attack_sampling_seed is not None
+            else None
+        )
+
         # RQ1 configuration
         self.rq1_enabled = bool(rq1_enabled)
         self.rq1_is_reference = bool(rq1_is_reference)
@@ -69,6 +102,14 @@ class PRBCD(SparseAttack):
             if rq1_sampling_seed is not None
             else 0
         )
+
+        if self.rq1_is_reference and (
+            self.initial_block_linear_ids is not None
+            or self.initial_block_path is not None
+        ):
+            raise ValueError(
+                "rq1_is_reference cannot be combined with a custom initial block."
+            )
 
         self.keep_heuristic = keep_heuristic
         self.display_step = display_step
@@ -138,19 +179,37 @@ class PRBCD(SparseAttack):
         self.dataset = kwargs.get('dataset')
         self.seed = kwargs.get('seed')
 
-        attack_sampling_seed = (
-            int(self.rq1_sampling_seed)
-            if (self.rq1_enabled or self.rq1_is_reference)
-            else int(self.seed or 0)
-        )
+        if self.attack_sampling_seed is not None:
+            attack_sampling_seed = int(self.attack_sampling_seed)
+        elif self.rq1_enabled or self.rq1_is_reference:
+            attack_sampling_seed = int(self.rq1_sampling_seed)
+        else:
+            attack_sampling_seed = int(self.seed or 0)
 
-        if self.rq1_enabled or self.rq1_is_reference:
+        # Seed before constructing either a random block or any later refill.
+        if (
+            self.attack_sampling_seed is not None
+            or self.rq1_enabled
+            or self.rq1_is_reference
+            or self.block_diagnostics_enabled
+        ):
             torch.manual_seed(attack_sampling_seed)
 
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(attack_sampling_seed)
 
         selector_params = kwargs.get("selector_params", {}) or {}
+
+        # Load selector/resampling configuration before initial-block selection.
+        # This also makes selector settings available for custom initial blocks.
+        if use_cert in (
+                "accuracy_drop_selector",
+                "accuracy_drop_selector_with_resampling",
+        ):
+            self._load_selector_params(
+                selector_params,
+                ads_mode=ads_mode,
+            )
 
         effective_search_space_size = (
             int(self.n_possible_edges)
@@ -211,13 +270,57 @@ class PRBCD(SparseAttack):
                     dtype=torch.int32,
                 )
 
+        if self.block_diagnostics_enabled:
+            self.attack_statistics["block_diagnostics"] = {
+                "initial_block": None,
+                "epoch_blocks": {},
+                "resample_events": [],
+                "final_block": None,
+                "final_linear_ids": torch.empty(0, dtype=torch.long),
+                "metadata": {
+                    "block_size": int(self.block_size),
+                    "n_perturbations": int(n_perturbations),
+                    "sampling_seed": int(attack_sampling_seed),
+                    "initial_block_label": self.initial_block_label,
+                    "initial_block_path": self.initial_block_path,
+                    "custom_initial_block": bool(
+                        self.initial_block_linear_ids is not None
+                        or self.initial_block_path is not None
+                    ),
+                    "resampling_enabled": bool(self.resampling_enabled),
+                    "epochs": int(self.epochs),
+                    "fine_tune_epochs": int(self.fine_tune_epochs),
+                    "epochs_resampling": int(self.epochs_resampling),
+                    "n_possible_edges": int(self.n_possible_edges),
+                },
+            }
+
         #tried_mask for selector exclusion
         self.tried_mask = torch.zeros(self.n_possible_edges, device=self.device, dtype=torch.bool)
 
 
-        # Sample initial search space (Algorithm 1, line 3-4)
+        # Sample initial search space (Algorithm 1, line 3-4).
+        # A supplied block takes precedence over the ordinary random/selector
+        # initialization.  It does not, by itself, disable later resampling.
+        if (
+            self.initial_block_linear_ids is not None
+            or self.initial_block_path is not None
+        ):
+            initial_ids = self._load_initial_block_linear_ids()
+            print(
+                "[PRBCD] custom initial block -> "
+                f"{initial_ids.numel()} unique edge flips | "
+                f"label={self.initial_block_label!r} | "
+                f"resampling_enabled={self.resampling_enabled}"
+            )
+            self.init_search_space_from_linear_ids(
+                initial_ids,
+                n_perturbations=n_perturbations,
+                require_block_size_match=True,
+            )
+
         # RQ1 reference: use the complete edge-flip space as a fixed block.
-        if self.rq1_is_reference:
+        elif self.rq1_is_reference:
             print(
                 "[RQ1] reference run -> using full edge-flip search space "
                 "and disabling resampling"
@@ -519,7 +622,7 @@ class PRBCD(SparseAttack):
                     verbose=True,
                 )
 
-                'self.tried_set = tried_set'
+                self.tried_set = tried_set
 
             # ==========================================================
             # LP model already supplied:
@@ -545,10 +648,13 @@ class PRBCD(SparseAttack):
             # Shared LP-guided block construction
             # ==========================================================
 
-            exclude_tried_for_sampling = (
-                    self.exclude_tried
-                    and len(self.tried_set) > 0
-            )
+            # When exclude_tried=True, also exclude candidates evaluated while
+            # constructing the selector training data.
+            if self.exclude_tried and len(self.tried_set) > 0:
+                self.tried_mask = PRBCD.apply_tried_set_to_seen(
+                    self.tried_mask,
+                    self.tried_set,
+                )
 
             self.sample_block_from_linkpred_threshold(
                 graph=graph,
@@ -557,10 +663,10 @@ class PRBCD(SparseAttack):
                 score_batch_size=self.score_batch_size,
                 max_sampling_tries=self.max_sampling_tries,
                 rng_seed=attack_sampling_seed,
-                exclude_tried=exclude_tried_for_sampling,
+                exclude_tried=self.exclude_tried,
             )
 
-            'self.tried_set = tried_set'
+            # self.tried_set is assigned in the training/supplied-model branch.
         elif use_cert in ("accuracy_drop_selector_subgraph_random", "accuracy_drop_selector_subgraph_khop", "accuracy_drop_selector_subgraph_growhop"):
             print(use_cert, "-> sampling with accuracy drop selector subgraph")
 
@@ -764,9 +870,15 @@ class PRBCD(SparseAttack):
                     gradient=gradient,
                 )
 
+                # Reset on every epoch so non-selector epochs cannot reuse a
+                # previous epoch's result.
+                selector_resample_stats = None
+
                 # Resampling of search space (Algorithm 1, line 9-14)
-                # RQ1 reference keeps the complete search space fixed for all epochs.
-                if self.rq1_is_reference:
+                # A fixed-block arm skips only block replacement.  Importantly,
+                # epochs_resampling is left unchanged so its learning-rate schedule
+                # is directly comparable with the resampling arm.
+                if self.rq1_is_reference or not self.resampling_enabled:
                     pass
 
                 elif epoch < self.epochs_resampling - 1:
@@ -780,8 +892,18 @@ class PRBCD(SparseAttack):
                             .clone()
                         )
 
+                    if self.block_diagnostics_enabled:
+                        diagnostic_before_resampling = (
+                            self.current_search_space
+                            .detach()
+                            .cpu()
+                            .long()
+                            .clone()
+                        )
+
                     # ==========================================================
-                    # Keep your existing resampling logic here
+                    # Selector-guided resampling. The sweep's
+                    # selector_params["resampling_mode"] is authoritative.
                     # ==========================================================
 
                     if use_cert in (
@@ -790,16 +912,42 @@ class PRBCD(SparseAttack):
                             "accuracy_drop_selector_with_resampling",
                     ):
                         if use_cert == "accuracy_drop_selector_with_resampling":
-                            self.resample_block_from_linkpred_threshold(
-                                graph=graph,
-                                n_perturbations=n_perturbations,
-                                score_batch_size=int(self.block_size / 10),
-                                tau=max(self.tau - epoch * 0.04, 0.0),
-
-                                # Give every resampling step a deterministic,
-                                # distinct stream.
-                                rng_seed=attack_sampling_seed + epoch + 1,
-                            )
+                            if self.resampling_mode == "threshold":
+                                selector_resample_stats = (
+                                    self.resample_block_from_linkpred_threshold(
+                                        graph=graph,
+                                        n_perturbations=n_perturbations,
+                                        score_batch_size=self.score_batch_size,
+                                        max_sampling_tries=self.max_sampling_tries,
+                                        tau=max(
+                                            self.tau - epoch * 0.04,
+                                            0.0,
+                                        ),
+                                        exclude_tried=self.exclude_tried,
+                                        rng_seed=(
+                                            attack_sampling_seed + epoch + 1
+                                        ),
+                                    )
+                                )
+                            elif self.resampling_mode == "topk":
+                                selector_resample_stats = (
+                                    self.resample_block_from_linkpred_topk(
+                                        graph=graph,
+                                        n_perturbations=n_perturbations,
+                                        top_k_per_batch=self.top_k_per_batch,
+                                        score_batch_size=self.score_batch_size,
+                                        max_sampling_tries=self.max_sampling_tries,
+                                        exclude_tried=self.exclude_tried,
+                                        rng_seed=(
+                                            attack_sampling_seed + epoch + 1
+                                        ),
+                                    )
+                                )
+                            else:
+                                raise RuntimeError(
+                                    "Unsupported selector resampling mode: "
+                                    f"{self.resampling_mode!r}."
+                                )
                         else:
                             self.resample_random_block(
                                 n_perturbations=n_perturbations,
@@ -809,6 +957,44 @@ class PRBCD(SparseAttack):
                         self.resample_random_block(
                             n_perturbations=n_perturbations,
                             mod_block_size=self.block_size,
+                        )
+
+                    # Overwrite the placeholders created for this epoch.
+                    if selector_resample_stats is not None:
+                        self.attack_statistics[
+                            "selector_score_mean"
+                        ][-1] = float(
+                            selector_resample_stats["mean_score"]
+                        )
+                        self.attack_statistics[
+                            "selector_score_max"
+                        ][-1] = float(
+                            selector_resample_stats["max_score"]
+                        )
+                        self.attack_statistics[
+                            "selector_score_mean_of_try_maxes"
+                        ][-1] = float(
+                            selector_resample_stats["mean_max_score"]
+                        )
+                        self.attack_statistics[
+                            "selector_score_try_means"
+                        ][-1] = list(
+                            selector_resample_stats["try_means"]
+                        )
+                        self.attack_statistics[
+                            "selector_score_try_maxes"
+                        ][-1] = list(
+                            selector_resample_stats["try_maxes"]
+                        )
+                        self.attack_statistics[
+                            "selector_score_num_tries"
+                        ][-1] = int(
+                            selector_resample_stats["num_tries"]
+                        )
+                        self.attack_statistics[
+                            "selector_score_mode"
+                        ][-1] = str(
+                            selector_resample_stats["mode"]
                         )
 
                     # ==========================================================
@@ -830,6 +1016,22 @@ class PRBCD(SparseAttack):
                             "epoch": int(epoch),
                             "before": rq1_before_resampling,
                             "after": rq1_after_resampling,
+                        })
+
+                    if self.block_diagnostics_enabled:
+                        diagnostic_after_resampling = (
+                            self.current_search_space
+                            .detach()
+                            .cpu()
+                            .long()
+                            .clone()
+                        )
+                        self.attack_statistics["block_diagnostics"][
+                            "resample_events"
+                        ].append({
+                            "epoch": int(epoch),
+                            "before": diagnostic_before_resampling,
+                            "after": diagnostic_after_resampling,
                         })
                 elif self.with_early_stopping and epoch == self.epochs_resampling - 1:
                     # Retreive best epoch if early stopping is active (not explicitly covered by pesudo code)
@@ -876,6 +1078,33 @@ class PRBCD(SparseAttack):
                 "final_linear_ids"
             ] = torch.unique(
                 final_space[final_mask],
+                sorted=True,
+            )
+
+        if self.block_diagnostics_enabled:
+            final_space = (
+                self.current_search_space
+                .detach()
+                .cpu()
+                .long()
+                .clone()
+            )
+            final_weights = (
+                self.perturbed_edge_weight
+                .detach()
+                .cpu()
+                .float()
+                .clone()
+            )
+            if final_space.numel() != final_weights.numel():
+                raise RuntimeError(
+                    "Final current_search_space and perturbed_edge_weight "
+                    "are not aligned for block diagnostics."
+                )
+            diagnostics = self.attack_statistics["block_diagnostics"]
+            diagnostics["final_block"] = final_space
+            diagnostics["final_linear_ids"] = torch.unique(
+                final_space[final_weights > 0.5],
                 sorted=True,
             )
 
@@ -1045,6 +1274,104 @@ class PRBCD(SparseAttack):
         self.perturbed_edge_weight.data[self.perturbed_edge_weight < self.eps] = self.eps
 
         return self.get_modified_adj()
+
+    def _load_initial_block_linear_ids(self) -> torch.Tensor:
+        """Load and validate a custom block in PRBCD's linear edge-index space."""
+        if self.initial_block_linear_ids is not None:
+            payload = self.initial_block_linear_ids
+        elif self.initial_block_path is not None:
+            if not os.path.exists(self.initial_block_path):
+                raise FileNotFoundError(
+                    f"Custom PRBCD initial block not found: {self.initial_block_path}"
+                )
+            try:
+                payload = torch.load(
+                    self.initial_block_path,
+                    map_location="cpu",
+                    weights_only=False,
+                )
+            except TypeError:
+                # Compatibility with older PyTorch versions without weights_only.
+                payload = torch.load(self.initial_block_path, map_location="cpu")
+            if isinstance(payload, dict):
+                for key in (
+                    "linear_ids",
+                    "initial_block_linear_ids",
+                    "current_search_space",
+                ):
+                    if key in payload:
+                        payload = payload[key]
+                        break
+                else:
+                    raise KeyError(
+                        "Initial-block file must contain one of: linear_ids, "
+                        "initial_block_linear_ids, current_search_space."
+                    )
+        else:
+            raise RuntimeError("No custom initial block was configured.")
+
+        linear_ids = torch.as_tensor(payload, dtype=torch.long).flatten()
+        if linear_ids.numel() == 0:
+            raise ValueError("Custom PRBCD initial block is empty.")
+        if torch.any(linear_ids < 0) or torch.any(linear_ids >= self.n_possible_edges):
+            bad = linear_ids[(linear_ids < 0) | (linear_ids >= self.n_possible_edges)]
+            raise ValueError(
+                "Custom initial block contains out-of-range linear ids; "
+                f"examples={bad[:10].tolist()}, valid=[0, {self.n_possible_edges})."
+            )
+        return torch.unique(linear_ids, sorted=True)
+
+    def init_search_space_from_linear_ids(
+            self,
+            linear_ids: torch.Tensor,
+            n_perturbations: int = 0,
+            require_block_size_match: bool = True,
+    ):
+        """Initialize PRBCD from explicit linear candidate ids."""
+        current = torch.unique(
+            torch.as_tensor(linear_ids, dtype=torch.long, device=self.device).flatten(),
+            sorted=True,
+        )
+        if current.numel() == 0:
+            raise ValueError("Cannot initialize PRBCD from an empty block.")
+
+        if require_block_size_match and current.numel() != int(self.block_size):
+            raise ValueError(
+                "Configured block_size does not match the supplied custom block: "
+                f"block_size={self.block_size}, unique ids={current.numel()}."
+            )
+
+        self.current_search_space = current
+        if self.make_undirected:
+            self.modified_edge_index = PRBCD.linear_to_triu_idx(
+                self.n, self.current_search_space
+            )
+        else:
+            self.modified_edge_index = PRBCD.linear_to_full_idx(
+                self.n, self.current_search_space
+            )
+            is_not_self_loop = (
+                self.modified_edge_index[0] != self.modified_edge_index[1]
+            )
+            self.current_search_space = self.current_search_space[is_not_self_loop]
+            self.modified_edge_index = self.modified_edge_index[:, is_not_self_loop]
+
+        self.perturbed_edge_weight = torch.full(
+            (self.current_search_space.numel(),),
+            float(self.eps),
+            dtype=torch.float32,
+            device=self.device,
+            requires_grad=True,
+        )
+
+        if self.current_search_space.numel() <= int(n_perturbations):
+            raise RuntimeError(
+                "Custom initial block must contain more candidates than the "
+                f"attack budget: {self.current_search_space.numel()} <= "
+                f"{n_perturbations}."
+            )
+
+        return
 
     def sample_full_search_space(self, n_perturbations: int = 0):
         """Initialize the PRBCD block with every possible edge-flip variable.
@@ -1308,6 +1635,17 @@ class PRBCD(SparseAttack):
             with torch.no_grad():
                 logits = self.lp_model.edge_head(h, cand_ei).view(-1)
                 scores = torch.sigmoid(logits)
+
+            if not torch.isfinite(scores).all():
+                raise RuntimeError(
+                    "Selector produced NaN or infinite scores "
+                    "during initial threshold sampling."
+                )
+
+            # exclude_tried means candidates are excluded after they have been
+            # scored, not only after they have been selected.
+            if exclude_tried:
+                self.tried_mask[cand_lin] = True
 
             # accept those above threshold
             keep = scores >= float(tau)
@@ -2798,127 +3136,166 @@ class PRBCD(SparseAttack):
             "Increase pool_size or use strict=False fallback."
         )
 
+    @staticmethod
+    def _summarize_selector_resampling_scores(
+            *,
+            mode: str,
+            try_mean_scores: List[float],
+            try_max_scores: List[float],
+    ) -> Dict[str, Any]:
+        """Build scalar and per-try selector-score statistics."""
+        if len(try_mean_scores) != len(try_max_scores):
+            raise RuntimeError(
+                "Selector try-mean and try-max statistics are not aligned."
+            )
+
+        num_tries = len(try_mean_scores)
+        if num_tries == 0:
+            mean_score = float("nan")
+            max_score = float("nan")
+            mean_max_score = float("nan")
+        else:
+            mean_score = float(sum(try_mean_scores) / num_tries)
+            max_score = float(max(try_max_scores))
+            mean_max_score = float(sum(try_max_scores) / num_tries)
+
+        return {
+            "mode": str(mode),
+            "mean_score": mean_score,
+            "max_score": max_score,
+            "mean_max_score": mean_max_score,
+            "try_means": list(try_mean_scores),
+            "try_maxes": list(try_max_scores),
+            "num_tries": int(num_tries),
+        }
+
     def resample_block_from_linkpred_threshold(
             self,
             graph,
             n_perturbations: int,
             tau: float = 0.7,
             max_sampling_tries: int = 4_000_000,
-            score_batch_size: int = 10000,
+            score_batch_size: int = 10_000,
             rng_seed: int = 0,
             exclude_tried: bool = True,
-    ):
+    ) -> Dict[str, Any]:
+        """Refill the PRBCD block with selector scores above ``tau``.
+
+        A try is one actually scored candidate batch. For each try, this
+        records the mean and maximum sigmoid score. When ``exclude_tried`` is
+        enabled, every scored candidate is permanently excluded from later
+        tries and later resampling epochs, not only selected candidates.
         """
-        Resampling function, that encodes the link-pred GNN on the *current perturbed graph*
-        (via self.get_modified_adj()) instead of the unperturbed input `graph`.
-
-        Notes:
-          - We binarize the current attacked adjacency for the LP encoder by default:
-                keep edges with edge_weight > 0.5
-            (Adjust the threshold below if your LP model expects something else.)
-          - Candidate sampling is done from a restricted "allowed pool" derived from a single
-            combined block mask (block + tried), rather than sampling from the full space
-            and then cutting.
-        """
-
-        import torch
-
         if not hasattr(self, "lp_model") or self.lp_model is None:
             raise RuntimeError("self.lp_model is not set.")
 
-        # -----------------------------
-        # tried_mask init
-        # -----------------------------
-        if exclude_tried and (not hasattr(self, "tried_mask") or self.tried_mask is None):
-            self.tried_mask = torch.zeros(self.n_possible_edges, device=self.device, dtype=torch.bool)
-            if hasattr(self, "current_search_space") and self.current_search_space.numel() > 0:
-                self.tried_mask[self.current_search_space] = True
+        score_batch_size = max(1, int(score_batch_size))
+        max_sampling_tries = max(1, int(max_sampling_tries))
 
-        # -----------------------------
-        # keep step (same as PRBCD)
-        # -----------------------------
+        if exclude_tried and (
+                not hasattr(self, "tried_mask")
+                or self.tried_mask is None
+        ):
+            self.tried_mask = torch.zeros(
+                self.n_possible_edges,
+                device=self.device,
+                dtype=torch.bool,
+            )
+
+        # Standard PRBCD keep step.
         if self.keep_heuristic == "WeightOnly":
             sorted_idx = torch.argsort(self.perturbed_edge_weight)
-            idx_keep = (self.perturbed_edge_weight <= self.eps).sum().long()
+            idx_keep = (
+                self.perturbed_edge_weight <= self.eps
+            ).sum().long()
             if idx_keep < sorted_idx.size(0) // 2:
                 idx_keep = sorted_idx.size(0) // 2
         else:
-            raise NotImplementedError("Only keep_heuristic=`WeightOnly` supported")
+            raise NotImplementedError(
+                "Only keep_heuristic=`WeightOnly` supported"
+            )
 
         sorted_idx = sorted_idx[idx_keep:]
         self.current_search_space = self.current_search_space[sorted_idx]
         self.modified_edge_index = self.modified_edge_index[:, sorted_idx]
         self.perturbed_edge_weight = self.perturbed_edge_weight[sorted_idx]
 
-        # -----------------------------
-        # Build *perturbed* structure for LP encoder
-        # -----------------------------
-        # Features still come from `graph`, but structure comes from get_modified_adj()
+        n_needed = max(
+            0,
+            int(self.block_size) - int(self.current_search_space.numel()),
+        )
+        try_mean_scores: List[float] = []
+        try_max_scores: List[float] = []
+
+        if n_needed == 0:
+            return PRBCD._summarize_selector_resampling_scores(
+                mode="threshold",
+                try_mean_scores=try_mean_scores,
+                try_max_scores=try_max_scores,
+            )
+
+        # Encode the current perturbed structure once for this refill.
         X, _ = self.extract_X_and_edge_index_from_sparsegraph(graph)
         X = X.to(self.device)
 
         with torch.no_grad():
-            edge_index_mod, edge_weight_mod = self.get_modified_adj()
-            edge_index_mod = edge_index_mod.to(self.device)
-            edge_weight_mod = edge_weight_mod.to(self.device).float()
+            edge_index_mod, _ = self.get_modified_adj()
+            edge_index_struct = edge_index_mod.to(self.device)
 
-            edge_index_struct = edge_index_mod
-
-            '''# Binarize attacked adjacency for message passing
-            present = edge_weight_mod > 0.5
-            edge_index_struct = edge_index_mod[:, present]'''
-
-        # encode once
         self.lp_model = self.lp_model.to(self.device).eval()
         with torch.no_grad():
             h = self.lp_model.encoder(X, edge_index_struct)
 
-        g = torch.Generator(device=self.device)
-        g.manual_seed(int(rng_seed))
+        generator = torch.Generator(device=self.device)
+        generator.manual_seed(int(rng_seed))
 
-        # -----------------------------
-        # masks for uniqueness within the block
-        # -----------------------------
-        block_mask = torch.zeros(self.n_possible_edges, device=self.device, dtype=torch.bool)
+        blocked_mask = torch.zeros(
+            self.n_possible_edges,
+            device=self.device,
+            dtype=torch.bool,
+        )
         if self.current_search_space.numel() > 0:
-            block_mask[self.current_search_space] = True
-
-        # Combine masks: "blocked" = in block OR (optionally) already tried
-        blocked_mask = block_mask.clone()
+            blocked_mask[self.current_search_space] = True
         if exclude_tried:
             blocked_mask |= self.tried_mask
 
-        # Allowed pool: indices we can sample from (NOT blocked)
-        allowed_pool = torch.nonzero(~blocked_mask, as_tuple=False).view(-1)
+        # Local pool shrinking prevents duplicate scoring within this refill,
+        # independently of the cross-epoch exclude_tried setting.
+        allowed_pool = torch.nonzero(
+            ~blocked_mask,
+            as_tuple=False,
+        ).view(-1)
 
-        accepted = []
+        # Draw one random order and consume it sequentially. This avoids an
+        # expensive full-pool randperm on every try while still guaranteeing
+        # that no candidate is scored twice within this refill.
+        sampling_order = torch.randperm(
+            allowed_pool.numel(),
+            device=self.device,
+            generator=generator,
+        )
+        sampling_cursor = 0
+
+        accepted_ids: List[torch.Tensor] = []
+        accepted_count = 0
         tries = 0
-        n_needed = int(self.block_size - self.current_search_space.numel())
 
-        # If we already have enough, skip refill loop
-        if n_needed < 0:
-            n_needed = 0
-
-        while len(accepted) < n_needed and tries < int(max_sampling_tries):
+        while (
+                accepted_count < n_needed
+                and tries < max_sampling_tries
+                and sampling_cursor < int(sampling_order.numel())
+        ):
             tries += 1
+            batch_end = min(
+                sampling_cursor + score_batch_size,
+                int(sampling_order.numel()),
+            )
+            batch_positions = sampling_order[
+                sampling_cursor:batch_end
+            ]
+            sampling_cursor = batch_end
+            cand_lin = allowed_pool[batch_positions]
 
-            # Nothing left to sample from -> cannot refill
-            if allowed_pool.numel() == 0:
-                break
-
-            # sample directly from allowed pool (restricted sampling)
-            k = min(int(score_batch_size), int(allowed_pool.numel()))
-            idx = torch.randint(allowed_pool.numel(), (k,), device=self.device, generator=g)
-            cand_lin = allowed_pool[idx]
-            cand_lin = torch.unique(cand_lin, sorted=False)
-
-            # Pool can be slightly stale because we accept edges and update block_mask.
-            # Filter out edges that have become blocked since pool creation.
-            cand_lin = cand_lin[~block_mask[cand_lin]]
-            if cand_lin.numel() == 0:
-                continue
-
-            # decode to pairs
             if self.make_undirected:
                 cand_ei = PRBCD.linear_to_triu_idx(self.n, cand_lin)
             else:
@@ -2929,71 +3306,81 @@ class PRBCD(SparseAttack):
                 if cand_lin.numel() == 0:
                     continue
 
-            # score candidates
             with torch.no_grad():
                 logits = self.lp_model.edge_head(h, cand_ei).view(-1)
                 scores = torch.sigmoid(logits)
 
-            keep = scores >= float(tau)
-            cand_keep = cand_lin[keep]
-            if cand_keep.numel() == 0:
+            if scores.numel() == 0:
+                continue
+            if not torch.isfinite(scores).all():
+                raise RuntimeError(
+                    "Selector produced NaN or infinite scores during "
+                    "threshold resampling."
+                )
+
+            try_mean_scores.append(float(scores.mean().item()))
+            try_max_scores.append(float(scores.max().item()))
+
+            if exclude_tried:
+                # A candidate becomes tried as soon as it is scored.
+                self.tried_mask[cand_lin] = True
+
+            selected = cand_lin[scores >= float(tau)]
+            if selected.numel() == 0:
                 continue
 
-            need = n_needed - len(accepted)
-            cand_keep = cand_keep[:need]
+            remaining = n_needed - accepted_count
+            selected = selected[:remaining]
+            accepted_ids.append(selected)
+            accepted_count += int(selected.numel())
 
-            accepted.extend(cand_keep.tolist())
-
-            # update block_mask for uniqueness
-            block_mask[cand_keep] = True
-
-            # also update blocked_mask + allowed_pool if you want to keep pool tight
-            # (this avoids repeatedly drawing now-blocked edges)
-            if cand_keep.numel() > 0:
-                blocked_mask[cand_keep] = True
-                # remove newly blocked edges from pool
-                # (cheap: just filter pool by blocked_mask)
-                allowed_pool = allowed_pool[~blocked_mask[allowed_pool]]
-
-        if len(accepted) < n_needed:
+        if accepted_count < n_needed:
             raise RuntimeError(
-                f"Could not refill to block_size with tau={tau}. "
-                f"Needed {n_needed}, got {len(accepted)} after {tries} tries. Lower tau / increase tries."
+                "Could not refill the threshold block: "
+                f"tau={tau}, needed={n_needed}, accepted={accepted_count}, "
+                f"scored_tries={len(try_mean_scores)}, "
+                f"loop_tries={tries}. Lower tau or increase the eligible "
+                "candidate space."
             )
 
-        fill_lin = torch.tensor(accepted, device=self.device, dtype=torch.long)
-
-        # -----------------------------
-        # merge like PRBCD (but correct mapping of old weights)
-        # -----------------------------
+        fill_lin = torch.cat(accepted_ids, dim=0)
         old_space = self.current_search_space
-        old_w = self.perturbed_edge_weight.clone()
+        old_weights = self.perturbed_edge_weight.clone()
 
-        concat = torch.cat((old_space, fill_lin), dim=0)
+        combined_space = torch.cat((old_space, fill_lin), dim=0)
+        new_space, inverse = torch.unique(
+            combined_space,
+            sorted=True,
+            return_inverse=True,
+        )
 
-        # unique edges in the new block
-        new_space, inv = torch.unique(concat, sorted=True, return_inverse=True)
-
-        # initialize all new weights to eps
-        new_w = torch.full((new_space.numel(),), float(self.eps), device=self.device, dtype=torch.float32)
-
-        # map old weights into their positions in new_space
-        old_len = old_space.numel()
-        new_w[inv[:old_len]] = old_w
+        new_weights = torch.full(
+            (new_space.numel(),),
+            float(self.eps),
+            device=self.device,
+            dtype=torch.float32,
+        )
+        old_length = int(old_space.numel())
+        if old_length > 0:
+            new_weights[inverse[:old_length]] = old_weights
 
         self.current_search_space = new_space
+        self.perturbed_edge_weight = new_weights
 
-        # rebuild modified_edge_index from new_space
         if self.make_undirected:
-            self.modified_edge_index = PRBCD.linear_to_triu_idx(self.n, self.current_search_space)
+            self.modified_edge_index = PRBCD.linear_to_triu_idx(
+                self.n,
+                self.current_search_space,
+            )
         else:
-            self.modified_edge_index = PRBCD.linear_to_full_idx(self.n, self.current_search_space)
-
-        self.perturbed_edge_weight = new_w
-
-        # directed: remove self-loops if any (keep tensors aligned)
-        if not self.make_undirected:
-            is_not_self = self.modified_edge_index[0] != self.modified_edge_index[1]
+            self.modified_edge_index = PRBCD.linear_to_full_idx(
+                self.n,
+                self.current_search_space,
+            )
+            is_not_self = (
+                self.modified_edge_index[0]
+                != self.modified_edge_index[1]
+            )
             self.current_search_space = self.current_search_space[is_not_self]
             self.modified_edge_index = self.modified_edge_index[:, is_not_self]
             self.perturbed_edge_weight = self.perturbed_edge_weight[is_not_self]
@@ -3001,8 +3388,264 @@ class PRBCD(SparseAttack):
         if exclude_tried:
             self.tried_mask[self.current_search_space] = True
 
-        if self.current_search_space.size(0) <= n_perturbations:
-            raise RuntimeError("Block ended up too small. Lower tau.")
+        if self.current_search_space.size(0) <= int(n_perturbations):
+            raise RuntimeError("Threshold PRBCD block ended up too small.")
+
+        return PRBCD._summarize_selector_resampling_scores(
+            mode="threshold",
+            try_mean_scores=try_mean_scores,
+            try_max_scores=try_max_scores,
+        )
+
+    def resample_block_from_linkpred_topk(
+            self,
+            graph,
+            n_perturbations: int,
+            top_k_per_batch: int = 100,
+            score_batch_size: int = 10_000,
+            max_sampling_tries: int = 4_000_000,
+            rng_seed: int = 0,
+            exclude_tried: bool = True,
+    ) -> Dict[str, Any]:
+        """Refill the PRBCD block using batch-wise selector top-k.
+
+        Each candidate is scored at most once during a refill. With
+        ``exclude_tried=True``, every scored candidate is also excluded from
+        all later refills. Per-try mean and maximum scores are returned.
+        """
+        if not hasattr(self, "lp_model") or self.lp_model is None:
+            raise RuntimeError("self.lp_model is not set.")
+
+        score_batch_size = max(1, int(score_batch_size))
+        top_k_per_batch = max(1, int(top_k_per_batch))
+        max_sampling_tries = max(1, int(max_sampling_tries))
+
+        if exclude_tried and (
+                not hasattr(self, "tried_mask")
+                or self.tried_mask is None
+        ):
+            self.tried_mask = torch.zeros(
+                self.n_possible_edges,
+                device=self.device,
+                dtype=torch.bool,
+            )
+
+        # Standard PRBCD keep step.
+        if self.keep_heuristic == "WeightOnly":
+            sorted_idx = torch.argsort(self.perturbed_edge_weight)
+            idx_keep = (
+                self.perturbed_edge_weight <= self.eps
+            ).sum().long()
+            if idx_keep < sorted_idx.size(0) // 2:
+                idx_keep = sorted_idx.size(0) // 2
+        else:
+            raise NotImplementedError(
+                "Only keep_heuristic=`WeightOnly` supported"
+            )
+
+        sorted_idx = sorted_idx[idx_keep:]
+        self.current_search_space = self.current_search_space[sorted_idx]
+        self.modified_edge_index = self.modified_edge_index[:, sorted_idx]
+        self.perturbed_edge_weight = self.perturbed_edge_weight[sorted_idx]
+
+        n_needed = max(
+            0,
+            int(self.block_size) - int(self.current_search_space.numel()),
+        )
+        try_mean_scores: List[float] = []
+        try_max_scores: List[float] = []
+
+        if n_needed == 0:
+            return PRBCD._summarize_selector_resampling_scores(
+                mode="topk",
+                try_mean_scores=try_mean_scores,
+                try_max_scores=try_max_scores,
+            )
+
+        X, _ = self.extract_X_and_edge_index_from_sparsegraph(graph)
+        X = X.to(self.device)
+
+        with torch.no_grad():
+            edge_index_mod, _ = self.get_modified_adj()
+            edge_index_struct = edge_index_mod.to(self.device)
+
+        self.lp_model = self.lp_model.to(self.device).eval()
+        with torch.no_grad():
+            h = self.lp_model.encoder(X, edge_index_struct)
+
+        generator = torch.Generator(device=self.device)
+        generator.manual_seed(int(rng_seed))
+
+        blocked_mask = torch.zeros(
+            self.n_possible_edges,
+            device=self.device,
+            dtype=torch.bool,
+        )
+        if self.current_search_space.numel() > 0:
+            blocked_mask[self.current_search_space] = True
+        if exclude_tried:
+            blocked_mask |= self.tried_mask
+
+        allowed_pool = torch.nonzero(
+            ~blocked_mask,
+            as_tuple=False,
+        ).view(-1)
+
+        if allowed_pool.numel() < n_needed:
+            raise RuntimeError(
+                "Not enough eligible candidates for top-k refill: "
+                f"needed={n_needed}, eligible={allowed_pool.numel()}, "
+                f"exclude_tried={exclude_tried}."
+            )
+
+        minimum_required_tries = (
+            n_needed + top_k_per_batch - 1
+        ) // top_k_per_batch
+        if max_sampling_tries < minimum_required_tries:
+            raise RuntimeError(
+                "max_sampling_tries is too small for top-k refill: "
+                f"minimum={minimum_required_tries}, "
+                f"configured={max_sampling_tries}."
+            )
+
+        # One random order gives fresh, non-overlapping batches without
+        # rebuilding a full-pool permutation on every try.
+        sampling_order = torch.randperm(
+            allowed_pool.numel(),
+            device=self.device,
+            generator=generator,
+        )
+        sampling_cursor = 0
+
+        accepted_ids: List[torch.Tensor] = []
+        accepted_count = 0
+        tries = 0
+
+        while (
+                accepted_count < n_needed
+                and tries < max_sampling_tries
+                and sampling_cursor < int(sampling_order.numel())
+        ):
+            tries += 1
+            batch_end = min(
+                sampling_cursor + score_batch_size,
+                int(sampling_order.numel()),
+            )
+            batch_positions = sampling_order[
+                sampling_cursor:batch_end
+            ]
+            sampling_cursor = batch_end
+            cand_lin = allowed_pool[batch_positions]
+
+            if self.make_undirected:
+                cand_ei = PRBCD.linear_to_triu_idx(self.n, cand_lin)
+            else:
+                cand_ei = PRBCD.linear_to_full_idx(self.n, cand_lin)
+                is_not_self = cand_ei[0] != cand_ei[1]
+                cand_lin = cand_lin[is_not_self]
+                cand_ei = cand_ei[:, is_not_self]
+                if cand_lin.numel() == 0:
+                    continue
+
+            with torch.no_grad():
+                logits = self.lp_model.edge_head(h, cand_ei).view(-1)
+                scores = torch.sigmoid(logits)
+
+            if scores.numel() == 0:
+                continue
+            if not torch.isfinite(scores).all():
+                raise RuntimeError(
+                    "Selector produced NaN or infinite scores during "
+                    "top-k resampling."
+                )
+
+            try_mean_scores.append(float(scores.mean().item()))
+            try_max_scores.append(float(scores.max().item()))
+
+            if exclude_tried:
+                # Exclude every scored candidate across later epochs.
+                self.tried_mask[cand_lin] = True
+
+            current_k = min(top_k_per_batch, int(scores.numel()))
+            _, top_positions = torch.topk(
+                scores,
+                k=current_k,
+                largest=True,
+                sorted=True,
+            )
+            batch_top_ids = cand_lin[top_positions]
+
+            remaining = n_needed - accepted_count
+            batch_top_ids = batch_top_ids[:remaining]
+            accepted_ids.append(batch_top_ids)
+            accepted_count += int(batch_top_ids.numel())
+
+        if accepted_count < n_needed:
+            raise RuntimeError(
+                "Could not refill the top-k block: "
+                f"needed={n_needed}, accepted={accepted_count}, "
+                f"scored_tries={len(try_mean_scores)}, "
+                f"loop_tries={tries}, exclude_tried={exclude_tried}."
+            )
+
+        fill_lin = torch.cat(accepted_ids, dim=0)
+        if fill_lin.numel() != n_needed:
+            raise RuntimeError(
+                "Top-k refill produced the wrong number of candidates: "
+                f"expected={n_needed}, actual={fill_lin.numel()}."
+            )
+
+        old_space = self.current_search_space
+        old_weights = self.perturbed_edge_weight.clone()
+        combined_space = torch.cat((old_space, fill_lin), dim=0)
+        new_space, inverse = torch.unique(
+            combined_space,
+            sorted=True,
+            return_inverse=True,
+        )
+
+        new_weights = torch.full(
+            (new_space.numel(),),
+            float(self.eps),
+            device=self.device,
+            dtype=torch.float32,
+        )
+        old_length = int(old_space.numel())
+        if old_length > 0:
+            new_weights[inverse[:old_length]] = old_weights
+
+        self.current_search_space = new_space
+        self.perturbed_edge_weight = new_weights
+
+        if self.make_undirected:
+            self.modified_edge_index = PRBCD.linear_to_triu_idx(
+                self.n,
+                self.current_search_space,
+            )
+        else:
+            self.modified_edge_index = PRBCD.linear_to_full_idx(
+                self.n,
+                self.current_search_space,
+            )
+            is_not_self = (
+                self.modified_edge_index[0]
+                != self.modified_edge_index[1]
+            )
+            self.current_search_space = self.current_search_space[is_not_self]
+            self.modified_edge_index = self.modified_edge_index[:, is_not_self]
+            self.perturbed_edge_weight = self.perturbed_edge_weight[is_not_self]
+
+        if exclude_tried:
+            self.tried_mask[self.current_search_space] = True
+
+        if self.current_search_space.size(0) <= int(n_perturbations):
+            raise RuntimeError("Top-k PRBCD block ended up too small.")
+
+        return PRBCD._summarize_selector_resampling_scores(
+            mode="topk",
+            try_mean_scores=try_mean_scores,
+            try_max_scores=try_max_scores,
+        )
 
     def label_edge_flips_prbcd_selfsample(
             self,
@@ -6053,6 +6696,44 @@ class PRBCD(SparseAttack):
             "probability_mass_projected"
         ].append(float(probability_mass_projected))
 
+        # Keep selector-resampling statistics aligned with every attack row.
+        # The clean baseline is represented by epoch -1. Epochs without
+        # selector-guided resampling retain the placeholder values.
+        self.attack_statistics["epoch"].append(
+            -1 if epoch is None else int(epoch)
+        )
+        self.attack_statistics["selector_score_mean"].append(float("nan"))
+        self.attack_statistics["selector_score_max"].append(float("nan"))
+        self.attack_statistics[
+            "selector_score_mean_of_try_maxes"
+        ].append(float("nan"))
+        self.attack_statistics["selector_score_try_means"].append([])
+        self.attack_statistics["selector_score_try_maxes"].append([])
+        self.attack_statistics["selector_score_num_tries"].append(0)
+        self.attack_statistics["selector_score_mode"].append(None)
+
+        # ----------------------------------------------------------
+        # Generic block-history diagnostics
+        # ----------------------------------------------------------
+
+        if self.block_diagnostics_enabled:
+            if getattr(self, "current_search_space", None) is None:
+                raise RuntimeError(
+                    "Block diagnostics require current_search_space."
+                )
+            diagnostic_ids = (
+                self.current_search_space
+                .detach()
+                .cpu()
+                .long()
+                .clone()
+            )
+            diagnostics = self.attack_statistics["block_diagnostics"]
+            if epoch is None:
+                diagnostics["initial_block"] = diagnostic_ids
+            else:
+                diagnostics["epoch_blocks"][int(epoch)] = diagnostic_ids
+
         # ----------------------------------------------------------
         # No RQ1 recording requested
         # ----------------------------------------------------------
@@ -6547,9 +7228,30 @@ class PRBCD(SparseAttack):
             2_000_000,
         )
 
-        self.exclude_tried = selector_params.get(
+        self.exclude_tried = bool(selector_params.get(
             "exclude_tried",
             True,
+        ))
+
+        raw_resampling_mode = str(
+            selector_params.get("resampling_mode", "threshold")
+        ).strip().lower()
+
+        # Accept the historical typo, but store only canonical values.
+        if raw_resampling_mode == "theshold":
+            raw_resampling_mode = "threshold"
+
+        if raw_resampling_mode not in {"threshold", "topk"}:
+            raise ValueError(
+                "selector_params['resampling_mode'] must be "
+                "'threshold' or 'topk', got "
+                f"{raw_resampling_mode!r}."
+            )
+
+        self.resampling_mode = raw_resampling_mode
+        self.top_k_per_batch = max(
+            1,
+            int(selector_params.get("top_k_per_batch", 100)),
         )
 
         self.lp_hit_rate_detour = selector_params.get("lp_hit_rate_detour", False)
