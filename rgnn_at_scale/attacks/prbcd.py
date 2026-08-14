@@ -51,7 +51,6 @@ class PRBCD(SparseAttack):
 
             # Custom/fixed initial-block experiments (used by RQ2)
             initial_block_linear_ids: Optional[List[int]] = None,
-            initial_block_path: Optional[str] = None,
             initial_block_label: str = "",
             resampling_enabled: bool = True,
             block_diagnostics_enabled: bool = False,
@@ -69,23 +68,15 @@ class PRBCD(SparseAttack):
         # Existing initialization
         self.lp_model = lp_model
 
-        # Generic custom-block configuration.  A file path is preferred when
-        # attacks are launched through experiment runners that serialize their
-        # configuration.  The file may contain a tensor/list directly or a dict
-        # with one of: linear_ids, initial_block_linear_ids, current_search_space.
-        if initial_block_linear_ids is not None and initial_block_path is not None:
-            raise ValueError(
-                "Supply either initial_block_linear_ids or initial_block_path, not both."
-            )
+        # Initial Block from RQ2 initial block Experiment
         self.initial_block_linear_ids = (
-            [int(value) for value in initial_block_linear_ids]
+            initial_block_linear_ids
             if initial_block_linear_ids is not None
             else None
         )
-        self.initial_block_path = (
-            str(initial_block_path) if initial_block_path is not None else None
-        )
         self.initial_block_label = str(initial_block_label)
+
+        # indicates whether resampling is enabled
         self.resampling_enabled = bool(resampling_enabled)
         self.block_diagnostics_enabled = bool(block_diagnostics_enabled)
         self.attack_sampling_seed = (
@@ -300,23 +291,14 @@ class PRBCD(SparseAttack):
 
 
         # Sample initial search space (Algorithm 1, line 3-4).
-        # A supplied block takes precedence over the ordinary random/selector
-        # initialization.  It does not, by itself, disable later resampling.
+        # Supplied Block takes prescedent over sampling
         if (
             self.initial_block_linear_ids is not None
             or self.initial_block_path is not None
         ):
             initial_ids = self._load_initial_block_linear_ids()
-            print(
-                "[PRBCD] custom initial block -> "
-                f"{initial_ids.numel()} unique edge flips | "
-                f"label={self.initial_block_label!r} | "
-                f"resampling_enabled={self.resampling_enabled}"
-            )
             self.init_search_space_from_linear_ids(
                 initial_ids,
-                n_perturbations=n_perturbations,
-                require_block_size_match=True,
             )
 
         # RQ1 reference: use the complete edge-flip space as a fixed block.
@@ -1324,23 +1306,13 @@ class PRBCD(SparseAttack):
     def init_search_space_from_linear_ids(
             self,
             linear_ids: torch.Tensor,
-            n_perturbations: int = 0,
-            require_block_size_match: bool = True,
     ):
         """Initialize PRBCD from explicit linear candidate ids."""
         current = torch.unique(
             torch.as_tensor(linear_ids, dtype=torch.long, device=self.device).flatten(),
             sorted=True,
         )
-        if current.numel() == 0:
-            raise ValueError("Cannot initialize PRBCD from an empty block.")
-
-        if require_block_size_match and current.numel() != int(self.block_size):
-            raise ValueError(
-                "Configured block_size does not match the supplied custom block: "
-                f"block_size={self.block_size}, unique ids={current.numel()}."
-            )
-
+        # Logic from Original PR-BCD
         self.current_search_space = current
         if self.make_undirected:
             self.modified_edge_index = PRBCD.linear_to_triu_idx(
@@ -1363,13 +1335,6 @@ class PRBCD(SparseAttack):
             device=self.device,
             requires_grad=True,
         )
-
-        if self.current_search_space.numel() <= int(n_perturbations):
-            raise RuntimeError(
-                "Custom initial block must contain more candidates than the "
-                f"attack budget: {self.current_search_space.numel()} <= "
-                f"{n_perturbations}."
-            )
 
         return
 

@@ -1353,34 +1353,13 @@ def _require_torch():
         ) from exc
     return torch
 
+# Computes Accuracy on model
 def accuracy(model, x, labels, idx, edge_index=None):
     model.eval()
-
-    if not torch.is_tensor(x):
-        x = torch.as_tensor(x, dtype=torch.float32)
-
-    device = x.device
-
-    if not torch.is_tensor(labels):
-        labels = torch.as_tensor(labels, dtype=torch.long, device=device)
-    else:
-        labels = labels.to(device)
-
-    if not torch.is_tensor(idx):
-        idx = torch.as_tensor(idx, dtype=torch.long, device=device)
-    else:
-        idx = idx.to(device)
-
-    if edge_index is not None:
-        edge_index = edge_index.to(device)
-
     with torch.no_grad():
-        logits_tmp = model(
-            data=x,
-            adj=edge_index
-        )
-        pred = logits_tmp[idx].argmax(dim=1)
-        return (pred == labels[idx]).float().mean().item()
+        logits = model(data=x, adj=edge_index)
+        predictions = logits[idx].argmax(dim=1)
+        return (predictions == labels[idx]).float().mean().item()
 
 def _edge_index_from_dense(adj):
     return (adj > 0.5).nonzero(as_tuple=False).t().contiguous()
@@ -2818,8 +2797,7 @@ def _mine_subset_accuracy_drop(
         adj_work[dst, src] = flipped_values
 
         # Compute accuracy drop when subset edges are flipped
-        pert_preds = model(attr, adj_work).argmax(dim=-1)
-        pert_accuracy = float((pert_preds[eval_idx] == y_eval).float().mean().item())
+        pert_accuracy = accuracy(model, attr, labels, eval_idx ,adj_work)
         drop = max(0.0, clean_accuracy - pert_accuracy)
         drop_per_subset[subset_idx] = drop
 
