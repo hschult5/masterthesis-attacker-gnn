@@ -2688,93 +2688,27 @@ def mine_candidate_edge_scores(
     candidates: list[tuple[int, int]],
     n_nodes: int,
     *,
-    mode: Literal[
-        "subset_accuracy_drop",
-        "endpoint",
-        "two_hop_correct_to_incorrect",
-    ] = "subset_accuracy_drop",
+    mode: str,
     subset_fraction: float = 0.1,
     n_subsets: int = 100,
-
-    # Endpoint sampling parameters
-    endpoint_k_samples: int = 1000,
-    endpoint_require_correct_to_incorrect: bool = True,
-    endpoint_max_sampling_tries: int | None = None,
-
-    # Two-hop neighborhood mining parameters
-    two_hop_k_samples: int | None = None,
-
     seed: int = 0,
     device: torch.device | str | None = None,
-    verbose: bool = True,
 ) -> dict[str, Any]:
     """
-    Mine supervision scores for candidate edge flips.
+    Overarching label mining function for candidate labels.
 
-    Modes
+    Label modes
     -----
-    subset_accuracy_drop:
-        Random subsets of the supplied candidate edges are flipped
-        simultaneously. The observed evaluation-accuracy drop is assigned
-        to all selected edges.
-
+    subset accuracy drop:
+        Scores randomly chosen subsets of the candidate set, by flipping them
+        on the clean adjacency and recording the drop in accuracy.
+        Labels are constructed by summing all drops that an edge caused
     endpoint:
-        Builds a node pool from all nodes occurring in `candidates`.
-        It then randomly samples unique undirected pairs from all possible
-        pairs among those nodes.
-
-        Each sampled pair is flipped individually:
-
-            existing edge     -> removed
-            non-existing edge -> added
-
-        After a forward pass through the victim model, only the predictions
-        of the two endpoints are evaluated.
-
-    two_hop_correct_to_incorrect:
-        Uses the supplied candidate edges directly.
-
-        Each candidate edge is flipped individually. For an edge (u, v), the
-        evaluated node set is the union of the clean two-hop neighborhoods
-        of u and v, including the endpoints themselves.
-
-        The raw score assigned to the candidate edge is the number of nodes
-        in that neighborhood that:
-
-            1. were correctly classified on the clean graph, and
-            2. are incorrectly classified after flipping the edge.
-
-        The raw scores are min-max normalized across all evaluated candidate
-        edges to produce `labels_norm`.
-
-    Parameters
-    ----------
-    endpoint_k_samples:
-        Number of unique random node pairs to evaluate in endpoint mode.
-
-    endpoint_require_correct_to_incorrect:
-        If True, an endpoint hit requires that the endpoint was correctly
-        classified before the flip and incorrectly classified afterward.
-
-        If False, any change in the endpoint's predicted class is counted.
-
-    endpoint_max_sampling_tries:
-        Maximum number of attempts used to collect unique random pairs.
-        If None, a suitable value is selected automatically.
-
-    two_hop_k_samples:
-        Maximum number of supplied candidate edges to evaluate in
-        two-hop mode.
-
-        If None, all unique supplied candidate edges are evaluated.
-        If an integer is supplied, that many unique candidate edges are
-        sampled without replacement.
+        Labels indicate if one of the endpoints of a flipped edge changes prediction
+        from correct to incorrect
     """
     if device is None:
         device = attr.device
-
-    if not candidates:
-        raise ValueError("candidates must not be empty.")
 
     model = model.to(device)
     model.eval()
@@ -2809,34 +2743,14 @@ def mine_candidate_edge_scores(
         dtype=torch.long,
     )
 
-    if (
-        (cand_src < 0).any()
-        or (cand_src >= n_nodes).any()
-        or (cand_dst < 0).any()
-        or (cand_dst >= n_nodes).any()
-    ):
-        raise ValueError(
-            "At least one candidate contains an invalid node ID."
-        )
-
+    # Compute Clean Stats
     clean_logits = model(attr, adj_orig)
     clean_preds = clean_logits.argmax(dim=-1)
     clean_correct = clean_preds == labels
-
-    clean_accuracy = float(
-        (
-            clean_preds[eval_idx]
-            == labels[eval_idx]
-        )
-        .float()
-        .mean()
-        .item()
-    )
+    clean_accuracy = float((clean_preds[eval_idx] == labels[eval_idx]).float().mean().item())
 
     if mode == "subset_accuracy_drop":
-        # The original candidate edges are used directly.
         exists = adj_orig[cand_src, cand_dst].clone()
-
         return _mine_subset_accuracy_drop(
             model=model,
             attr=attr,
@@ -2850,53 +2764,17 @@ def mine_candidate_edge_scores(
             subset_fraction=subset_fraction,
             n_subsets=n_subsets,
             seed=seed,
-            verbose=verbose,
         )
-
     if mode == "endpoint":
-        # cand_src and cand_dst define a candidate-node pool.
-        # The endpoint miner samples new random pairs from that pool.
-        if endpoint_k_samples is None:
-            endpoint_k_samples = len(candidates)
         return _mine_endpoint_flips(
             model=model,
             attr=attr,
             labels=labels,
             adj_orig=adj_orig,
-            cand_src=cand_src,
-            cand_dst=cand_dst,
-            clean_preds=clean_preds,
+            candidates=candidates,
             clean_correct=clean_correct,
             clean_accuracy=clean_accuracy,
-            verbose=verbose,
         )
-
-    if mode == "two_hop_correct_to_incorrect":
-        # Unlike endpoint mode, the two-hop miner uses the supplied
-        # candidate edges themselves. It does not construct new pairs
-        # from the candidate-node pool.
-        return _mine_two_hop_correct_to_incorrect_flips(
-            model=model,
-            attr=attr,
-            labels=labels,
-            adj_orig=adj_orig,
-            cand_src=cand_src,
-            cand_dst=cand_dst,
-            clean_preds=clean_preds,
-            clean_correct=clean_correct,
-            clean_accuracy=clean_accuracy,
-            k_samples=two_hop_k_samples,
-            rng_seed=seed,
-            verbose=verbose,
-        )
-
-    raise ValueError(
-        f"Unknown mode {mode!r}. Expected one of: "
-        "'subset_accuracy_drop', "
-        "'endpoint', or "
-        "'two_hop_correct_to_incorrect'."
-    )
-
 
 @torch.no_grad()
 def _mine_subset_accuracy_drop(
@@ -2913,27 +2791,13 @@ def _mine_subset_accuracy_drop(
     subset_fraction: float,
     n_subsets: int,
     seed: int,
-    verbose: bool,
 ) -> dict[str, Any]:
-    if not 0.0 < subset_fraction <= 1.0:
-        raise ValueError(
-            f"subset_fraction must be in (0, 1], got {subset_fraction}."
-        )
-
-    if n_subsets <= 0:
-        raise ValueError(f"n_subsets must be positive, got {n_subsets}.")
 
     device = adj_orig.device
     n_cands = int(cand_src.numel())
-
-    subset_size = max(
-        1,
-        min(n_cands, round(subset_fraction * n_cands)),
-    )
-
+    subset_size = subset_fraction * n_cands
     rng = np.random.default_rng(seed)
-
-    drop_sum = np.zeros(n_cands, dtype=np.float64)
+    labels_raw = np.zeros(n_cands, dtype=np.float64)
     inclusion_count = np.zeros(n_cands, dtype=np.int64)
     drop_per_subset = np.zeros(n_subsets, dtype=np.float64)
 
@@ -2941,78 +2805,64 @@ def _mine_subset_accuracy_drop(
     y_eval = labels[eval_idx]
 
     for subset_idx in range(n_subsets):
-        chosen = rng.choice(
-            n_cands,
-            size=subset_size,
-            replace=False,
-        )
-
-        chosen_t = torch.as_tensor(
-            chosen,
-            device=device,
-            dtype=torch.long,
-        )
-
+        # Chose edge randomly from all candidate edges
+        chosen = rng.choice(n_cands, size=int(subset_size), replace=False)
+        chosen_t = torch.as_tensor(chosen,device=device,dtype=torch.long)
         src = cand_src[chosen_t]
         dst = cand_dst[chosen_t]
+
+        # Flip edge
         original_values = exists[chosen_t]
         flipped_values = 1.0 - original_values
-
         adj_work[src, dst] = flipped_values
         adj_work[dst, src] = flipped_values
 
+        # Compute accuracy drop when subset edges are flipped
         pert_preds = model(attr, adj_work).argmax(dim=-1)
-        pert_accuracy = float(
-            (pert_preds[eval_idx] == y_eval)
-            .float()
-            .mean()
-            .item()
-        )
-
+        pert_accuracy = float((pert_preds[eval_idx] == y_eval).float().mean().item())
         drop = max(0.0, clean_accuracy - pert_accuracy)
-
         drop_per_subset[subset_idx] = drop
-        drop_sum[chosen] += drop
+
+        # Add the recorded accuracy drop to chosen edges labels
+        labels_raw[chosen] += drop
         inclusion_count[chosen] += 1
 
+        # Restore the original adjacency
         adj_work[src, dst] = original_values
         adj_work[dst, src] = original_values
 
-    labels_raw = drop_sum.copy()
+    # Max norm the labels
     max_raw = float(labels_raw.max())
-
-    labels_norm = (
-        (labels_raw / max_raw).astype(np.float32)
+    labels_norm = ((labels_raw / max_raw).astype(np.float32)
         if max_raw > 1e-8
         else labels_raw.astype(np.float32)
     )
 
     mean_drop_when_selected = np.divide(
-        drop_sum,
+        labels_raw,
         inclusion_count,
-        out=np.zeros_like(drop_sum),
+        out=np.zeros_like(labels_raw),
         where=inclusion_count > 0,
     )
 
-    if verbose:
-        n_positive = int((labels_norm > 0).sum())
+    n_positive = int((labels_norm > 0).sum())
 
-        print(f"Clean evaluation accuracy: {clean_accuracy:.4f}")
-        print(
-            f"Subset size: {subset_size} "
-            f"({subset_fraction:.0%} of {n_cands} candidates)"
-        )
-        print(f"Subsets run: {n_subsets}")
-        print(
-            "Accuracy drop per subset: "
-            f"mean={drop_per_subset.mean():.4f}  "
-            f"max={drop_per_subset.max():.4f}  "
-            f"zero_rate={(drop_per_subset == 0).mean():.2%}"
-        )
-        print(
-            f"Edges with score > 0: {n_positive}/{n_cands} "
-            f"({100.0 * n_positive / n_cands:.1f}%)"
-        )
+    print(f"Clean evaluation accuracy: {clean_accuracy:.4f}")
+    print(
+        f"Subset size: {subset_size} "
+        f"({subset_fraction:.0%} of {n_cands} candidates)"
+    )
+    print(f"Subsets run: {n_subsets}")
+    print(
+        "Accuracy drop per subset: "
+        f"mean={drop_per_subset.mean():.4f}  "
+        f"max={drop_per_subset.max():.4f}  "
+        f"zero_rate={(drop_per_subset == 0).mean():.2%}"
+    )
+    print(
+        f"Edges with score > 0: {n_positive}/{n_cands} "
+        f"({100.0 * n_positive / n_cands:.1f}%)"
+    )
 
     return {
         "mode": "subset_accuracy_drop",
@@ -3030,741 +2880,76 @@ def _mine_subset_accuracy_drop(
 @torch.no_grad()
 def _mine_endpoint_flips(
     *,
-    model: torch.nn.Module,
-    attr: torch.Tensor,
-    labels: torch.Tensor,
-    adj_orig: torch.Tensor,
-    cand_src: torch.Tensor,
-    cand_dst: torch.Tensor,
-    clean_preds: torch.Tensor,
-    clean_correct: torch.Tensor,
-    clean_accuracy: float,
-    verbose: bool = True,
-) -> dict[str, Any]:
-    """
-    Evaluate every original candidate edge exactly once.
-
-    Label 1:
-        At least one endpoint was correctly classified before the flip
-        and incorrectly classified after flipping that exact candidate edge.
-
-    Label 0:
-        Otherwise.
-    """
+    model,
+    attr,
+    labels,
+    adj_orig,
+    candidates,
+    clean_correct,
+    clean_accuracy,
+):
     device = adj_orig.device
 
-    attr = attr.to(device)
-    labels = labels.to(device=device, dtype=torch.long)
-
-    cand_src = cand_src.to(
-        device=device,
-        dtype=torch.long,
-    ).view(-1)
-
-    cand_dst = cand_dst.to(
-        device=device,
-        dtype=torch.long,
-    ).view(-1)
-
-    clean_preds = clean_preds.to(
-        device=device,
-        dtype=torch.long,
-    )
-
-    clean_correct = clean_correct.to(
-        device=device,
-        dtype=torch.bool,
-    )
-
-    if cand_src.numel() != cand_dst.numel():
-        raise ValueError(
-            "cand_src and cand_dst must have equal length."
-        )
-
-    n_samples = cand_src.numel()
-
-    if n_samples == 0:
-        raise ValueError(
-            "The candidate list is empty."
-        )
-
     model.eval()
+
+    labels = labels.to(device)
+    clean_correct = clean_correct.to(device)
+
+    n_candidates = len(candidates)
+
+    if n_candidates == 0:
+        raise ValueError("Candidate list is empty.")
+
     adj_work = adj_orig.clone()
 
-    endpoint_labels = torch.zeros(
-        n_samples,
-        device=device,
-        dtype=torch.float32,
+    labels_out = np.zeros(
+        n_candidates,
+        dtype=np.float32,
     )
 
-    src_hit_labels = torch.zeros_like(
-        endpoint_labels
+    exists = np.zeros(
+        n_candidates,
+        dtype=np.float32,
     )
 
-    dst_hit_labels = torch.zeros_like(
-        endpoint_labels
-    )
+    for i, (u, v) in enumerate(candidates):
+        u = int(u)
+        v = int(v)
 
-    both_hit_labels = torch.zeros_like(
-        endpoint_labels
-    )
+        # Determine whether to add or remove the edge
+        edge_exists = bool(adj_orig[u, v] > 0.5 or adj_orig[v, u] > 0.5)
+        exists[i] = float(edge_exists)
+        flipped_value = (0.0 if edge_exists else 1.0)
 
-    exists_clean = torch.zeros(
-        n_samples,
-        device=device,
-        dtype=torch.bool,
-    )
-
-    src_pert_predictions = torch.full(
-        (n_samples,),
-        -1,
-        device=device,
-        dtype=torch.long,
-    )
-
-    dst_pert_predictions = torch.full_like(
-        src_pert_predictions,
-        -1,
-    )
-
-    rows: list[dict[str, Any]] = []
-
-    for i in range(n_samples):
-        u = int(cand_src[i].item())
-        v = int(cand_dst[i].item())
-
-        original_uv = float(
-            adj_orig[u, v].item()
-        )
-
-        original_vu = float(
-            adj_orig[v, u].item()
-        )
-
-        edge_exists = (
-            original_uv > 0.5
-            or original_vu > 0.5
-        )
-
-        exists_clean[i] = edge_exists
-
-        flipped_value = (
-            0.0 if edge_exists else 1.0
-        )
-
-        # Flip exactly this original candidate edge.
+        # Flip the edge and get predictions
         adj_work[u, v] = flipped_value
         adj_work[v, u] = flipped_value
+        pert_preds = model(attr,adj_work).argmax(dim=-1)
 
-        pert_preds = model(
-            attr,
-            adj_work,
-        ).argmax(dim=-1)
+        # Determines if edge flipping lead to prediction change from correct -> incorrect
+        u_hit = (bool(clean_correct[u]) and pert_preds[u] != labels[u])
+        v_hit = (bool(clean_correct[v]) and pert_preds[v] != labels[v])
 
-        u_clean_pred = int(
-            clean_preds[u].item()
-        )
+        # Construct the endpoint labels
+        labels_out[i] = float(u_hit or v_hit)
 
-        v_clean_pred = int(
-            clean_preds[v].item()
-        )
+        # Restore clean adjacency matrix
+        adj_work[u, v] = adj_orig[u, v]
+        adj_work[v, u] = adj_orig[v, u]
 
-        u_pert_pred = int(
-            pert_preds[u].item()
-        )
+        n_positive = int(labels_out.sum())
 
-        v_pert_pred = int(
-            pert_preds[v].item()
-        )
-
-        u_true = int(labels[u].item())
-        v_true = int(labels[v].item())
-
-        # Correct before, incorrect after.
-        u_hit = (
-            bool(clean_correct[u].item())
-            and u_pert_pred != u_true
-        )
-
-        v_hit = (
-            bool(clean_correct[v].item())
-            and v_pert_pred != v_true
-        )
-
-        endpoint_hit = u_hit or v_hit
-        both_hit = u_hit and v_hit
-
-        endpoint_labels[i] = float(
-            endpoint_hit
-        )
-
-        src_hit_labels[i] = float(
-            u_hit
-        )
-
-        dst_hit_labels[i] = float(
-            v_hit
-        )
-
-        both_hit_labels[i] = float(
-            both_hit
-        )
-
-        src_pert_predictions[i] = (
-            u_pert_pred
-        )
-
-        dst_pert_predictions[i] = (
-            v_pert_pred
-        )
-
-        rows.append({
-            "sample_index": i,
-            "u": u,
-            "v": v,
-            "exists_clean": edge_exists,
-            "action": (
-                "del"
-                if edge_exists
-                else "add"
-            ),
-            "u_label": u_true,
-            "v_label": v_true,
-            "u_clean_pred": u_clean_pred,
-            "v_clean_pred": v_clean_pred,
-            "u_pert_pred": u_pert_pred,
-            "v_pert_pred": v_pert_pred,
-            "u_was_correct": bool(
-                clean_correct[u].item()
-            ),
-            "v_was_correct": bool(
-                clean_correct[v].item()
-            ),
-            "u_hit": u_hit,
-            "v_hit": v_hit,
-            "both_hit": both_hit,
-            "endpoint_hit": endpoint_hit,
-        })
-
-        # Restore the graph exactly.
-        adj_work[u, v] = original_uv
-        adj_work[v, u] = original_vu
-
-    endpoint_hits = int(
-        endpoint_labels.sum().item()
-    )
-
-    if verbose:
-        print(
-            f"Clean evaluation accuracy: "
-            f"{clean_accuracy:.4f}"
-        )
-
-        print(
-            f"Original candidate edges "
-            f"evaluated: {n_samples}"
-        )
-
-        print(
-            f"Endpoint hits: "
-            f"{endpoint_hits}/{n_samples} "
-            f"({endpoint_hits / n_samples:.2%})"
-        )
-
-    edge_index_lab = torch.stack(
-        [
-            cand_src,
-            cand_dst,
-        ],
-        dim=0,
-    )
+    print(f"Clean accuracy: {clean_accuracy:.4f}")
+    print(f"Candidates evaluated: {n_candidates}")
+    print(f"Endpoint hits: "f"{n_positive}/{n_candidates} "f"({n_positive / n_candidates:.2%})")
 
     return {
         "mode": "endpoint",
-        "labels_raw": (
-            endpoint_labels
-            .detach()
-            .cpu()
-            .numpy()
-        ),
-        "labels_norm": (
-            endpoint_labels
-            .detach()
-            .cpu()
-            .numpy()
-        ),
-        "endpoint_labels": (
-            endpoint_labels
-            .detach()
-            .cpu()
-            .numpy()
-        ),
-        "sampled_edge_index": (
-            edge_index_lab
-            .detach()
-            .cpu()
-        ),
-        "sampled_u": (
-            cand_src
-            .detach()
-            .cpu()
-            .numpy()
-        ),
-        "sampled_v": (
-            cand_dst
-            .detach()
-            .cpu()
-            .numpy()
-        ),
-        "u_hit_labels": (
-            src_hit_labels
-            .detach()
-            .cpu()
-            .numpy()
-        ),
-        "v_hit_labels": (
-            dst_hit_labels
-            .detach()
-            .cpu()
-            .numpy()
-        ),
-        "both_hit_labels": (
-            both_hit_labels
-            .detach()
-            .cpu()
-            .numpy()
-        ),
-        "u_pert_predictions": (
-            src_pert_predictions
-            .detach()
-            .cpu()
-            .numpy()
-        ),
-        "v_pert_predictions": (
-            dst_pert_predictions
-            .detach()
-            .cpu()
-            .numpy()
-        ),
-        "exists": (
-            exists_clean
-            .detach()
-            .cpu()
-            .numpy()
-        ),
+        "labels_raw": labels_out,
+        "labels_norm": labels_out,
+        "endpoint_labels": labels_out,
+        "exists": exists,
         "clean_accuracy": clean_accuracy,
-        "endpoint_hits": endpoint_hits,
-        "n_samples": n_samples,
-        "rows": rows,
-    }
-
-
-@torch.no_grad()
-def _mine_two_hop_correct_to_incorrect_flips(
-    *,
-    model: torch.nn.Module,
-    attr: Tensor,
-    labels: Tensor,
-    adj_orig: Tensor,
-    cand_src: Tensor,
-    cand_dst: Tensor,
-    clean_preds: Tensor,
-    clean_correct: Tensor,
-    clean_accuracy: float,
-    k_samples: int | None = None,
-    rng_seed: int = 0,
-    verbose: bool = True,
-) -> dict[str, Any]:
-    """
-    Evaluate candidate edge flips by counting correct-to-incorrect prediction
-    changes in the union of the endpoints' clean 2-hop neighborhoods.
-
-    For every evaluated candidate edge (u, v):
-
-        1. Compute N_2(u) union N_2(v) on the clean graph, including u and v.
-        2. Flip only edge (u, v).
-        3. Run the model on the perturbed graph.
-        4. Count nodes w in the neighborhood for which:
-
-               clean_preds[w] == labels[w]
-               pert_preds[w]  != labels[w]
-
-    This count becomes the edge's raw label.
-
-    Normalization
-    -------------
-    Raw scores are min-max normalized across the evaluated candidate edges:
-
-        labels_norm = (labels_raw - min) / (max - min)
-
-    If all raw scores are identical, labels_norm is set to zero.
-
-    Candidate sampling
-    ------------------
-    Candidate pairs are taken directly from cand_src/cand_dst. Undirected
-    duplicates such as (u, v) and (v, u) are merged.
-
-    If k_samples is None, all unique candidate edges are evaluated.
-    Otherwise, at most k_samples unique candidates are sampled without
-    replacement.
-    """
-    device = adj_orig.device
-
-    attr = attr.to(device)
-    labels = labels.to(device=device, dtype=torch.long).view(-1)
-    cand_src = cand_src.to(device=device, dtype=torch.long).view(-1)
-    cand_dst = cand_dst.to(device=device, dtype=torch.long).view(-1)
-    clean_preds = clean_preds.to(device=device, dtype=torch.long).view(-1)
-    clean_correct = clean_correct.to(
-        device=device,
-        dtype=torch.bool,
-    ).view(-1)
-
-    if cand_src.numel() != cand_dst.numel():
-        raise ValueError(
-            "cand_src and cand_dst must have equal length, got "
-            f"{cand_src.numel()} and {cand_dst.numel()}."
-        )
-
-    if cand_src.numel() == 0:
-        raise ValueError("The candidate set is empty.")
-
-    if adj_orig.ndim != 2 or adj_orig.size(0) != adj_orig.size(1):
-        raise ValueError(
-            "adj_orig must be a square dense adjacency matrix."
-        )
-
-    num_nodes = int(adj_orig.size(0))
-
-    if attr.size(0) != num_nodes:
-        raise ValueError(
-            f"attr contains {attr.size(0)} nodes, but adj_orig contains "
-            f"{num_nodes} nodes."
-        )
-
-    if labels.numel() != num_nodes:
-        raise ValueError(
-            f"labels contains {labels.numel()} entries, but the graph has "
-            f"{num_nodes} nodes."
-        )
-
-    if clean_preds.numel() != num_nodes:
-        raise ValueError(
-            "clean_preds must contain one prediction per graph node."
-        )
-
-    if clean_correct.numel() != num_nodes:
-        raise ValueError(
-            "clean_correct must contain one Boolean value per graph node."
-        )
-
-    if k_samples is not None and k_samples <= 0:
-        raise ValueError(
-            f"k_samples must be positive or None, got {k_samples}."
-        )
-
-    if torch.any(cand_src < 0) or torch.any(cand_src >= num_nodes):
-        raise ValueError("cand_src contains an invalid node index.")
-
-    if torch.any(cand_dst < 0) or torch.any(cand_dst >= num_nodes):
-        raise ValueError("cand_dst contains an invalid node index.")
-
-    # ---------------------------------------------------------------
-    # Canonicalize candidates as undirected pairs: u < v.
-    # ---------------------------------------------------------------
-    canonical_u = torch.minimum(cand_src, cand_dst)
-    canonical_v = torch.maximum(cand_src, cand_dst)
-
-    non_self_loop = canonical_u != canonical_v
-    canonical_u = canonical_u[non_self_loop]
-    canonical_v = canonical_v[non_self_loop]
-
-    if canonical_u.numel() == 0:
-        raise ValueError(
-            "No non-self-loop candidate edges remain after filtering."
-        )
-
-    # Linearization is only used to remove duplicate undirected pairs.
-    candidate_keys = canonical_u * num_nodes + canonical_v
-    unique_keys = torch.unique(candidate_keys, sorted=True)
-
-    unique_u = torch.div(
-        unique_keys,
-        num_nodes,
-        rounding_mode="floor",
-    )
-    unique_v = unique_keys.remainder(num_nodes)
-
-    n_unique_candidates = int(unique_u.numel())
-
-    # ---------------------------------------------------------------
-    # Select all candidates or a reproducible random subset.
-    # ---------------------------------------------------------------
-    if k_samples is None:
-        selected_indices = torch.arange(
-            n_unique_candidates,
-            device=device,
-            dtype=torch.long,
-        )
-    else:
-        n_selected = min(int(k_samples), n_unique_candidates)
-
-        generator = torch.Generator(device="cpu")
-        generator.manual_seed(int(rng_seed))
-
-        selected_indices = torch.randperm(
-            n_unique_candidates,
-            generator=generator,
-        )[:n_selected].to(device)
-
-    sampled_u = unique_u[selected_indices]
-    sampled_v = unique_v[selected_indices]
-    n_samples = int(sampled_u.numel())
-
-    # ---------------------------------------------------------------
-    # Build Boolean clean adjacency for neighborhood extraction.
-    #
-    # We treat the graph as undirected, even if only one direction is
-    # present in adj_orig.
-    # ---------------------------------------------------------------
-    adjacency_bool = (adj_orig > 0.5)
-    adjacency_bool = adjacency_bool | adjacency_bool.T
-
-    # Self-connectivity makes distance <= 2 extraction convenient and
-    # ensures that each endpoint belongs to its own neighborhood.
-    adjacency_with_self = adjacency_bool.clone()
-    adjacency_with_self.fill_diagonal_(True)
-
-    # Integer matrix multiplication:
-    # two_hop_reachability[i, j] > 0 means that j can be reached from i
-    # using at most two steps in adjacency_with_self.
-    #
-    # Because self-connections are included, this covers distances 0, 1,
-    # and 2.
-    adjacency_numeric = adjacency_with_self.to(dtype=torch.float32)
-    two_hop_reachability = (
-        adjacency_numeric @ adjacency_numeric
-    ) > 0
-
-    model.eval()
-
-    adj_work = adj_orig.clone()
-
-    labels_raw_tensor = torch.zeros(
-        n_samples,
-        device=device,
-        dtype=torch.float32,
-    )
-
-    neighborhood_sizes = torch.zeros(
-        n_samples,
-        device=device,
-        dtype=torch.long,
-    )
-
-    clean_correct_counts = torch.zeros_like(neighborhood_sizes)
-
-    exists_clean = torch.zeros(
-        n_samples,
-        device=device,
-        dtype=torch.bool,
-    )
-
-    rows: list[dict[str, Any]] = []
-
-    for sample_idx in range(n_samples):
-        u = int(sampled_u[sample_idx].item())
-        v = int(sampled_v[sample_idx].item())
-
-        # The neighborhood is fixed using the clean graph. The flipped
-        # graph is not used to redefine which nodes are evaluated.
-        neighborhood_mask = (
-            two_hop_reachability[u]
-            | two_hop_reachability[v]
-        )
-
-        neighborhood_nodes = torch.nonzero(
-            neighborhood_mask,
-            as_tuple=False,
-        ).flatten()
-
-        neighborhood_size = int(neighborhood_nodes.numel())
-        neighborhood_sizes[sample_idx] = neighborhood_size
-
-        clean_correct_in_neighborhood = clean_correct[
-            neighborhood_nodes
-        ]
-
-        n_clean_correct = int(
-            clean_correct_in_neighborhood.sum().item()
-        )
-        clean_correct_counts[sample_idx] = n_clean_correct
-
-        original_uv = float(adj_orig[u, v].item())
-        original_vu = float(adj_orig[v, u].item())
-
-        edge_exists = original_uv > 0.5 or original_vu > 0.5
-        exists_clean[sample_idx] = edge_exists
-
-        flipped_value = 0.0 if edge_exists else 1.0
-
-        # Flip only the current undirected candidate edge.
-        adj_work[u, v] = flipped_value
-        adj_work[v, u] = flipped_value
-
-        pert_logits = model(attr, adj_work)
-        pert_preds = pert_logits.argmax(dim=-1)
-
-        pert_incorrect = pert_preds != labels
-
-        # A node is counted only when it was correct before the flip and
-        # incorrect after the flip.
-        correct_to_incorrect_mask = (
-            clean_correct
-            & pert_incorrect
-            & neighborhood_mask
-        )
-
-        flipped_nodes = torch.nonzero(
-            correct_to_incorrect_mask,
-            as_tuple=False,
-        ).flatten()
-
-        raw_score = int(flipped_nodes.numel())
-        labels_raw_tensor[sample_idx] = float(raw_score)
-
-        rows.append({
-            "sample_index": sample_idx,
-            "u": u,
-            "v": v,
-            "exists_clean": edge_exists,
-            "action": "del" if edge_exists else "add",
-            "neighborhood_size": neighborhood_size,
-            "clean_correct_in_neighborhood": n_clean_correct,
-            "correct_to_incorrect_count": raw_score,
-            "correct_to_incorrect_nodes": (
-                flipped_nodes.detach().cpu().tolist()
-            ),
-        })
-
-        # Restore the exact clean values before evaluating the next edge.
-        adj_work[u, v] = original_uv
-        adj_work[v, u] = original_vu
-
-    # ---------------------------------------------------------------
-    # Min-max normalization across the evaluated candidate edges.
-    # ---------------------------------------------------------------
-    raw_min = float(labels_raw_tensor.min().item())
-    raw_max = float(labels_raw_tensor.max().item())
-
-    if raw_max > raw_min:
-        labels_norm_tensor = (
-            labels_raw_tensor - raw_min
-        ) / (raw_max - raw_min)
-    else:
-        labels_norm_tensor = torch.zeros_like(labels_raw_tensor)
-
-    # Add normalized scores to the row representation.
-    for sample_idx, row in enumerate(rows):
-        row["label_raw"] = float(
-            labels_raw_tensor[sample_idx].item()
-        )
-        row["label_norm"] = float(
-            labels_norm_tensor[sample_idx].item()
-        )
-
-    total_correct_to_incorrect = int(
-        labels_raw_tensor.sum().item()
-    )
-    positive_flips = int(
-        (labels_raw_tensor > 0).sum().item()
-    )
-
-    mean_raw_score = float(
-        labels_raw_tensor.mean().item()
-    )
-
-    mean_neighborhood_size = float(
-        neighborhood_sizes.float().mean().item()
-    )
-
-    if verbose:
-        print(f"Clean evaluation accuracy: {clean_accuracy:.4f}")
-        print(
-            f"Unique candidate edges available: "
-            f"{n_unique_candidates}"
-        )
-        print(
-            f"Candidate flips evaluated: {n_samples}"
-        )
-        print(
-            "Score definition: number of clean-correct nodes becoming "
-            "incorrect within the union of both endpoints' clean "
-            "2-hop neighborhoods"
-        )
-        print(
-            f"Flips with raw score > 0: "
-            f"{positive_flips}/{n_samples} "
-            f"({positive_flips / n_samples:.2%})"
-        )
-        print(
-            f"Total correct-to-incorrect transitions: "
-            f"{total_correct_to_incorrect}"
-        )
-        print(f"Mean raw score: {mean_raw_score:.4f}")
-        print(
-            f"Raw score range: [{raw_min:.0f}, {raw_max:.0f}]"
-        )
-        print(
-            f"Mean union-neighborhood size: "
-            f"{mean_neighborhood_size:.2f}"
-        )
-
-    sampled_edge_index = torch.stack(
-        [sampled_u, sampled_v],
-        dim=0,
-    )
-
-    return {
-        "mode": "two_hop_correct_to_incorrect",
-
-        "labels_raw": (
-            labels_raw_tensor.detach().cpu().numpy()
-        ),
-        "labels_norm": (
-            labels_norm_tensor.detach().cpu().numpy()
-        ),
-
-        "sampled_edge_index": (
-            sampled_edge_index.detach().cpu()
-        ),
-        "sampled_u": sampled_u.detach().cpu().numpy(),
-        "sampled_v": sampled_v.detach().cpu().numpy(),
-
-        "exists": exists_clean.detach().cpu().numpy(),
-
-        "neighborhood_sizes": (
-            neighborhood_sizes.detach().cpu().numpy()
-        ),
-        "clean_correct_counts": (
-            clean_correct_counts.detach().cpu().numpy()
-        ),
-
-        "clean_accuracy": clean_accuracy,
-
-        "n_unique_candidates": n_unique_candidates,
-        "n_samples": n_samples,
-
-        "positive_flips": positive_flips,
-        "total_correct_to_incorrect": (
-            total_correct_to_incorrect
-        ),
-        "mean_raw_score": mean_raw_score,
-        "raw_score_min": raw_min,
-        "raw_score_max": raw_max,
-        "mean_neighborhood_size": mean_neighborhood_size,
-
-        "rows": rows,
     }
 
 from pathlib import Path
