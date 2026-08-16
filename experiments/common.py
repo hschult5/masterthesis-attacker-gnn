@@ -150,8 +150,9 @@ def run_global_attack(
     }
 
     rq1_enabled = bool(getattr(adversary, "rq1_enabled", False))
+    is_custom_initial_block = getattr(adversary, "initial_block_linear_ids", None) is not None
 
-    if rq1_enabled:
+    if rq1_enabled or is_custom_initial_block:
         # RQ1 needs fresh per-epoch search-space diagnostics. Cached final
         # perturbations contain only the final graph, not those diagnostics.
         pert_adj = None
@@ -216,7 +217,7 @@ def run_global_attack(
 
         pert_adj, pert_attr = adversary.get_pertubations()
 
-        if n_perturbations > 0 and not rq1_enabled:
+        if n_perturbations > 0 and not rq1_enabled and not is_custom_initial_block:
             storage.save_artifact(
                 pert_adj_storage_type,
                 artifact_params,

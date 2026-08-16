@@ -49,8 +49,8 @@ class PRBCD(SparseAttack):
             pre_hidden: int = 64,
             lp_model: Optional[torch.nn.Module] = None,
 
-            # Custom/fixed initial-block experiments (used by RQ2)
-            initial_block_linear_ids: Optional[List[int]] = None,
+            # Fixed blocks from RQ2
+            initial_block_linear_ids: Optional[torch.Tensor] = None,
             initial_block_label: str = "",
             resampling_enabled: bool = True,
             block_diagnostics_enabled: bool = False,
@@ -77,7 +77,7 @@ class PRBCD(SparseAttack):
         self.initial_block_label = str(initial_block_label)
 
         # indicates whether resampling is enabled
-        self.resampling_enabled = bool(resampling_enabled)
+        self.resampling_enabled = resampling_enabled
         self.block_diagnostics_enabled = bool(block_diagnostics_enabled)
         self.attack_sampling_seed = (
             int(attack_sampling_seed)
@@ -292,14 +292,8 @@ class PRBCD(SparseAttack):
 
         # Sample initial search space (Algorithm 1, line 3-4).
         # Supplied Block takes prescedent over sampling
-        if (
-            self.initial_block_linear_ids is not None
-            or self.initial_block_path is not None
-        ):
-            initial_ids = self._load_initial_block_linear_ids()
-            self.init_search_space_from_linear_ids(
-                initial_ids,
-            )
+        if (self.initial_block_linear_ids is not None):
+            self.init_search_space_from_linear_ids(self.initial_block_linear_ids)
 
         # RQ1 reference: use the complete edge-flip space as a fixed block.
         elif self.rq1_is_reference:
@@ -857,9 +851,7 @@ class PRBCD(SparseAttack):
                 selector_resample_stats = None
 
                 # Resampling of search space (Algorithm 1, line 9-14)
-                # A fixed-block arm skips only block replacement.  Importantly,
-                # epochs_resampling is left unchanged so its learning-rate schedule
-                # is directly comparable with the resampling arm.
+                # If a fixed block is supplied, resampling is disabled.
                 if self.rq1_is_reference or not self.resampling_enabled:
                     pass
 
@@ -1303,17 +1295,10 @@ class PRBCD(SparseAttack):
             )
         return torch.unique(linear_ids, sorted=True)
 
-    def init_search_space_from_linear_ids(
-            self,
-            linear_ids: torch.Tensor,
-    ):
-        """Initialize PRBCD from explicit linear candidate ids."""
-        current = torch.unique(
-            torch.as_tensor(linear_ids, dtype=torch.long, device=self.device).flatten(),
-            sorted=True,
-        )
+    # Init PR-BCD internal tensors from supplied block
+    def init_search_space_from_linear_ids(self, linear_ids: torch.Tensor):
+        self.current_search_space = linear_ids
         # Logic from Original PR-BCD
-        self.current_search_space = current
         if self.make_undirected:
             self.modified_edge_index = PRBCD.linear_to_triu_idx(
                 self.n, self.current_search_space

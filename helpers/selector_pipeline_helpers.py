@@ -14,7 +14,7 @@ from tqdm import tqdm
 from AttackerGNN.ShadowModelLinkPredictor import LinkPredictionGNN
 from rgnn_at_scale.helper import utils
 from rgnn_at_scale.attacks.base_attack import Attack
-
+from sklearn.model_selection import train_test_split
 
 class EndpointPRBCDV4Scorer:
     """
@@ -1393,1266 +1393,255 @@ import torch.nn as nn
 from tqdm.auto import tqdm
 
 
-def train_link_prediction_gnn(
-    x: torch.Tensor,
+def train_selector(
+    attr: torch.Tensor,
     edge_index_struct: torch.Tensor,
     edge_index_lab: torch.Tensor,
     y_label: torch.Tensor,
+    label_mode: str,
     device: str = "cpu",
     num_epochs: int = 200,
     hidden_dim: int = 64,
     out_dim: int = 64,
     lr: float = 5e-4,
     weight_decay: float = 5e-4,
-    use_tqdm: bool = True,
-    verbose: bool = True,
+    label_smoothing: float = 0.1, # Only applies to endpoint binary labels
     log_every: int = 20,
     log_grad_norm: bool = False,
-    csv_path: str | None = None,
-    csv_append: bool = False,
-    # ---- optional auxiliary endpoint supervision ----
-    y_src_label: torch.Tensor | None = None,
-    y_dst_label: torch.Tensor | None = None,
-    aux_loss_weight: float = 0.5,
     # ---- early stopping / best checkpoint ----
     min_epochs_before_early_stop: int = 40,
     early_stop: bool = True,
-    early_stop_metric: str = "val_ap",
-    # allowed:
-    # classification/thresholded metrics:
-    # "val_auc" | "val_ap" | "val_acc" |
-    # "val_f1" | "val_recall"
-    # continuous-target metrics:
-    # "val_loss" | "val_mae" | "val_mse" |
-    # "val_rmse" | "val_r2" | "val_pearson"
-    early_stop_patience: int = 15,
+    patience: int = 15,
     early_stop_min_delta: float = 1e-4,
-    restore_best: bool = True,
-    # ---- split ratios ----
-    train_ratio: float = 0.7,
-    val_ratio: float = 0.15,
-    test_ratio: float = 0.15,
-    threshold: float = 0.5,
+    # ---- train / validation split ----
+    split_ratios: tuple[float, float, float] = (0.7, 0.15, 0.15),
 ):
-    """Train a binary link-prediction GNN with hard or soft targets.
+    """Train the selector GNN on hard or soft edge targets in [0, 1].
 
-    ``y_label`` may contain either hard binary labels {0, 1} or soft labels
-    anywhere in [0, 1]. In both cases the edge head must return one logit per
-    labeled edge and training uses ``BCEWithLogitsLoss``.
-
-    For soft labels, MAE/MSE/RMSE/R2/Pearson are computed directly against the
-    sigmoid probabilities. Binary metrics are still available, but they use
-    ``threshold`` to convert both targets and probabilities to hard classes.
-
-    The auxiliary source/destination labels, when supplied, may also be hard or
-    soft values in [0, 1].
+    The training function deliberately does only what is needed for fitting:
+    train/validation splitting, BCE training, validation-loss early stopping,
+    and best-checkpoint restoration. Exhaustive selector statistics belong in
+    the later test-set evaluation.
     """
     import copy
-    import math
 
     import torch
     import torch.nn as nn
-    from sklearn.metrics import average_precision_score, roc_auc_score
     from tqdm import tqdm
 
-    # ======================================================
-    # Validate configuration
-    # ======================================================
-
-    if num_epochs <= 0:
-        raise ValueError("num_epochs must be greater than 0.")
-
-    if min_epochs_before_early_stop < 1:
-        raise ValueError(
-            "min_epochs_before_early_stop must be at least 1."
-        )
-
-    if early_stop_patience < 1:
-        raise ValueError(
-            "early_stop_patience must be at least 1."
-        )
-
-    if early_stop_min_delta < 0:
-        raise ValueError(
-            "early_stop_min_delta must be non-negative."
-        )
-
-    if not 0.0 < threshold < 1.0:
-        raise ValueError("threshold must lie strictly between 0 and 1.")
-
-    if aux_loss_weight < 0:
-        raise ValueError("aux_loss_weight must be non-negative.")
-
-    if (y_src_label is None) != (y_dst_label is None):
-        raise ValueError(
-            "y_src_label and y_dst_label must either both be "
-            "provided or both be None."
-        )
-
-    # Backward-compatible aliases.
-    metric_aliases = {
-        "auc": "val_auc",
-        "ap": "val_ap",
-        "acc": "val_acc",
-        "f1": "val_f1",
-        "recall": "val_recall",
-        "loss": "val_loss",
-        "mae": "val_mae",
-        "mse": "val_mse",
-        "rmse": "val_rmse",
-        "r2": "val_r2",
-        "pearson": "val_pearson",
-    }
-    early_stop_metric = metric_aliases.get(
-        early_stop_metric,
-        early_stop_metric,
-    )
-
-    metric_mode = {
-        "val_auc": "max",
-        "val_ap": "max",
-        "val_acc": "max",
-        "val_f1": "max",
-        "val_recall": "max",
-        "val_loss": "min",
-        "val_mae": "min",
-        "val_mse": "min",
-        "val_rmse": "min",
-        "val_r2": "max",
-        "val_pearson": "max",
-    }
-
-    if early_stop_metric not in metric_mode:
-        raise ValueError(
-            f"early_stop_metric must be one of "
-            f"{list(metric_mode.keys())}, or one of the aliases "
-            f"{list(metric_aliases.keys())}."
-        )
-
-    ratio_sum = train_ratio + val_ratio + test_ratio
-
-    if abs(ratio_sum - 1.0) >= 1e-6:
-        raise ValueError(
-            "train_ratio + val_ratio + test_ratio must equal 1.0."
-        )
-
-    if min(train_ratio, val_ratio, test_ratio) <= 0:
-        raise ValueError(
-            "train_ratio, val_ratio and test_ratio must all be positive."
-        )
-
-    if log_every < 1:
-        raise ValueError("log_every must be at least 1.")
-
-    # ======================================================
-    # Move tensors to device and validate targets
-    # ======================================================
-
-    x = x.to(device)
+    # Prepare inputs
+    attr = attr.to(device)
     edge_index_struct = edge_index_struct.long().to(device)
     edge_index_lab = edge_index_lab.long().to(device)
     y_label = y_label.float().view(-1).to(device)
 
-    if y_src_label is not None:
-        y_src_label = y_src_label.float().view(-1).to(device)
-
-    if y_dst_label is not None:
-        y_dst_label = y_dst_label.float().view(-1).to(device)
-
     if edge_index_struct.ndim != 2 or edge_index_struct.size(0) != 2:
-        raise ValueError(
-            "edge_index_struct must have shape (2, E)."
-        )
-
+        raise ValueError("edge_index_struct must have shape (2, E).")
     if edge_index_lab.ndim != 2 or edge_index_lab.size(0) != 2:
-        raise ValueError(
-            "edge_index_lab must have shape (2, M)."
-        )
+        raise ValueError("edge_index_lab must have shape (2, M).")
 
     M = edge_index_lab.size(1)
 
-    def _validate_unit_interval(
-        values: torch.Tensor,
-        name: str,
-    ) -> torch.Tensor:
-        if not bool(torch.isfinite(values).all().item()):
-            raise ValueError(f"{name} contains NaN or infinite values.")
+    # Define training state variables
+    train_losses: list[float] = []
+    val_losses: list[float] = [] # Early stopping metric for subset_accuracy_drop labeling mode
+    val_aps: list[float] = [] # Early stopping metric for endpoint labeling mode
 
-        tolerance = 1e-7
-        min_value = float(values.min().item()) if values.numel() else 0.0
-        max_value = float(values.max().item()) if values.numel() else 1.0
+    if label_mode == "endpoint":
+        best_metric_score = float("-inf")
+        early_stop_metric = "val_ap"
+    else:
+        best_metric_score = float("inf")
+        early_stop_metric = "val_loss"
 
-        if min_value < -tolerance or max_value > 1.0 + tolerance:
-            raise ValueError(
-                f"{name} must contain values in [0, 1]. "
-                f"Found range [{min_value}, {max_value}]."
-            )
+    best_epoch = None
+    best_state = None
+    patience_left = patience
 
-        # Remove harmless floating-point spillover such as 1.00000001.
-        return values.clamp(0.0, 1.0)
 
-    y_label = _validate_unit_interval(y_label, "y_label")
+    # Train/Validation/Test split
+    train_ratio, val_ratio, test_ratio = split_ratios
 
-    if y_src_label is not None:
-        y_src_label = _validate_unit_interval(
-            y_src_label,
-            "y_src_label",
-        )
+    indices = np.arange(M)
 
-    if y_dst_label is not None:
-        y_dst_label = _validate_unit_interval(
-            y_dst_label,
-            "y_dst_label",
-        )
-
-    def _contains_only_hard_labels(values: torch.Tensor) -> bool:
-        if values.numel() == 0:
-            return True
-
-        is_zero = torch.isclose(
-            values,
-            torch.zeros_like(values),
-            atol=1e-7,
-            rtol=0.0,
-        )
-        is_one = torch.isclose(
-            values,
-            torch.ones_like(values),
-            atol=1e-7,
-            rtol=0.0,
-        )
-        return bool((is_zero | is_one).all().item())
-
-    hard_label_mode = _contains_only_hard_labels(y_label)
-    label_mode = "hard_binary" if hard_label_mode else "soft_binary"
-
-    # ======================================================
-    # Empty input
-    # ======================================================
-
-    if M == 0:
-        if verbose:
-            print(
-                "[LP-GNN] No labeled pairs. Returning untrained model."
-            )
-
-        model = LinkPredictionGNN(
-            in_dim=x.size(1),
-            hidden_dim=hidden_dim,
-            out_dim=out_dim,
-        ).to(device)
-
-        model.training_history = {
-            "train_losses": [],
-            "train_objective_losses": [],
-            "val_losses": [],
-            "test_losses": [],
-            "val_ap": [],
-            "val_auc": [],
-            "val_f1": [],
-            "val_mae": [],
-            "val_mse": [],
-            "val_rmse": [],
-            "val_r2": [],
-            "val_pearson": [],
-            "early_stop_metric_history": [],
-            "patience_history": [],
-            "stopped_at": 0,
-            "best_epoch": None,
-            "best_metric": None,
-            "early_stopped": False,
-            "early_stop_enabled": early_stop,
-            "early_stop_metric": early_stop_metric,
-            "early_stop_patience": early_stop_patience,
-            "min_epochs_before_early_stop": (
-                min_epochs_before_early_stop
-            ),
-            "restored_best": False,
-            "stop_reason": "no_labeled_pairs",
-            "train_idx": torch.empty(0, dtype=torch.long),
-            "val_idx": torch.empty(0, dtype=torch.long),
-            "test_idx": torch.empty(0, dtype=torch.long),
-            "label_mode": label_mode,
-            "threshold": float(threshold),
-            "split_strategy": None,
-        }
-
-        return model
-
-    if M != y_label.numel():
-        raise ValueError(
-            "edge_index_lab and y_label must contain the same "
-            f"number of examples, got {M} and {y_label.numel()}."
-        )
-
-    if y_src_label is not None and M != y_src_label.numel():
-        raise ValueError(
-            "edge_index_lab and y_src_label must contain the "
-            "same number of examples."
-        )
-
-    if y_dst_label is not None and M != y_dst_label.numel():
-        raise ValueError(
-            "edge_index_lab and y_dst_label must contain the "
-            "same number of examples."
-        )
-
-    use_aux = (
-        y_src_label is not None
-        and y_dst_label is not None
-    )
-
-    # Soft targets are thresholded only for stratification and binary metrics.
-    y_hard = (y_label >= threshold).long()
-    n_neg = int((y_hard == 0).sum().item())
-    n_pos = int((y_hard == 1).sum().item())
-
-    if verbose:
-        if hard_label_mode:
-            msg = (
-                f"[LP-GNN] Labeled pairs: M={M} | mode=hard_binary | "
-                f"pos={n_pos} | neg={n_neg}"
-            )
-        else:
-            msg = (
-                f"[LP-GNN] Labeled pairs: M={M} | mode=soft_binary | "
-                f"target_min={y_label.min().item():.4f} | "
-                f"target_mean={y_label.mean().item():.4f} | "
-                f"target_max={y_label.max().item():.4f} | "
-                f"thresholded_pos={n_pos} | thresholded_neg={n_neg}"
-            )
-
-        if use_aux:
-            src_mode = (
-                "hard"
-                if _contains_only_hard_labels(y_src_label)
-                else "soft"
-            )
-            dst_mode = (
-                "hard"
-                if _contains_only_hard_labels(y_dst_label)
-                else "soft"
-            )
-            msg += (
-                f" | src_labels={src_mode} | dst_labels={dst_mode} "
-                f"| aux_loss_weight={aux_loss_weight}"
-            )
-
-        print(msg)
-
-    # ======================================================
-    # Train / validation / test split
-    # ======================================================
-
-    split_generator = torch.Generator(
-        device="cpu"
-    ).manual_seed(42)
-
-    def _split_counts(count: int) -> tuple[int, int, int]:
-        n_train_local = int(train_ratio * count)
-        n_val_local = int(val_ratio * count)
-        n_test_local = count - n_train_local - n_val_local
-        return n_train_local, n_val_local, n_test_local
-
-    def _split_one_group(
-        indices: torch.Tensor,
-        group_name: str,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        count = int(indices.numel())
-        n_train_local, n_val_local, n_test_local = _split_counts(count)
-
-        if min(n_train_local, n_val_local, n_test_local) <= 0:
-            raise ValueError(
-                f"Group '{group_name}' needs at least one example in "
-                "train, validation and test. "
-                f"Group size={count}, resulting split="
-                f"{n_train_local}/{n_val_local}/{n_test_local}."
-            )
-
-        order = torch.randperm(
-            count,
-            generator=split_generator,
-        ).to(device)
-        shuffled = indices[order]
-
-        train_local = shuffled[:n_train_local]
-        val_local = shuffled[
-            n_train_local:n_train_local + n_val_local
-        ]
-        test_local = shuffled[n_train_local + n_val_local:]
-
-        return train_local, val_local, test_local
-
-    classification_metric_names = {
-        "val_auc",
-        "val_ap",
-        "val_acc",
-        "val_f1",
-        "val_recall",
-    }
-
-    threshold_groups_can_be_stratified = False
-    if n_neg > 0 and n_pos > 0:
-        neg_counts = _split_counts(n_neg)
-        pos_counts = _split_counts(n_pos)
-        threshold_groups_can_be_stratified = (
-            min(*neg_counts, *pos_counts) > 0
-        )
-
-    if threshold_groups_can_be_stratified:
-        neg_idx_all = torch.nonzero(
-            y_hard == 0,
-            as_tuple=True,
-        )[0]
-        pos_idx_all = torch.nonzero(
-            y_hard == 1,
-            as_tuple=True,
-        )[0]
-
-        neg_train, neg_val, neg_test = _split_one_group(
-            neg_idx_all,
-            "target<threshold",
-        )
-        pos_train, pos_val, pos_test = _split_one_group(
-            pos_idx_all,
-            "target>=threshold",
-        )
-
-        train_idx = torch.cat([neg_train, pos_train])
-        val_idx = torch.cat([neg_val, pos_val])
-        test_idx = torch.cat([neg_test, pos_test])
-        split_strategy = "threshold_stratified"
+    if label_mode == "endpoint":
+        stratify_labels = (y_label > 0.5).numpy().astype(int)
 
     else:
-        if hard_label_mode:
-            if n_neg == 0 or n_pos == 0:
-                raise ValueError(
-                    f"Hard binary training requires both classes, got "
-                    f"pos={n_pos}, neg={n_neg}."
-                )
+        # Sort continuous labels and divide into 5 equally sized rank bins
+        order = np.argsort(y_label.numpy())
+        stratify_labels = np.empty(M, dtype=int)
 
-            raise ValueError(
-                "Each hard class needs enough examples to place at least "
-                "one item in train, validation and test. "
-                f"Got pos={n_pos}, neg={n_neg}."
-            )
+        for bin_id, bin_indices in enumerate(np.array_split(order, 5)):
+            stratify_labels[bin_indices] = bin_id
 
-        if early_stop_metric in classification_metric_names:
-            if n_neg == 0 or n_pos == 0:
-                raise ValueError(
-                    f"{early_stop_metric} requires soft targets on both "
-                    f"sides of threshold={threshold}, but got "
-                    f"thresholded_pos={n_pos}, thresholded_neg={n_neg}. "
-                    "Use early_stop_metric='val_loss', 'val_mae', "
-                    "'val_rmse', 'val_r2', or 'val_pearson'."
-                )
 
-            raise ValueError(
-                f"{early_stop_metric} requires enough thresholded positive "
-                "and negative targets for all three splits. "
-                f"Got thresholded_pos={n_pos}, thresholded_neg={n_neg}. "
-                "Use a continuous early-stopping metric or provide more data."
-            )
+    # First split for trainíng set
+    temp_ratio = val_ratio + test_ratio
 
-        n_train, n_val, n_test = _split_counts(M)
+    train_idx, temp_idx = train_test_split(
+        indices,
+        test_size=temp_ratio,
+        stratify=stratify_labels,
+        random_state=0,
+    )
 
-        if min(n_train, n_val, n_test) <= 0:
-            raise ValueError(
-                "Not enough labeled pairs for train, validation and test. "
-                f"M={M}, resulting split={n_train}/{n_val}/{n_test}."
-            )
+    # Then split the remaining into validation and test sets
+    relative_test_ratio = test_ratio / temp_ratio
 
-        # Rank-bin stratification preserves the soft-target distribution better
-        # than a purely random split. Each bin is split independently.
-        min_bin_size = max(
-            3,
-            math.ceil(1.0 / min(train_ratio, val_ratio, test_ratio)),
-        )
-        num_bins = max(1, min(10, M // min_bin_size))
+    val_idx, test_idx = train_test_split(
+        temp_idx,
+        test_size=relative_test_ratio,
+        stratify=stratify_labels[temp_idx],
+        random_state=0,
+    )
 
-        random_tiebreak = torch.rand(
-            M,
-            generator=split_generator,
-        )
-        # Stable sorting is not available in all supported torch versions;
-        # a tiny random jitter only determines ordering among near-equal values.
-        y_for_sort = y_label.detach().cpu() + 1e-12 * random_tiebreak
-        sorted_cpu_idx = torch.argsort(y_for_sort)
-        rank_bins = torch.tensor_split(sorted_cpu_idx, num_bins)
+    # Convert to tensors
+    train_idx = torch.tensor(train_idx, dtype=torch.long, device=device)
+    val_idx = torch.tensor(val_idx, dtype=torch.long, device=device)
+    test_idx = torch.tensor(test_idx, dtype=torch.long, device=device)
 
-        train_parts: list[torch.Tensor] = []
-        val_parts: list[torch.Tensor] = []
-        test_parts: list[torch.Tensor] = []
+    train_y_labels = y_label[train_idx]
+    edge_index_lab_train = edge_index_lab[:, train_idx]
 
-        for bin_number, bin_cpu_idx in enumerate(rank_bins):
-            bin_idx = bin_cpu_idx.to(device)
-            count = int(bin_idx.numel())
+    val_y_labels = y_label[val_idx]
+    edge_index_lab_val = edge_index_lab[:, val_idx]
 
-            if count == 0:
-                continue
+    # Add label-smoothing only for endpoint binary labels.
+    if label_mode == "endpoint":
+        train_y_labels_smooth = (train_y_labels * (1.0 - label_smoothing) + 0.5 * label_smoothing)
+    else:
+        train_y_labels_smooth = train_y_labels
 
-            bin_train, bin_val, bin_test = _split_one_group(
-                bin_idx,
-                f"soft_rank_bin_{bin_number}",
-            )
-            train_parts.append(bin_train)
-            val_parts.append(bin_val)
-            test_parts.append(bin_test)
+    # Initialize label weight only for unbalanced endpoint labels.
+    if label_mode == "endpoint":
+        label_one_count = float(train_y_labels.sum().item())
+        label_zero_count = float((1.0 - train_y_labels).sum().item())
+        label_weight = label_zero_count / label_one_count
+    else:
+        label_weight = 1.0
 
-        train_idx = torch.cat(train_parts)
-        val_idx = torch.cat(val_parts)
-        test_idx = torch.cat(test_parts)
-        split_strategy = f"soft_rank_bins_{num_bins}"
-
-    # Shuffle final indices so examples are not grouped by stratum/bin.
-    train_idx = train_idx[
-        torch.randperm(
-            train_idx.numel(),
-            generator=split_generator,
-        ).to(device)
-    ]
-    val_idx = val_idx[
-        torch.randperm(
-            val_idx.numel(),
-            generator=split_generator,
-        ).to(device)
-    ]
-    test_idx = test_idx[
-        torch.randperm(
-            test_idx.numel(),
-            generator=split_generator,
-        ).to(device)
-    ]
-
-    if train_idx.numel() + val_idx.numel() + test_idx.numel() != M:
-        raise AssertionError("Split sizes do not add up to M.")
-
-    if verbose:
-        print(
-            f"[LP-GNN] Split strategy={split_strategy} | "
-            f"train={train_idx.numel()} | val={val_idx.numel()} | "
-            f"test={test_idx.numel()}"
-        )
-
-    # ======================================================
-    # Model and losses
-    # ======================================================
-
+    # Define Model
     model = LinkPredictionGNN(
-        in_dim=x.size(1),
+        in_dim=attr.size(1),
         hidden_dim=hidden_dim,
         out_dim=out_dim,
     ).to(device)
 
+    # Define Optimizer
     optimizer = torch.optim.Adam(
         model.parameters(),
         lr=lr,
         weight_decay=weight_decay,
     )
 
-    def _effective_pos_weight(targets: torch.Tensor) -> float:
-        """Return neg/pos mass; identical to count ratio for hard labels."""
-        positive_mass = float(targets.sum().item())
-        negative_mass = float((1.0 - targets).sum().item())
-
-        if positive_mass <= 1e-12 or negative_mass <= 1e-12:
-            return 1.0
-
-        return negative_mass / positive_mass
-
-    train_targets = y_label[train_idx]
-
-    if hard_label_mode:
-        pos_weight = _effective_pos_weight(train_targets)
-    else:
-        pos_weight = 1.0
-
+    # Define loss
     loss_fn = nn.BCEWithLogitsLoss(
-        pos_weight=torch.tensor(
-            pos_weight,
-            dtype=torch.float32,
-            device=device,
-        )
+        pos_weight=torch.tensor(label_weight, dtype=torch.float32, device=device)
     )
 
-    if use_aux:
-        src_train = y_src_label[train_idx]
-        dst_train = y_dst_label[train_idx]
-
-        src_pos_weight = _effective_pos_weight(src_train)
-        dst_pos_weight = _effective_pos_weight(dst_train)
-
-        loss_fn_src = nn.BCEWithLogitsLoss(
-            pos_weight=torch.tensor(
-                src_pos_weight,
-                dtype=torch.float32,
-                device=device,
-            )
-        )
-        loss_fn_dst = nn.BCEWithLogitsLoss(
-            pos_weight=torch.tensor(
-                dst_pos_weight,
-                dtype=torch.float32,
-                device=device,
-            )
-        )
-    else:
-        src_pos_weight = None
-        dst_pos_weight = None
-
-    # ======================================================
-    # Evaluation helpers
-    # ======================================================
-
-    def _safe_div(num: float, den: float) -> float:
-        return float(num / den) if den > 0 else 0.0
-
-    def _confusion_counts_local(
-        predictions: torch.Tensor,
-        labels: torch.Tensor,
-    ) -> tuple[int, int, int, int]:
-        predictions = predictions.long().view(-1)
-        labels = labels.long().view(-1)
-
-        tp = int(((predictions == 1) & (labels == 1)).sum().item())
-        fp = int(((predictions == 1) & (labels == 0)).sum().item())
-        tn = int(((predictions == 0) & (labels == 0)).sum().item())
-        fn = int(((predictions == 0) & (labels == 1)).sum().item())
-        return tp, fp, tn, fn
-
-    def _safe_auc_ap(
-        probabilities: torch.Tensor,
-        labels: torch.Tensor,
-    ) -> tuple[float | None, float | None]:
-        probabilities_np = probabilities.detach().cpu().numpy()
-        labels_np = labels.detach().cpu().numpy()
-
-        if len(set(labels_np.tolist())) < 2:
-            return None, None
-
-        try:
-            auc = float(roc_auc_score(labels_np, probabilities_np))
-        except ValueError:
-            auc = None
-
-        try:
-            ap = float(average_precision_score(labels_np, probabilities_np))
-        except ValueError:
-            ap = None
-
-        return auc, ap
-
-    def _compute_metrics_from_logits(
-        logits: torch.Tensor,
-        targets: torch.Tensor,
-    ) -> dict:
-        logits = logits.view(-1)
-        targets = targets.float().view(-1)
-
-        probs = torch.sigmoid(logits)
-        hard_targets = (targets >= threshold).long()
-        predictions = (probs >= threshold).long()
-
-        loss_val = loss_fn(logits, targets)
-
-        errors = probs - targets
-        mae = torch.mean(torch.abs(errors))
-        mse = torch.mean(errors.square())
-        rmse = torch.sqrt(mse)
-
-        target_centered = targets - targets.mean()
-        prob_centered = probs - probs.mean()
-
-        ss_res = torch.sum(errors.square())
-        ss_tot = torch.sum(target_centered.square())
-
-        if float(ss_tot.item()) > 1e-12:
-            r2: float | None = float((1.0 - ss_res / ss_tot).item())
-        else:
-            r2 = None
-
-        pearson_denominator = torch.sqrt(
-            torch.sum(target_centered.square())
-            * torch.sum(prob_centered.square())
-        )
-
-        if float(pearson_denominator.item()) > 1e-12:
-            pearson: float | None = float(
-                (
-                    torch.sum(target_centered * prob_centered)
-                    / pearson_denominator
-                ).item()
-            )
-        else:
-            pearson = None
-
-        tp, fp, tn, fn = _confusion_counts_local(
-            predictions,
-            hard_targets,
-        )
-
-        total = tp + fp + tn + fn
-        acc = _safe_div(tp + tn, total)
-        precision = _safe_div(tp, tp + fp)
-        recall = _safe_div(tp, tp + fn)
-        specificity = _safe_div(tn, tn + fp)
-        f1 = (
-            2.0 * precision * recall / (precision + recall)
-            if precision + recall > 0
-            else 0.0
-        )
-
-        auc, ap = _safe_auc_ap(probs, hard_targets)
-
-        return {
-            "loss": float(loss_val.item()),
-            "mae": float(mae.item()),
-            "mse": float(mse.item()),
-            "rmse": float(rmse.item()),
-            "r2": r2,
-            "pearson": pearson,
-            # For soft targets, the following are thresholded metrics.
-            "acc": float(acc),
-            "precision": float(precision),
-            "recall": float(recall),
-            "f1": float(f1),
-            "specificity": float(specificity),
-            "auc": auc,
-            "ap": ap,
-            "tp": int(tp),
-            "fp": int(fp),
-            "tn": int(tn),
-            "fn": int(fn),
-            "target_min": float(targets.min().item()),
-            "target_mean": float(targets.mean().item()),
-            "target_max": float(targets.max().item()),
-            "p_min": float(probs.min().item()),
-            "p_mean": float(probs.mean().item()),
-            "p_max": float(probs.max().item()),
-        }
-
-    def _evaluate_split(
-        split_idx: torch.Tensor,
-    ) -> dict | None:
-        model.eval()
-
-        with torch.no_grad():
-            if use_aux:
-                output = model(
-                    x,
-                    edge_index_struct,
-                    edge_index_lab[:, split_idx],
-                    return_aux=True,
-                )
-                logits = output["edge_logits"].view(-1)
-            else:
-                logits = model(
-                    x,
-                    edge_index_struct,
-                    edge_index_lab[:, split_idx],
-                ).view(-1)
-
-            if (
-                torch.isnan(logits).any()
-                or torch.isinf(logits).any()
-            ):
-                return None
-
-            targets = y_label[split_idx]
-            return _compute_metrics_from_logits(logits, targets)
-
-    # ======================================================
-    # Early stopping state
-    # ======================================================
-
-    want = metric_mode[early_stop_metric]
-    best_metric = -float("inf") if want == "max" else float("inf")
-    best_epoch = -1
-    best_state = None
-    patience_left = int(early_stop_patience)
-
-    stopped_epoch = 0
-    stopped_metric_value = None
-    early_stopped = False
-    stop_reason = "completed"
-
-    def _is_improvement(current: float, best: float) -> bool:
-        if want == "max":
-            return current > best + early_stop_min_delta
-        return current < best - early_stop_min_delta
-
-    # ======================================================
-    # Histories
-    # ======================================================
-
-    train_losses: list[float] = []
-    val_losses: list[float] = []
-    test_losses: list[float] = []
-    train_objective_losses: list[float] = []
-
-    val_ap_history: list[float | None] = []
-    val_auc_history: list[float | None] = []
-    val_f1_history: list[float] = []
-    val_mae_history: list[float] = []
-    val_mse_history: list[float] = []
-    val_rmse_history: list[float] = []
-    val_r2_history: list[float | None] = []
-    val_pearson_history: list[float | None] = []
-
-    early_stop_metric_history: list[float] = []
-    patience_history: list[int] = []
-
-    epoch_iter = (
-        tqdm(range(num_epochs), desc="[LP-GNN] Training")
-        if use_tqdm
-        else range(num_epochs)
-    )
-
-    # ======================================================
     # Training loop
-    # ======================================================
-
-    for epoch in epoch_iter:
-        current_epoch = epoch + 1
-
+    for epoch in range(1, num_epochs + 1):
         model.train()
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
 
-        if use_aux:
-            out_train = model(
-                x,
-                edge_index_struct,
-                edge_index_lab[:, train_idx],
-                return_aux=True,
-            )
+        logits_train = model(attr, edge_index_struct, edge_index_lab_train).view(-1)
 
-            logits_train = out_train["edge_logits"].view(-1)
+        train_loss = loss_fn(logits_train, train_y_labels_smooth)
+        train_loss.backward()
 
-            if (
-                torch.isnan(logits_train).any()
-                or torch.isinf(logits_train).any()
-            ):
-                print(
-                    "[LP-GNN][ERROR] NaN/Inf in train edge logits "
-                    f"at epoch {current_epoch}."
-                )
-                stop_reason = "non_finite_train_logits"
-                break
-
-            loss_edge = loss_fn(
-                logits_train,
-                y_label[train_idx],
-            )
-            loss_src = loss_fn_src(
-                out_train["src_flip_logits"].view(-1),
-                y_src_label[train_idx],
-            )
-            loss_dst = loss_fn_dst(
-                out_train["dst_flip_logits"].view(-1),
-                y_dst_label[train_idx],
-            )
-
-            loss = (
-                loss_edge
-                + aux_loss_weight * (loss_src + loss_dst)
-            )
-
-        else:
-            logits_train = model(
-                x,
-                edge_index_struct,
-                edge_index_lab[:, train_idx],
-            ).view(-1)
-
-            if (
-                torch.isnan(logits_train).any()
-                or torch.isinf(logits_train).any()
-            ):
-                print(
-                    "[LP-GNN][ERROR] NaN/Inf in train logits "
-                    f"at epoch {current_epoch}."
-                )
-                stop_reason = "non_finite_train_logits"
-                break
-
-            # Preserve the old hard-label smoothing behavior, but do not
-            # smooth labels that are already soft.
-            if hard_label_mode:
-                label_smoothing = 0.1
-                train_targets_for_loss = (
-                    y_label[train_idx] * (1.0 - label_smoothing)
-                    + 0.5 * label_smoothing
-                )
-            else:
-                train_targets_for_loss = y_label[train_idx]
-
-            loss = loss_fn(
-                logits_train,
-                train_targets_for_loss,
-            )
-
-        if not bool(torch.isfinite(loss).item()):
-            print(
-                "[LP-GNN][ERROR] Non-finite training loss "
-                f"at epoch {current_epoch}."
-            )
-            stop_reason = "non_finite_train_loss"
-            break
-
-        loss.backward()
-
-        grad_norm_val = None
+        # Compute gradient norm for investigating gradient explosion
+        grad_norm = None
         if log_grad_norm:
-            total_norm_squared = 0.0
+            total_norm_sq = 0.0
             for parameter in model.parameters():
                 if parameter.grad is not None:
-                    parameter_norm = (
-                        parameter.grad.detach().norm(2).item()
-                    )
-                    total_norm_squared += parameter_norm ** 2
-            grad_norm_val = total_norm_squared ** 0.5
+                    norm = parameter.grad.detach().norm(2).item()
+                    total_norm_sq += norm * norm
+            grad_norm = total_norm_sq ** 0.5
 
         optimizer.step()
+        model.eval()
 
-        # ==================================================
-        # Evaluate train / validation / test
-        # ==================================================
+        # Compute validation loss
+        with torch.no_grad():
+            logits_val = model(attr, edge_index_struct, edge_index_lab_val).view(-1)
+            val_loss = loss_fn(logits_val, val_y_labels)
 
-        train_metrics = _evaluate_split(train_idx)
-        val_metrics = _evaluate_split(val_idx)
-        test_metrics = _evaluate_split(test_idx)
+            # For endpoint label mode compute Average Precision
+            if label_mode == "endpoint":
+                val_probs = torch.sigmoid(logits_val)
+                val_ap = average_precision_score(val_y_labels.detach().numpy(), val_probs.detach().numpy())
+            else:
+                val_ap = None
 
-        if train_metrics is None:
-            print(
-                "[LP-GNN][ERROR] NaN/Inf during train evaluation "
-                f"at epoch {current_epoch}."
-            )
-            stop_reason = "non_finite_train_evaluation"
-            break
+        train_loss_value = float(train_loss.item())
+        val_loss_value = float(val_loss.item())
 
-        if val_metrics is None:
-            print(
-                "[LP-GNN][ERROR] NaN/Inf during validation evaluation "
-                f"at epoch {current_epoch}."
-            )
-            stop_reason = "non_finite_validation_evaluation"
-            break
+        train_losses.append(train_loss_value)
+        val_losses.append(val_loss_value)
 
-        if test_metrics is None:
-            print(
-                "[LP-GNN][ERROR] NaN/Inf during test evaluation "
-                f"at epoch {current_epoch}."
-            )
-            stop_reason = "non_finite_test_evaluation"
-            break
+        if val_ap is not None:
+            val_aps.append(val_ap)
 
-        train_losses.append(float(train_metrics["loss"]))
-        val_losses.append(float(val_metrics["loss"]))
-        test_losses.append(float(test_metrics["loss"]))
-        train_objective_losses.append(float(loss.item()))
+        # Record early stopping metric and patience if a better score is not found
+        if label_mode == "endpoint":
+            current_score = val_ap
+            is_best = current_score > best_metric_score + early_stop_min_delta
+        else:
+            current_score = val_loss_value
+            is_best = current_score < best_metric_score - early_stop_min_delta
 
-        metric_key = early_stop_metric.replace("val_", "", 1)
-        metric_val_raw = val_metrics[metric_key]
-
-        if metric_val_raw is None:
-            raise RuntimeError(
-                f"{early_stop_metric} is unavailable at epoch "
-                f"{current_epoch}. This usually means that the validation "
-                "targets are constant for this metric. Choose val_loss, "
-                "val_mae, val_mse, or val_rmse instead."
-            )
-
-        metric_val = float(metric_val_raw)
-
-        if not math.isfinite(metric_val):
-            raise RuntimeError(
-                f"Non-finite {early_stop_metric} at epoch "
-                f"{current_epoch}: {metric_val}"
-            )
-
-        stopped_epoch = current_epoch
-        stopped_metric_value = metric_val
-
-        # ==================================================
-        # Best checkpoint and patience
-        # ==================================================
-
-        is_best = False
-
-        if _is_improvement(metric_val, best_metric):
-            best_metric = metric_val
-            best_epoch = current_epoch
+        # Record best model
+        if is_best:
+            best_metric_score = current_score
+            best_epoch = epoch
             best_state = copy.deepcopy(model.state_dict())
-            patience_left = int(early_stop_patience)
-            is_best = True
-        elif (
-            early_stop
-            and current_epoch >= min_epochs_before_early_stop
-        ):
+            patience_left = patience
+
+        # Reduce patience if metric_score moves away from target
+        elif early_stop and epoch >= min_epochs_before_early_stop:
             patience_left -= 1
 
-        val_ap_history.append(val_metrics["ap"])
-        val_auc_history.append(val_metrics["auc"])
-        val_f1_history.append(float(val_metrics["f1"]))
-        val_mae_history.append(float(val_metrics["mae"]))
-        val_mse_history.append(float(val_metrics["mse"]))
-        val_rmse_history.append(float(val_metrics["rmse"]))
-        val_r2_history.append(val_metrics["r2"])
-        val_pearson_history.append(val_metrics["pearson"])
-        early_stop_metric_history.append(metric_val)
-        patience_history.append(int(patience_left))
-
-        # ==================================================
-        # tqdm output
-        # ==================================================
-
-        if use_tqdm:
-            postfix = {
-                "tr_bce": f"{train_metrics['loss']:.4f}",
-                "tr_obj": f"{loss.item():.4f}",
-                "va_loss": f"{val_metrics['loss']:.4f}",
-                "va_mae": f"{val_metrics['mae']:.3f}",
-                "va_rmse": f"{val_metrics['rmse']:.3f}",
-                "va_ap": (
-                    f"{val_metrics['ap']:.3f}"
-                    if val_metrics["ap"] is not None
-                    else "n/a"
-                ),
-                "va_auc": (
-                    f"{val_metrics['auc']:.3f}"
-                    if val_metrics["auc"] is not None
-                    else "n/a"
-                ),
-                "va_f1": f"{val_metrics['f1']:.3f}",
-                "pat": patience_left if early_stop else "off",
-            }
-            epoch_iter.set_postfix(postfix)
-
-        # ==================================================
-        # Console output
-        # ==================================================
-
-        if verbose and (
-            current_epoch % log_every == 0
-            or current_epoch == 1
-            or current_epoch == num_epochs
-        ):
-            threshold_metric_prefix = (
-                ""
-                if hard_label_mode
-                else f"thr@{threshold:.2f}_"
-            )
-
+        # Logging message
+        if epoch == 1 or epoch % log_every == 0 or epoch == num_epochs:
             message = (
-                f"[LP-GNN] Epoch {current_epoch:03d}/{num_epochs} | "
-                f"train_bce={train_metrics['loss']:.4f} | "
-                f"train_objective={loss.item():.4f} | "
-                f"val_loss={val_metrics['loss']:.4f} | "
-                f"test_loss={test_metrics['loss']:.4f} | "
-                f"val_mae={val_metrics['mae']:.4f} | "
-                f"val_rmse={val_metrics['rmse']:.4f} | "
-                f"{threshold_metric_prefix}train_acc="
-                f"{train_metrics['acc']:.4f} | "
-                f"{threshold_metric_prefix}val_acc="
-                f"{val_metrics['acc']:.4f} | "
-                f"{threshold_metric_prefix}test_acc="
-                f"{test_metrics['acc']:.4f} | "
-                f"{threshold_metric_prefix}val_precision="
-                f"{val_metrics['precision']:.4f} | "
-                f"{threshold_metric_prefix}val_recall="
-                f"{val_metrics['recall']:.4f} | "
-                f"{threshold_metric_prefix}val_f1="
-                f"{val_metrics['f1']:.4f} | "
-                f"val_TP/FP/TN/FN="
-                f"{val_metrics['tp']}/{val_metrics['fp']}/"
-                f"{val_metrics['tn']}/{val_metrics['fn']}"
+                f"[LP-GNN] Epoch {epoch:03d}/{num_epochs} | "
+                f"train_loss={train_loss_value:.4f} | "
+                f"val_loss={val_loss_value:.4f} | "
             )
-
-            if val_metrics["r2"] is not None:
-                message += f" | val_R2={val_metrics['r2']:.4f}"
-
-            if val_metrics["pearson"] is not None:
-                message += (
-                    f" | val_Pearson={val_metrics['pearson']:.4f}"
-                )
-
-            if val_metrics["auc"] is not None:
-                message += f" | val_AUC={val_metrics['auc']:.4f}"
-
-            if val_metrics["ap"] is not None:
-                message += f" | val_AP={val_metrics['ap']:.4f}"
-
-            message += (
-                f" | best_{early_stop_metric}={best_metric:.4f} "
-                f"(epoch {best_epoch})"
-            )
-
-            if early_stop:
-                message += f" | patience_left={patience_left}"
-
-            if grad_norm_val is not None:
-                message += f" | grad_norm={grad_norm_val:.3e}"
-
-            if use_aux:
-                message += " | multitask_aux=on"
-
-            if is_best:
-                message += " | new_best"
-
+            if early_stop: message += f" | early_stopping_metric={early_stop_metric}"
+            if early_stop: message += f" | current_best={best_metric_score:.4f}"
+            if early_stop: message += f" | patience_left={patience_left}"
+            if grad_norm is not None: message += f" | grad_norm={grad_norm:.3e}"
+            if is_best: message += " | new_best"
             print(message)
 
-        # ==================================================
-        # Early stopping
-        # ==================================================
+        stopped_at = epoch
 
-        if (
-            early_stop
-            and current_epoch >= min_epochs_before_early_stop
-            and patience_left <= 0
-        ):
-            early_stopped = True
-            stop_reason = "early_stopping"
-
-            if verbose:
-                print(
-                    f"[LP-GNN] Early stopping at epoch "
-                    f"{current_epoch}. Best "
-                    f"{early_stop_metric}={best_metric:.4f} "
-                    f"at epoch {best_epoch}."
-                )
+        if early_stop and epoch >= min_epochs_before_early_stop and patience_left <= 0:
+            print(
+                f"Selector Training stopping at epoch {epoch}. "
+                f"Best early_stopping_metric={best_metric_score:.4f} at epoch {best_epoch}."
+            )
             break
 
-    # ======================================================
-    # Validate early-stopping bookkeeping
-    # ======================================================
+    # Restore the best model
+    model.load_state_dict(best_state)
 
-    stopped_at = len(train_losses)
-
-    assert stopped_at == stopped_epoch, (
-        "Internal epoch bookkeeping mismatch: "
-        f"history contains {stopped_at} epochs, "
-        f"but stopped_epoch={stopped_epoch}."
-    )
-
-    expected_history_length = stopped_at
-    histories_to_check = {
-        "val_losses": val_losses,
-        "test_losses": test_losses,
-        "train_objective_losses": train_objective_losses,
-        "val_ap": val_ap_history,
-        "val_auc": val_auc_history,
-        "val_f1": val_f1_history,
-        "val_mae": val_mae_history,
-        "val_mse": val_mse_history,
-        "val_rmse": val_rmse_history,
-        "val_r2": val_r2_history,
-        "val_pearson": val_pearson_history,
-        "early_stop_metric_history": early_stop_metric_history,
-        "patience_history": patience_history,
-    }
-
-    for history_name, history_values in histories_to_check.items():
-        assert len(history_values) == expected_history_length, (
-            f"{history_name} does not match the number of completed epochs."
-        )
-
-    if stopped_at > 0:
-        assert best_state is not None, (
-            "At least one epoch completed but no best checkpoint was recorded."
-        )
-        assert 1 <= best_epoch <= stopped_at, (
-            f"Invalid best_epoch={best_epoch} for stopped_at={stopped_at}."
-        )
-        assert math.isfinite(best_metric), (
-            "The recorded best metric is not finite."
-        )
-
-    if early_stopped:
-        assert early_stop
-        assert stopped_at >= min_epochs_before_early_stop
-        assert patience_left <= 0
-        assert stop_reason == "early_stopping"
-
-    if not early_stop:
-        assert not early_stopped
-
-    # ======================================================
-    # Restore best validation checkpoint
-    # ======================================================
-
-    restored_best = False
-
-    if restore_best and best_state is not None:
-        model.load_state_dict(best_state)
-        restored_best = True
-
-        if verbose:
-            print(
-                f"[LP-GNN] Restored best model from epoch "
-                f"{best_epoch} ({early_stop_metric}="
-                f"{best_metric:.4f})."
-            )
-
-    # ======================================================
-    # Attach history to model
-    # ======================================================
-
+    # Record training history
     model.training_history = {
         "train_losses": train_losses,
-        "train_objective_losses": train_objective_losses,
         "val_losses": val_losses,
-        "test_losses": test_losses,
-        "val_ap": val_ap_history,
-        "val_auc": val_auc_history,
-        "val_f1": val_f1_history,
-        "val_mae": val_mae_history,
-        "val_mse": val_mse_history,
-        "val_rmse": val_rmse_history,
-        "val_r2": val_r2_history,
-        "val_pearson": val_pearson_history,
-        "early_stop_metric_history": early_stop_metric_history,
-        "patience_history": patience_history,
+        "val_aps": val_aps if label_mode == "endpoint" else None,
         "stopped_at": stopped_at,
-        "best_epoch": best_epoch if best_epoch >= 1 else None,
-        "best_metric": (
-            float(best_metric) if best_epoch >= 1 else None
-        ),
-        "early_stopped": early_stopped,
-        "early_stop_enabled": early_stop,
-        "early_stop_metric": early_stop_metric,
-        "early_stop_patience": early_stop_patience,
-        "early_stop_min_delta": early_stop_min_delta,
-        "min_epochs_before_early_stop": min_epochs_before_early_stop,
-        "stopped_metric_value": stopped_metric_value,
-        "restored_best": restored_best,
-        "stop_reason": stop_reason,
-        "train_idx": train_idx.detach().cpu(),
-        "val_idx": val_idx.detach().cpu(),
-        "test_idx": test_idx.detach().cpu(),
-        "positive_class_weight": float(pos_weight),
-        "src_positive_class_weight": (
-            float(src_pos_weight) if src_pos_weight is not None else None
-        ),
-        "dst_positive_class_weight": (
-            float(dst_pos_weight) if dst_pos_weight is not None else None
-        ),
+        "best_epoch": best_epoch,
+        "train_idx": train_idx.detach(),
+        "val_idx": val_idx.detach(),
+        "test_idx": test_idx.detach(),
+        "positive_class_weight": label_weight,
         "label_mode": label_mode,
-        "hard_label_mode": hard_label_mode,
-        "threshold": float(threshold),
-        "split_strategy": split_strategy,
-        "csv_path": csv_path,
-        "csv_append": csv_append,
     }
-
-    if verbose:
-        print(
-            f"[LP-GNN] Training complete after {stopped_at} epoch(s). "
-            f"stop_reason={stop_reason} | "
-            f"label_mode={label_mode} | "
-            f"best_epoch={model.training_history['best_epoch']} | "
-            f"best_{early_stop_metric}="
-            f"{model.training_history['best_metric']}."
-        )
 
     return model
 
@@ -2809,12 +1798,10 @@ def _mine_subset_accuracy_drop(
         adj_work[src, dst] = original_values
         adj_work[dst, src] = original_values
 
-    # Max norm the labels
+    # Min-Max norm the labels
     max_raw = float(labels_raw.max())
-    labels_norm = ((labels_raw / max_raw).astype(np.float32)
-        if max_raw > 1e-8
-        else labels_raw.astype(np.float32)
-    )
+    min_raw = float(labels_raw.min())
+    labels_norm = ((labels_raw - min_raw) / (max_raw - min_raw)).astype(np.float32)
 
     mean_drop_when_selected = np.divide(
         labels_raw,
