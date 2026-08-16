@@ -12,15 +12,15 @@ class GNNEncoder(nn.Module):
         self.conv2 = GCNConv(hidden_dim, out_dim)
         self.dropout = dropout
 
-    def forward(self, x, edge_index_struct):
+    def forward(self, x, edge_index_struct, edge_weight=None):
         """
         x:                 (N, F) Node features
         edge_index_struct: (2, E) Adjacency for message passing
         """
-        h = self.conv1(x, edge_index_struct)
+        h = self.conv1(x, edge_index_struct, edge_weight)
         h = F.relu(h)
         h = F.dropout(h, p=self.dropout, training=self.training)
-        h = self.conv2(h, edge_index_struct)
+        h = self.conv2(h, edge_index_struct, edge_weight)
 
         return h
 
@@ -32,19 +32,14 @@ class EdgeScoringHead(nn.Module):
 
     def __init__(self, node_emb_dim, pair_hidden_dim=None):
         super().__init__()
-
         d = node_emb_dim
-
         pair_in_dim = 4 * d
-
         if pair_hidden_dim is None:
             pair_hidden_dim = 2 * d
-
         self.pair_trunk = nn.Sequential(
             nn.Linear(pair_in_dim, pair_hidden_dim),
             nn.ReLU(),
         )
-
         self.edge_out = nn.Linear(pair_hidden_dim, 1)
 
     def forward(self, h, edge_index_lab):
@@ -65,8 +60,8 @@ class EdgeScoringHead(nn.Module):
             [
                 h_src * h_dst,
                 torch.abs(h_src - h_dst),
-                h_src,
-                h_dst,
+                torch.minimum(h_src, h_dst),
+                torch.maximum(h_src, h_dst),
             ],
             dim=-1,
         )  # (M, 4d)
@@ -103,6 +98,6 @@ class LinkPredictionGNN(nn.Module):
 
         self.edge_head = EdgeScoringHead(out_dim)
 
-    def forward(self, x, edge_index_struct, edge_index_lab):
-        h = self.encoder(x, edge_index_struct)
+    def forward(self, x, edge_index_struct, edge_index_lab, edge_weight=None):
+        h = self.encoder(x, edge_index_struct, edge_weight)
         return self.edge_head(h, edge_index_lab)
