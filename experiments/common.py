@@ -151,8 +151,9 @@ def run_global_attack(
 
     rq1_enabled = bool(getattr(adversary, "rq1_enabled", False))
     is_custom_initial_block = getattr(adversary, "initial_block_linear_ids", None) is not None
+    block_diagnostics_enabled = bool(getattr(adversary, "block_diagnostics_enabled", False))
 
-    if rq1_enabled or is_custom_initial_block:
+    if rq1_enabled or is_custom_initial_block or block_diagnostics_enabled:
         # RQ1 needs fresh per-epoch search-space diagnostics. Cached final
         # perturbations contain only the final graph, not those diagnostics.
         pert_adj = None

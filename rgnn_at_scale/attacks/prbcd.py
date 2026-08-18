@@ -43,10 +43,12 @@ class PRBCD(SparseAttack):
             block_diagnostics_enabled: bool = False,
             attack_sampling_seed: Optional[int] = None,
 
-            # RQ1
-            rq1_enabled: bool = False,
-            rq1_is_reference: bool = False,
-            rq1_sampling_seed: Optional[int] = None,
+            # Injection experiments from RQ1
+            probe_ids: Optional[List[int]] = None,
+            probe_groups: Optional[List[str]] = None,
+            probe_checkpoint_epochs: Optional[List[int]] = None,
+            injection_ids: Optional[List[int]] = None,
+            injection_epoch: Optional[int] = None,
 
             **kwargs,
     ):
@@ -72,15 +74,6 @@ class PRBCD(SparseAttack):
             else None
         )
 
-        # RQ1 configuration
-        self.rq1_enabled = bool(rq1_enabled)
-        self.rq1_is_reference = bool(rq1_is_reference)
-        self.rq1_sampling_seed = (
-            int(rq1_sampling_seed)
-            if rq1_sampling_seed is not None
-            else 0
-        )
-
         self.keep_heuristic = keep_heuristic
         self.display_step = display_step
         self.epochs = epochs
@@ -103,19 +96,17 @@ class PRBCD(SparseAttack):
         else:
             self.n_possible_edges = self.n ** 2  # We filter self-loops later
 
-        # RQ1 reference runs use the complete edge-flip space as one fixed block.
-        # This makes all epochs behave like fine-tuning epochs: no block sampling
-        # or resampling is performed, and the learning-rate schedule starts in
-        # the fine-tuning regime immediately.
-        if self.rq1_is_reference:
-            self.block_size = int(self.n_possible_edges)
-            self.fine_tune_epochs = int(self.epochs)
-            self.epochs_resampling = 0
-
         self.lr_factor = lr_factor * max(
             math.log2(self.n_possible_edges / self.block_size),
             1.,
         )
+
+        self.probe_ids = [edge_id for edge_id in (probe_ids or [])]
+        self.probe_groups = list(probe_groups or [])
+        self.probe_checkpoint_epochs = set(epoch for epoch in (probe_checkpoint_epochs or []))
+
+        self.injection_ids = [edge_id for edge_id in (injection_ids or [])]
+        self.injection_epoch = injection_epoch if injection_epoch is not None else None
 
     def _attack(self, ads_mode, graph, n_perturbations, semi=False, use_cert="none", grid_radii: Optional[np.ndarray] = None, grid_binary_class: Optional[np.ndarray] = None, **kwargs):
         """Perform attack (`n_perturbations` is increasing as it was a greedy attack).
@@ -132,18 +123,11 @@ class PRBCD(SparseAttack):
 
         if self.attack_sampling_seed is not None:
             attack_sampling_seed = int(self.attack_sampling_seed)
-        elif self.rq1_enabled or self.rq1_is_reference:
-            attack_sampling_seed = int(self.rq1_sampling_seed)
         else:
             attack_sampling_seed = int(self.seed or 0)
 
         # Seed before constructing either a random block or any later refill.
-        if (
-            self.attack_sampling_seed is not None
-            or self.rq1_enabled
-            or self.rq1_is_reference
-            or self.block_diagnostics_enabled
-        ):
+        if self.attack_sampling_seed is not None or self.block_diagnostics_enabled:
             torch.manual_seed(attack_sampling_seed)
 
             if torch.cuda.is_available():
@@ -162,48 +146,8 @@ class PRBCD(SparseAttack):
 
         # For collecting attack statistics
         self.attack_statistics: DefaultDict[str, Any] = defaultdict(list)
-
-        if self.rq1_enabled:
-            self.attack_statistics["rq1"] = {
-                "final_linear_ids": torch.empty(
-                    0,
-                    dtype=torch.long,
-                ),
-                "initial_block": None,
-                "epoch_blocks": {},
-                "resample_events": [],
-                "positive_gradient_sum": None,
-                "max_weight": None,
-                "times_seen": None,
-                "metadata": {
-                    "block_size": int(self.block_size),
-                    "n_perturbations": int(n_perturbations),
-                    "sampling_seed": int(self.rq1_sampling_seed),
-                    "is_reference": bool(self.rq1_is_reference),
-                    "use_cert": str(use_cert),
-                    "full_space_reference": bool(self.rq1_is_reference),
-                    "n_possible_edges": int(self.n_possible_edges),
-                    "epochs_resampling": int(self.epochs_resampling),
-                },
-            }
-
-            if self.rq1_is_reference:
-                rq1 = self.attack_statistics["rq1"]
-
-                rq1["positive_gradient_sum"] = torch.zeros(
-                    self.n_possible_edges,
-                    dtype=torch.float32,
-                )
-
-                rq1["max_weight"] = torch.zeros(
-                    self.n_possible_edges,
-                    dtype=torch.float32,
-                )
-
-                rq1["times_seen"] = torch.zeros(
-                    self.n_possible_edges,
-                    dtype=torch.int32,
-                )
+        self.attack_statistics["probe_results"] = []
+        self.attack_statistics["injection"] = None
 
         if self.block_diagnostics_enabled:
             self.attack_statistics["block_diagnostics"] = {
@@ -212,17 +156,18 @@ class PRBCD(SparseAttack):
                 "resample_events": [],
                 "final_block": None,
                 "final_linear_ids": torch.empty(0, dtype=torch.long),
+                "max_weight": torch.zeros(self.n_possible_edges, dtype=torch.float32),
                 "metadata": {
-                    "block_size": int(self.block_size),
-                    "n_perturbations": int(n_perturbations),
-                    "sampling_seed": int(attack_sampling_seed),
+                    "block_size": self.block_size,
+                    "n_perturbations": n_perturbations,
+                    "sampling_seed": attack_sampling_seed,
                     "initial_block_label": self.initial_block_label,
-                    "custom_initial_block": bool(self.initial_block_linear_ids is not None),
-                    "resampling_enabled": bool(self.resampling_enabled),
-                    "epochs": int(self.epochs),
-                    "fine_tune_epochs": int(self.fine_tune_epochs),
-                    "epochs_resampling": int(self.epochs_resampling),
-                    "n_possible_edges": int(self.n_possible_edges),
+                    "custom_initial_block": self.initial_block_linear_ids is not None,
+                    "resampling_enabled": self.resampling_enabled,
+                    "epochs": self.epochs,
+                    "fine_tune_epochs": self.fine_tune_epochs,
+                    "epochs_resampling": self.epochs_resampling,
+                    "n_possible_edges": self.n_possible_edges,
                 },
             }
 
@@ -233,16 +178,6 @@ class PRBCD(SparseAttack):
         # Supplied Block takes prescedent over sampling
         if self.initial_block_linear_ids is not None:
             self.init_search_space_from_linear_ids(self.initial_block_linear_ids)
-
-        # RQ1 reference: use the complete edge-flip space as a fixed block.
-        elif self.rq1_is_reference:
-            print(
-                "[RQ1] reference run -> using full edge-flip search space "
-                "and disabling resampling"
-            )
-            self.sample_full_search_space(
-                n_perturbations=n_perturbations,
-            )
 
         elif use_cert in ("accuracy_drop_selector","accuracy_drop_selector_with_resampling"):
             if self.lp_model is None:
@@ -281,13 +216,16 @@ class PRBCD(SparseAttack):
                 probability_mass_update=0.0,
                 probability_mass_projected=0.0,
                 epoch=None,
-                gradient=None,
             )
 
             del logits, loss
 
         # Loop over the epochs (Algorithm 1, line 5)
         for epoch in tqdm(range(self.epochs)):
+
+            # Inject edges for RQ1 Injection experiment
+            self._inject_edges(epoch)
+
             self.perturbed_edge_weight.requires_grad = True
 
             # Retreive sparse perturbed adjacency matrix `A \oplus p_{t-1}` (Algorithm 1, line 6)
@@ -320,7 +258,7 @@ class PRBCD(SparseAttack):
                 # For monitoring
                 probability_mass_projected = self.perturbed_edge_weight.sum().item()
 
-                # Calculate accuracy after the current epoch (overhead for monitoring and early stopping)
+                # Calculate accuracy after the current epoch
                 edge_index, edge_weight = self.get_modified_adj()
                 logits = self.attacked_model(data=self.attr.to(self.device), adj=(edge_index, edge_weight))
                 accuracy = utils.accuracy(logits, self.labels, self.idx_attack)
@@ -344,24 +282,16 @@ class PRBCD(SparseAttack):
                     probability_mass_update=probability_mass_update,
                     probability_mass_projected=probability_mass_projected,
                     epoch=epoch,
-                    gradient=gradient,
                 )
 
-                # Skip resampling for RQ1 reference runs or when explicitly disabled
-                if self.rq1_is_reference or not self.resampling_enabled:
+                self._run_loss_probes(epoch=epoch,n_perturbations=n_perturbations)
+
+                # Skip resampling for RQ2 initial block experiment
+                if not self.resampling_enabled:
                     pass
 
                 # Resampling of search space (Algorithm 1, line 9-14)
                 elif epoch < self.epochs_resampling - 1:
-
-                    if self.rq1_enabled and not self.rq1_is_reference:
-                        rq1_before_resampling = (
-                            self.current_search_space
-                            .detach()
-                            .cpu()
-                            .long()
-                            .clone()
-                        )
 
                     if self.block_diagnostics_enabled:
                         diagnostic_before_resampling = (
@@ -399,23 +329,6 @@ class PRBCD(SparseAttack):
                     # Record the post-resampling block
                     # ==========================================================
 
-                    if self.rq1_enabled and not self.rq1_is_reference:
-                        rq1_after_resampling = (
-                            self.current_search_space
-                            .detach()
-                            .cpu()
-                            .long()
-                            .clone()
-                        )
-
-                        self.attack_statistics["rq1"][
-                            "resample_events"
-                        ].append({
-                            "epoch": int(epoch),
-                            "before": rq1_before_resampling,
-                            "after": rq1_after_resampling,
-                        })
-
                     if self.block_diagnostics_enabled:
                         diagnostic_after_resampling = (
                             self.current_search_space
@@ -448,36 +361,6 @@ class PRBCD(SparseAttack):
 
         # Sample final discrete graph (Algorithm 1, line 16)
         edge_index = self.sample_final_edges(n_perturbations)[0]
-
-        if self.rq1_enabled:
-            final_space = (
-                self.current_search_space
-                .detach()
-                .cpu()
-                .long()
-            )
-
-            final_weights = (
-                self.perturbed_edge_weight
-                .detach()
-                .cpu()
-                .float()
-            )
-
-            if final_space.numel() != final_weights.numel():
-                raise RuntimeError(
-                    "Final current_search_space and "
-                    "perturbed_edge_weight are not aligned."
-                )
-
-            final_mask = final_weights > 0.5
-
-            self.attack_statistics["rq1"][
-                "final_linear_ids"
-            ] = torch.unique(
-                final_space[final_mask],
-                sorted=True,
-            )
 
         if self.block_diagnostics_enabled:
             final_space = (
@@ -702,48 +585,6 @@ class PRBCD(SparseAttack):
         )
 
         return
-
-    def sample_full_search_space(self, n_perturbations: int = 0):
-        """Initialize the PRBCD block with every possible edge-flip variable.
-
-        This is intended for RQ1 reference runs. For undirected attacks, the
-        search space is exactly all upper-triangular node pairs. For directed
-        attacks, self-loops are removed after decoding, matching the existing
-        random-block behavior.
-        """
-        self.current_search_space = torch.arange(
-            self.n_possible_edges,
-            device=self.device,
-            dtype=torch.long,
-        )
-
-        if self.make_undirected:
-            self.modified_edge_index = PRBCD.linear_to_triu_idx(
-                self.n,
-                self.current_search_space,
-            )
-        else:
-            self.modified_edge_index = PRBCD.linear_to_full_idx(
-                self.n,
-                self.current_search_space,
-            )
-            is_not_self_loop = self.modified_edge_index[0] != self.modified_edge_index[1]
-            self.current_search_space = self.current_search_space[is_not_self_loop]
-            self.modified_edge_index = self.modified_edge_index[:, is_not_self_loop]
-
-        self.perturbed_edge_weight = torch.full_like(
-            self.current_search_space,
-            self.eps,
-            dtype=torch.float32,
-            requires_grad=True,
-        )
-
-        if self.current_search_space.size(0) < n_perturbations:
-            raise RuntimeError(
-                f"Full RQ1 reference search space has fewer edges "
-                f"({self.current_search_space.size(0)}) than "
-                f"n_perturbations={n_perturbations}."
-            )
 
     def sample_random_block(self, n_perturbations: int = 0, mod_block_size: int = 0):
         for _ in range(self.max_final_samples):
@@ -1054,6 +895,160 @@ class PRBCD(SparseAttack):
                 self.n, self.current_search_space
             )
 
+    @torch.no_grad()
+    def _inject_edges(self, epoch):
+
+        if self.injection_epoch is None:
+            return
+
+        if epoch != self.injection_epoch:
+            return
+
+        if not self.injection_ids:
+            return
+
+        injection_ids = torch.tensor(
+            self.injection_ids,
+            dtype=torch.long,
+            device=self.device,
+        )
+
+        n_injected = injection_ids.numel()
+        # Positions of the n lowest-weight current candidates
+        lowest_idx = torch.argsort(self.perturbed_edge_weight)[:n_injected]
+
+        removed_ids = self.current_search_space[lowest_idx].detach().clone()
+        removed_weights = self.perturbed_edge_weight[lowest_idx].detach().clone()
+
+        # Replace linear IDs
+        self.current_search_space[lowest_idx] = injection_ids
+        # Replace corresponding node-pairs
+        if self.make_undirected:
+            injected_pairs = PRBCD.linear_to_triu_idx(self.n, injection_ids)
+        else:
+            injected_pairs = PRBCD.linear_to_full_idx(self.n, injection_ids)
+
+        self.modified_edge_index[:, lowest_idx] = injected_pairs
+
+        # Replace lowest weights with epsilon
+        self.perturbed_edge_weight[lowest_idx] = self.eps
+
+        self.attack_statistics["injection"] = {
+            "epoch": int(epoch),
+            "injected_ids": injection_ids.detach().cpu(),
+            "removed_ids": removed_ids.cpu(),
+            "removed_weights": removed_weights.cpu(),
+        }
+
+    def _run_loss_probes(self, epoch, n_perturbations):
+        if epoch not in self.probe_checkpoint_epochs or not self.probe_ids:
+            return
+
+        # Save the actual PRBCD checkpoint
+        original_space = self.current_search_space.detach().clone()
+        original_edge_index = self.modified_edge_index.detach().clone()
+
+        original_weights = self.perturbed_edge_weight.detach().clone()
+        original_requires_grad = self.perturbed_edge_weight.requires_grad
+
+        # Save RNG so probes cannot affect later PRBCD sampling
+        original_rng_state = torch.random.get_rng_state()
+
+        # Same weakest edge is removed for every candidate
+        lowest_idx = torch.argmin(original_weights).item()
+
+        removed_edge_id = original_space[lowest_idx].item()
+        removed_weight = original_weights[lowest_idx].item()
+
+        one_step_epoch = epoch + 1
+
+        def restore_checkpoint():
+
+            self.current_search_space = original_space.clone()
+            self.modified_edge_index = original_edge_index.clone()
+            self.perturbed_edge_weight = original_weights.clone().requires_grad_(original_requires_grad)
+            torch.random.set_rng_state(original_rng_state)
+
+            if hasattr(self.attacked_model, "release_cache"):
+                self.attacked_model.release_cache()
+
+        def detached_prbcd_step():
+
+            # Fresh independent gradient tensor
+            self.perturbed_edge_weight = self.perturbed_edge_weight.detach().clone().requires_grad_(True)
+            with torch.enable_grad():
+                edge_index, edge_weight = self.get_modified_adj()
+                logits = self._get_logits(self.attr, edge_index, edge_weight)
+                pre_step_loss = self.calculate_loss(logits[self.idx_attack],self.labels[self.idx_attack])
+                gradient = utils.grad_with_checkpoint(pre_step_loss, self.perturbed_edge_weight)[0]
+
+            with torch.no_grad():
+                self.update_edge_weights(n_perturbations, one_step_epoch, gradient)
+                self.perturbed_edge_weight = (
+                    Attack.project(n_perturbations, self.perturbed_edge_weight, self.eps).detach()
+                )
+
+                # If the victim model has a preprocessed adjacency release it
+                if hasattr(self.attacked_model, "release_cache"):
+                    self.attacked_model.release_cache()
+
+                # Calculate the loss for every edge including the replaced edge
+                edge_index, edge_weight = self.get_modified_adj()
+                logits = self._get_logits(self.attr,edge_index,edge_weight)
+                post_step_loss = self.calculate_loss(logits[self.idx_attack],self.labels[self.idx_attack])
+
+            return pre_step_loss.detach().item(), post_step_loss.detach().item(), gradient.detach().clone()
+        try:
+            # Restore the checkpoint before probing a new edge
+            restore_checkpoint()
+            (checkpoint_loss, baseline_loss, _,) = detached_prbcd_step()
+
+            for candidate_id, group in zip(self.probe_ids,self.probe_groups):
+
+                restore_checkpoint()
+
+                candidate_tensor = torch.tensor(
+                    [candidate_id],
+                    dtype=torch.long,
+                    device=self.device,
+                )
+
+                if self.make_undirected:
+                    candidate_pair = PRBCD.linear_to_triu_idx(self.n, candidate_tensor,)
+                else:
+                    candidate_pair = PRBCD.linear_to_full_idx(self.n,candidate_tensor,)
+
+                # Replace the edge with the lowest weight
+                self.current_search_space[lowest_idx] = candidate_id
+                self.modified_edge_index[:, lowest_idx] = candidate_pair[:, 0]
+
+                # Initialize its weight at epsilon
+                self.perturbed_edge_weight[lowest_idx] = self.eps
+
+                # Perform one detached "hypothetical" PR-BCD step to potentially accumulate edge weight
+                (candidate_pre_loss, probe_loss, gradient) = detached_prbcd_step()
+                candidate_gradient = gradient[lowest_idx].item()
+
+                self.attack_statistics["probe_results"].append({
+                    "checkpoint_epoch": epoch,
+                    "one_step_epoch": one_step_epoch,
+                    "linear_id": candidate_id,
+                    "group": str(group),
+                    "removed_linear_id":removed_edge_id,
+                    "replacement_weight": removed_weight,
+                    "candidate_initial_weight": self.eps,
+                    "candidate_gradient": candidate_gradient,
+                    "checkpoint_loss": checkpoint_loss,
+                    "candidate_pre_step_loss": candidate_pre_loss,
+                    "baseline_loss": baseline_loss,
+                    "probe_loss": probe_loss,
+                    "delta_loss": probe_loss - baseline_loss,
+                })
+
+        finally:
+            # Restores all PR-BCD optimization parameters to the original state
+            restore_checkpoint()
+
     @staticmethod
     def linear_to_triu_idx(n: int, lin_idx: torch.Tensor) -> torch.Tensor:
         row_idx = (
@@ -1097,7 +1092,6 @@ class PRBCD(SparseAttack):
             probability_mass_projected,
             *,
             epoch=None,
-            gradient=None,
     ):
         epoch_id = -1 if epoch is None else int(epoch)
 
@@ -1116,57 +1110,22 @@ class PRBCD(SparseAttack):
         )
 
         # Nothing else required
-        if not self.block_diagnostics_enabled and not self.rq1_enabled:
+        if not self.block_diagnostics_enabled:
             return
-
-        current_ids = (
-            self.current_search_space
-            .detach()
-            .cpu()
-            .long()
-            .clone()
-        )
 
         # Block history
         if self.block_diagnostics_enabled:
             diagnostics = self.attack_statistics["block_diagnostics"]
+            current_ids = self.current_search_space.detach().cpu().long().clone()
+            current_weights = self.perturbed_edge_weight.detach().cpu().float()
 
             if epoch is None:
                 diagnostics["initial_block"] = current_ids
             else:
                 diagnostics["epoch_blocks"][int(epoch)] = current_ids
 
-        # RQ1 reference metrics
-        if not self.rq1_enabled or epoch is None:
-            return
-
-        if self.rq1_is_reference:
-            if gradient is None:
-                raise RuntimeError(
-                    "RQ1 reference recording requires gradient."
-                )
-
-            current_gradient = (
-                gradient.detach().cpu().float()
-            )
-
-            current_weights = (
-                self.perturbed_edge_weight
-                .detach()
-                .cpu()
-                .float()
-            )
-
-            rq1 = self.attack_statistics["rq1"]
-
-            rq1["positive_gradient_sum"].index_add_(
-                0,
-                current_ids,
-                current_gradient.clamp_min(0.0),
-            )
-
-            rq1["max_weight"][current_ids] = torch.maximum(
-                rq1["max_weight"][current_ids],
+            diagnostics["max_weight"][current_ids] = torch.maximum(
+                diagnostics["max_weight"][current_ids],
                 current_weights,
             )
 
