@@ -171,9 +171,6 @@ class PRBCD(SparseAttack):
                 },
             }
 
-        #tried_mask for selector exclusion
-        self.tried_mask = torch.zeros(self.n_possible_edges, device=self.device, dtype=torch.bool)
-
         # Sample initial search space (Algorithm 1, line 3-4).
         # Supplied Block takes prescedent over sampling
         if self.initial_block_linear_ids is not None:
@@ -193,7 +190,6 @@ class PRBCD(SparseAttack):
                 score_batch_size=self.score_batch_size,
                 max_sampling_tries=self.max_sampling_tries,
                 rng_seed=attack_sampling_seed,
-                exclude_tried=self.exclude_tried,
             )
         elif use_cert == "none":
             print("Standard PRBCD -> random initial block")
@@ -201,6 +197,10 @@ class PRBCD(SparseAttack):
         else:
             raise ValueError(f"Unknown use_cert mode: {use_cert!r}"
                              )
+
+        # Keep track of every edge that has ever entered the PR-BCD block
+        self.accepted_edge_history = torch.unique(self.current_search_space.detach().clone(), sorted=True)
+
         # Accuracy and attack statistics before the attack even started
         with torch.no_grad():
 
@@ -309,7 +309,6 @@ class PRBCD(SparseAttack):
                                 graph=graph,
                                 top_k_per_batch=self.top_k_per_batch,
                                 score_batch_size=self.score_batch_size,
-                                exclude_tried=self.exclude_tried,
                                 rng_seed=(attack_sampling_seed + epoch + 1)
                             )
                         else:
@@ -613,10 +612,10 @@ class PRBCD(SparseAttack):
             max_sampling_tries: int,
             score_batch_size: int,
             rng_seed: int,
-            exclude_tried: bool,
     ):
         X, edge_index = self.extract_X_and_edge_index_from_sparsegraph(graph)
 
+        # Prepare the selector and encode the clean graph
         self.lp_model.eval()
         with torch.no_grad():
             h = self.lp_model.encoder(X, edge_index)
@@ -627,11 +626,6 @@ class PRBCD(SparseAttack):
         # Parameters to keep track of already accepted edges
         accepted = []
         accepted_count = 0
-        accepted_mask = torch.zeros(
-            self.n_possible_edges,
-            dtype=torch.bool,
-            device=self.device,
-        )
 
         # Try repeatedly to fill the block until max_sampling_tries
         for _ in range(max_sampling_tries):
@@ -640,17 +634,13 @@ class PRBCD(SparseAttack):
 
             # Sample a random candidate set for scoring with size score_batch_size
             cand_lin = torch.unique(
-                torch.randint(
-                    self.n_possible_edges,
-                    (score_batch_size,),
-                    device=self.device,
-                    generator=generator,
-                ),
+                torch.randint(self.n_possible_edges, (score_batch_size,), device=self.device, generator=generator),
                 sorted=False,
             )
 
-            blocked_mask = self.tried_mask if exclude_tried else accepted_mask
-            cand_lin = cand_lin[~blocked_mask[cand_lin]]
+            # Exclude already accepted edges
+            if accepted:
+                cand_lin = cand_lin[~torch.isin(cand_lin, torch.cat(accepted))]
 
             # If all candidates were blocked sample again
             if cand_lin.numel() == 0:
@@ -667,21 +657,19 @@ class PRBCD(SparseAttack):
             if cand_lin.numel() == 0:
                 continue
 
+            # Obtain selector scores
             with torch.no_grad():
                 scores = torch.sigmoid(self.lp_model.edge_head(h, cand_ei).view(-1))
-
-            if exclude_tried:
-                self.tried_mask[cand_lin] = True
 
             # Select only those candidates that are above the tau threshold
             selected = cand_lin[scores >= tau]
             remaining = self.block_size - accepted_count
-            # Prevents overfilling the block
+
+            # Prevent overfilling the block
             selected = selected[:remaining]
 
             if selected.numel() > 0:
                 accepted.append(selected)
-                accepted_mask[selected] = True
                 accepted_count += selected.numel()
 
         if accepted_count < self.block_size:
@@ -693,15 +681,9 @@ class PRBCD(SparseAttack):
         self.current_search_space = torch.cat(accepted)
 
         if self.make_undirected:
-            self.modified_edge_index = PRBCD.linear_to_triu_idx(
-                self.n,
-                self.current_search_space,
-            )
+            self.modified_edge_index = PRBCD.linear_to_triu_idx(self.n, self.current_search_space)
         else:
-            self.modified_edge_index = PRBCD.linear_to_full_idx(
-                self.n,
-                self.current_search_space,
-            )
+            self.modified_edge_index = PRBCD.linear_to_full_idx(self.n, self.current_search_space)
 
         self.perturbed_edge_weight = torch.full(
             (self.current_search_space.numel(),),
@@ -765,84 +747,68 @@ class PRBCD(SparseAttack):
             top_k_per_batch: int = 100,
             score_batch_size: int = 10_000,
             rng_seed: int = 0,
-            exclude_tried: bool = True,
     ):
-        """Refill the PRBCD block using top_k_per_batch from a batch of size score_batch_size."""
+        """Refill the PRBCD block with top-scoring candidates from random batches."""
 
         # Keep step from PR-BCD, keeps at most half of the block
         if self.keep_heuristic == "WeightOnly":
             sorted_idx = torch.argsort(self.perturbed_edge_weight)
             idx_keep = (self.perturbed_edge_weight <= self.eps).sum().long()
+
             if idx_keep < sorted_idx.size(0) // 2:
                 idx_keep = sorted_idx.size(0) // 2
         else:
-            raise NotImplementedError(
-                "Only keep_heuristic=`WeightOnly` supported"
-            )
+            raise NotImplementedError("Only keep_heuristic=`WeightOnly` supported")
 
         sorted_idx = sorted_idx[idx_keep:]
+
         self.current_search_space = self.current_search_space[sorted_idx]
         self.modified_edge_index = self.modified_edge_index[:, sorted_idx]
         self.perturbed_edge_weight = self.perturbed_edge_weight[sorted_idx]
 
-        # Number of edge ids needed to refill the block
+        # Number of new edges needed to refill the block
         n_needed = self.block_size - self.current_search_space.numel()
+
+        # Stop resampling when block has been filled
+        if n_needed <= 0:
+            return
 
         X, _ = self.extract_X_and_edge_index_from_sparsegraph(graph)
 
-        # Encode current relaxed perturbations, GCN Conv natively accepts that.
+        # Encode current relaxed perturbations
         with torch.no_grad():
             edge_index_struct, edge_weight = self.get_modified_adj()
-            h = self.lp_model.encoder(X, edge_index_struct, edge_weight)
+            h = self.lp_model.encoder(
+                X,
+                edge_index_struct
+            )
 
         generator = torch.Generator(device=self.device)
         generator.manual_seed(int(rng_seed))
 
-        blocked_mask = torch.zeros(
-            self.n_possible_edges,
-            device=self.device,
-            dtype=torch.bool,
-        )
-
-        # Keeping this blocked mask is sadly O(N^2)
-        blocked_mask[self.current_search_space] = True
-        if exclude_tried:
-            blocked_mask |= self.tried_mask
-
-        # Create a pool of all edges that are not blocked
-        allowed_pool = torch.nonzero(~blocked_mask, as_tuple=False).view(-1)
-
-        # Throw exception when allowed pool gets too small for refilling the block
-        if allowed_pool.numel() < n_needed:
-            raise RuntimeError(
-                "Not enough candidates for top-k resampling: "
-                f"needed={n_needed}, eligible={allowed_pool.numel()}, "
-                f"exclude_tried={exclude_tried}."
-            )
-
-        # Order the allowed pool to subsequently sample score batches from them
-        sampling_order = torch.randperm(
-            allowed_pool.numel(),
-            device=self.device,
-            generator=generator,
-        )
-
-        # Let a counter run over all allowed edges
-        sampling_cursor = 0
         accepted_ids = []
         accepted_count = 0
 
-        while accepted_count < n_needed and sampling_cursor < sampling_order.numel():
-            batch_end = min(sampling_cursor + score_batch_size, sampling_order.numel())
-            batch_positions = sampling_order[sampling_cursor:batch_end]
-            sampling_cursor = batch_end
-            cand_lin = allowed_pool[batch_positions]
+        while accepted_count < n_needed:
 
-            # From original PR-BCD, in this thesis, we only evaluate undirected graphs.
+            # Sample random candidate edges directly from the full edge space
+            cand_lin = torch.unique(
+                torch.randint(self.n_possible_edges, (score_batch_size,), device=self.device, generator=generator),
+                sorted=False,
+            )
+
+            # Exclude edges that have ever entered the PR-BCD block
+            cand_lin = cand_lin[~torch.isin(cand_lin, self.accepted_edge_history)]
+
+            # If all candidates were blocked sample again
+            if cand_lin.numel() == 0:
+                continue
+
+            # Convert linear ids to node pairs
             if self.make_undirected:
                 cand_ei = PRBCD.linear_to_triu_idx(self.n, cand_lin)
             else:
-                cand_ei = PRBCD.linear_to_full_idx(self.n, cand_lin)
+                cand_ei = PRBCD.linear_to_full_idx(self.n,cand_lin)
                 is_not_self = cand_ei[0] != cand_ei[1]
                 cand_lin = cand_lin[is_not_self]
                 cand_ei = cand_ei[:, is_not_self]
@@ -854,46 +820,37 @@ class PRBCD(SparseAttack):
                 logits = self.lp_model.edge_head(h, cand_ei).view(-1)
                 scores = torch.sigmoid(logits)
 
-            # Exclude every scored candidate across later epochs.
-            if exclude_tried:
-                self.tried_mask[cand_lin] = True
-
+            # Select the k highest-scoring candidates
             current_k = min(top_k_per_batch, scores.numel())
-            top_positions = torch.topk(scores, k=current_k).indices
+            top_positions = torch.topk(scores,k=current_k).indices
             batch_top_ids = cand_lin[top_positions]
 
+            # Prevent overfilling the PR-BCD block
             remaining = n_needed - accepted_count
             batch_top_ids = batch_top_ids[:remaining]
-            accepted_ids.append(batch_top_ids)
-            accepted_count += int(batch_top_ids.numel())
 
-        if accepted_count < n_needed:
-            raise RuntimeError(
-                f"Could not refill block: needed={n_needed}, accepted={accepted_count}."
+            accepted_ids.append(batch_top_ids)
+            accepted_count += batch_top_ids.numel()
+
+            # Permanently exclude every edge that entered the block
+            self.accepted_edge_history = torch.unique(
+                torch.cat((self.accepted_edge_history, batch_top_ids)),
+                sorted=True,
             )
 
         fill_lin = torch.cat(accepted_ids)
 
-        # Init edge weights of the new block with epsilon
-        new_weights = torch.full(
-            (fill_lin.numel(),),
-            self.eps,
-            dtype=torch.float32,
-            device=self.device,
-        )
+        # Initialize new block weights with epsilon
+        new_weights = torch.full((fill_lin.numel(),), self.eps, dtype=torch.float32, device=self.device,)
 
-        # Fill PR-BCD optimization block
+        # Refill PR-BCD optimization block
         self.current_search_space = torch.cat((self.current_search_space, fill_lin))
         self.perturbed_edge_weight = torch.cat((self.perturbed_edge_weight, new_weights))
 
         if self.make_undirected:
-            self.modified_edge_index = PRBCD.linear_to_triu_idx(
-                self.n, self.current_search_space
-            )
+            self.modified_edge_index = PRBCD.linear_to_triu_idx(self.n, self.current_search_space)
         else:
-            self.modified_edge_index = PRBCD.linear_to_full_idx(
-                self.n, self.current_search_space
-            )
+            self.modified_edge_index = PRBCD.linear_to_full_idx(self.n, self.current_search_space)
 
     @torch.no_grad()
     def _inject_edges(self, epoch):
@@ -1248,5 +1205,4 @@ class PRBCD(SparseAttack):
         self.tau = selector_params.get("tau", 0.8)
         self.score_batch_size = selector_params.get("score_batch_size", 1000)
         self.max_sampling_tries = selector_params.get("max_sampling_tries", 2_000_000)
-        self.exclude_tried = selector_params.get("exclude_tried", True)
         self.top_k_per_batch = selector_params.get("top_k_per_batch",100)

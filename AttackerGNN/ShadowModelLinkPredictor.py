@@ -60,8 +60,8 @@ class EdgeScoringHead(nn.Module):
             [
                 h_src * h_dst,
                 torch.abs(h_src - h_dst),
-                torch.minimum(h_src, h_dst),
-                torch.maximum(h_src, h_dst),
+                h_src,
+                h_dst,
             ],
             dim=-1,
         )  # (M, 4d)
