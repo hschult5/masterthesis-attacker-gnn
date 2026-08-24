@@ -149,19 +149,10 @@ This repository builds on the PR-BCD implementation introduced by
 The original implementation is available at:
 https://github.com/sigeisler/robustness_of_gnns_at_scale
 
-If you use this repository, please also cite the original work:
+No other code was used. Other Citations are provided in the thesis papar.
 
-```bibtex
-@article{geisler2021robustness,
-  author  = {Simon Geisler and
-             Tobias Schmidt and
-             Hakan Sirin and
-             Daniel Z{\"u}gner and
-             Aleksandar Bojchevski and
-             Stephan G{\"u}nnemann},
-  title   = {Robustness of Graph Neural Networks at Scale},
-  journal = {CoRR},
-  volume  = {abs/2110.14038},
-  year    = {2021},
-  url     = {https://arxiv.org/abs/2110.14038}
-}
+## License
+
+This project is licensed under the MIT License. See the `LICENSE` file for details.
+
+This repository builds on the PR-BCD implementation by Geisler et al.; the original copyright and license notices are retained.
