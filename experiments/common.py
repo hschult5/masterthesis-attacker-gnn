@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 from sacred import Experiment
 from torch_sparse import SparseTensor
+import inspect
 
 from rgnn_at_scale.data import prep_graph, split
 from rgnn_at_scale.helper.io import Storage
@@ -110,126 +111,39 @@ def run_global_attack(
     seed,
     selector_params=None,
 ):
+    """
+    run_global_attack adapted from Geisler et. al. Removed perturbation caching.
+    """
     selector_params = selector_params or {}
 
     n_perturbations = int(round(epsilon * m))
 
-    # ============================================================
-    # Build JSON-safe metadata for cache lookup and artifact saving
-    # ============================================================
+    logging.info(
+        f"Perturbation cache disabled: "
+        f"'{model_label}' and eps {epsilon}. Execute attack..."
+    )
 
-    cache_params = dict(pert_params)
+    attack_sig = inspect.signature(adversary.attack)
+    needs_graph = "graph" in attack_sig.parameters
 
-    # lp_model is usually nested inside attack_params.
-    if "attack_params" in cache_params:
-        cache_params["attack_params"] = dict(
-            cache_params["attack_params"]
-        )
+    attack_kwargs = dict(
+        n_perturbations=n_perturbations,
+        semi=semi,
+        use_cert=use_cert,
+        dataset=dataset,
+        seed=seed,
+        selector_params=selector_params,
+    )
 
-        lp_model_object = cache_params["attack_params"].pop(
-            "lp_model",
-            None,
-        )
+    if needs_graph:
+        attack_kwargs["graph"] = graph
 
-        if lp_model_object is not None:
-            cache_params["attack_params"]["lp_model_class"] = (
-                lp_model_object.__class__.__name__
-            )
+    attack_kwargs["ads_mode"] = selector_params.get(
+        "accuracy_drop_selector_mode",
+        "none",
+    )
 
-    # Handle the case where lp_model is directly inside pert_params.
-    lp_model_object = cache_params.pop("lp_model", None)
-
-    if lp_model_object is not None:
-        cache_params["lp_model_class"] = (
-            lp_model_object.__class__.__name__
-        )
-
-    artifact_params = {
-        **cache_params,
-        "epsilon": epsilon,
-    }
-
-    rq1_enabled = bool(getattr(adversary, "rq1_enabled", False))
-    is_custom_initial_block = getattr(adversary, "initial_block_linear_ids", None) is not None
-    block_diagnostics_enabled = bool(getattr(adversary, "block_diagnostics_enabled", False))
-
-    if rq1_enabled or is_custom_initial_block or block_diagnostics_enabled:
-        # RQ1 needs fresh per-epoch search-space diagnostics. Cached final
-        # perturbations contain only the final graph, not those diagnostics.
-        pert_adj = None
-        pert_attr = None
-        logging.info("RQ1 enabled: bypass perturbation cache.")
-    else:
-        pert_adj = storage.load_artifact(
-            pert_adj_storage_type,
-            artifact_params,
-        )
-
-        pert_attr = storage.load_artifact(
-            pert_attr_storage_type,
-            artifact_params,
-        )
-
-    gradient = None
-
-    if pert_adj is not None and pert_attr is not None:
-        logging.info(
-            f"Found cached perturbed adjacency and attribute matrix "
-            f"for model '{model_label}' and eps {epsilon}"
-        )
-
-        adversary.set_pertubations(
-            pert_adj,
-            pert_attr,
-        )
-
-    else:
-        logging.info(
-            f"No cached perturbations found for model "
-            f"'{model_label}' and eps {epsilon}. Execute attack..."
-        )
-
-        import inspect
-
-        attack_sig = inspect.signature(adversary.attack)
-        needs_graph = "graph" in attack_sig.parameters
-
-        attack_kwargs = dict(
-            n_perturbations=n_perturbations,
-            semi=semi,
-            use_cert=use_cert,
-            dataset=dataset,
-            seed=seed,
-            selector_params=selector_params,
-        )
-
-        if needs_graph:
-            attack_kwargs["graph"] = graph
-
-        # Backward compatibility:
-        # If PRBCD._attack expects ads_mode explicitly,
-        # derive it from selector_params.
-        attack_kwargs["ads_mode"] = selector_params.get(
-            "accuracy_drop_selector_mode",
-            "none",
-        )
-
-        gradient = adversary.attack(**attack_kwargs)
-
-        pert_adj, pert_attr = adversary.get_pertubations()
-
-        if n_perturbations > 0 and not rq1_enabled and not is_custom_initial_block:
-            storage.save_artifact(
-                pert_adj_storage_type,
-                artifact_params,
-                pert_adj,
-            )
-
-            storage.save_artifact(
-                pert_attr_storage_type,
-                artifact_params,
-                pert_attr,
-            )
+    gradient = adversary.attack(**attack_kwargs)
 
     return gradient
 

@@ -312,16 +312,6 @@ def mine_candidate_edge_scores(
 ) -> dict[str, Any]:
     """
     Overarching label mining function for candidate labels.
-
-    Label modes
-    -----
-    subset accuracy drop:
-        Scores randomly chosen subsets of the candidate set, by flipping them
-        on the clean adjacency and recording the drop in accuracy.
-        Labels are constructed by summing all drops that an edge caused
-    endpoint:
-        Labels indicate if one of the endpoints of a flipped edge changes prediction
-        from correct to incorrect
     """
     if device is None:
         device = attr.device
@@ -515,19 +505,10 @@ def _mine_endpoint_flips(
 
     adj_work = adj_orig.clone()
 
-    labels_out = np.zeros(
-        n_candidates,
-        dtype=np.float32,
-    )
-
-    exists = np.zeros(
-        n_candidates,
-        dtype=np.float32,
-    )
+    labels_out = np.zeros(n_candidates, dtype=np.float32,)
+    exists = np.zeros(n_candidates, dtype=np.float32)
 
     for i, (u, v) in enumerate(candidates):
-        u = int(u)
-        v = int(v)
 
         # Determine whether to add or remove the edge
         edge_exists = bool(adj_orig[u, v] > 0.5 or adj_orig[v, u] > 0.5)
@@ -599,17 +580,13 @@ def _compute_clean_stats(context):
     graph = nx.Graph()
     graph.add_nodes_from(range(n_nodes))
     graph.add_edges_from(
-        (int(u),int(v))
-        for u, v in zip(
-            edge_index[0],
-            edge_index[1],
-        )
+        (u,v) for u, v in zip(edge_index[0], edge_index[1])
         if u != v
     )
 
     # Compute degree and pagerank from reconstructed nx Graph
     degree = np.asarray([graph.degree(node) for node in range(n_nodes)],dtype=float)
-    pagerank_dict = nx.pagerank(graph,alpha=0.85)
+    pagerank_dict = nx.pagerank(graph, alpha=0.85)
     pagerank = np.asarray([pagerank_dict[node] for node in range(n_nodes)],dtype=float)
 
     model.eval()

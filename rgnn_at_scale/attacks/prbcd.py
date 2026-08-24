@@ -19,7 +19,9 @@ from rgnn_at_scale.attacks.base_attack import (
 )
 
 class PRBCD(SparseAttack):
-    """Sampled and hence scalable PGD attack for graph data.
+    """
+    Original PR-BCD implementation from Geisler et al. adapted to run
+    PSG-BCD and gather statistics specific to the Three studies.
     """
 
     def __init__(
@@ -57,7 +59,7 @@ class PRBCD(SparseAttack):
         # Existing initialization
         self.lp_model = lp_model
 
-        # Initial Block from RQ2 initial block Experiment
+        # Initial Block from RQ2 initial block experiment
         self.initial_block_linear_ids = (
             initial_block_linear_ids
             if initial_block_linear_ids is not None
@@ -91,11 +93,13 @@ class PRBCD(SparseAttack):
         self.perturbed_edge_weight: torch.Tensor = None
         self.semi = None
 
+        # Undirected logic is from original PR-BCD and not available for PSG-BCD
         if self.make_undirected:
             self.n_possible_edges = self.n * (self.n - 1) // 2
         else:
             self.n_possible_edges = self.n ** 2  # We filter self-loops later
 
+        # Decaying learning rate
         self.lr_factor = lr_factor * max(
             math.log2(self.n_possible_edges / self.block_size),
             1.,
@@ -171,8 +175,7 @@ class PRBCD(SparseAttack):
                 },
             }
 
-        # Sample initial search space (Algorithm 1, line 3-4).
-        # Supplied Block takes prescedent over sampling
+        # Supplied Block takes prescedent over sampling. Important for initial block experiment
         if self.initial_block_linear_ids is not None:
             self.init_search_space_from_linear_ids(self.initial_block_linear_ids)
 
@@ -192,6 +195,7 @@ class PRBCD(SparseAttack):
                 rng_seed=attack_sampling_seed,
             )
         elif use_cert == "none":
+            # Standard PR-BCD logic.
             print("Standard PRBCD -> random initial block")
             self.sample_random_block(n_perturbations,self.block_size)
         else:
@@ -290,7 +294,7 @@ class PRBCD(SparseAttack):
                 if not self.resampling_enabled:
                     pass
 
-                # Resampling of search space (Algorithm 1, line 9-14)
+                # Resampling of search space (Algorithm 3, line 17-27)
                 elif epoch < self.epochs_resampling - 1:
 
                     if self.block_diagnostics_enabled:
@@ -324,10 +328,7 @@ class PRBCD(SparseAttack):
                             mod_block_size=self.block_size,
                         )
 
-                    # ==========================================================
-                    # Record the post-resampling block
-                    # ==========================================================
-
+                    # Block diagnostics log final search space for initial block experiment and RQ1 group construction
                     if self.block_diagnostics_enabled:
                         diagnostic_after_resampling = (
                             self.current_search_space
@@ -358,9 +359,10 @@ class PRBCD(SparseAttack):
             self.modified_edge_index = best_edge_index.to(self.device)
             self.perturbed_edge_weight = best_edge_weight_diff.to(self.device)
 
-        # Sample final discrete graph (Algorithm 1, line 16)
+        # Sample final discrete graph (Algorithm 3, line 29)
         edge_index = self.sample_final_edges(n_perturbations)[0]
 
+        # Block diagnostics log final search space for initial block experiment and RQ1 group construction
         if self.block_diagnostics_enabled:
             final_space = (
                 self.current_search_space
@@ -395,8 +397,7 @@ class PRBCD(SparseAttack):
         ).coalesce().detach()
         self.attr_adversary = self.attr
 
-        # TODO: Don't we want to switch to returning things? Haha yeah me too
-
+    # From original PR-BCD
     def _get_logits(self, x, edge_index, edge_weight):
         return self.attacked_model(
             data=x.to(self.device),
@@ -448,7 +449,7 @@ class PRBCD(SparseAttack):
             f'{edges_after_attack} out of range with {clean_edges} clean edges and {n_perturbations} pertutbations'
         return edge_index[:, edge_mask], edge_weight[edge_mask]
 
-    # From original PR-BCD implementation
+    # From original PR-BCD
     def get_modified_adj(self):
         # --- Fallback: no perturbations yet ---
         if getattr(self, "perturbed_edge_weight", None) is None:
@@ -528,6 +529,7 @@ class PRBCD(SparseAttack):
 
         return edge_index, edge_weight
 
+    # From original PR-BCD
     def update_edge_weights(self, n_perturbations: int, epoch: int,
                             gradient: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Updates the edge weights and adaptively, heuristically refined the learning rate such that (1) it is
@@ -585,6 +587,7 @@ class PRBCD(SparseAttack):
 
         return
 
+    # From original PR-BCD
     def sample_random_block(self, n_perturbations: int = 0, mod_block_size: int = 0):
         for _ in range(self.max_final_samples):
             self.current_search_space = torch.randint(
@@ -613,6 +616,14 @@ class PRBCD(SparseAttack):
             score_batch_size: int,
             rng_seed: int,
     ):
+        """
+        Sample initial PSG-BCD block using the trained selector. Follows this logic:
+        2. Score score_batch_size perturbation candidates using the selector (Algorithm 3 Lines 7-8).
+        3. Accept the candidates with scores higher than tau into the PR-BCD block (Algorithm 3 Line 9).
+        4. Repeat 2. and 3. until the block has block_size edges (Algorithm 3 Line 6).
+        5. Save all edges that have been accepted to a shared history so they cannot be sampled again. (Algorithm 3 Line 10).
+        6. Continue PSG-BCD.
+        """
         X, edge_index = self.extract_X_and_edge_index_from_sparsegraph(graph)
 
         # Prepare the selector and encode the clean graph
@@ -693,6 +704,7 @@ class PRBCD(SparseAttack):
             requires_grad=True,
         )
 
+    # From original PR-BCD
     def resample_random_block(self, n_perturbations: int, mod_block_size: int): #TODO: still work to be split_by_eps
         if self.keep_heuristic == 'WeightOnly':
             sorted_idx = torch.argsort(self.perturbed_edge_weight)
@@ -748,7 +760,15 @@ class PRBCD(SparseAttack):
             score_batch_size: int = 10_000,
             rng_seed: int = 0,
     ):
-        """Refill the PRBCD block with top-scoring candidates from random batches."""
+        """
+        Resample PSG-BCD block using the trained selector. Follows this logic:
+        1. Remove at least half of the lowest weighted edges from the block (Algorithm 3 Lines 18-20).
+        2. Score score_batch_size perturbation candidates using the selector (Algorithm 3 Lines 22-23).
+        3. Accept the candidates with the top_k_per_batch highest scores into the PR-BCD block (Algorithm 3 Line 24).
+        4. Repeat 2. and 3. until the block has block_size edges (Algorithm 3 Line 21).
+        5. Save all edges that have been accepted to a shared history so they cannot be sampled again. (Algorithm 3 Line 25).
+        6. Continue PSG-BCD.
+        """
 
         # Keep step from PR-BCD, keeps at most half of the block
         if self.keep_heuristic == "WeightOnly":
@@ -854,6 +874,10 @@ class PRBCD(SparseAttack):
 
     @torch.no_grad()
     def _inject_edges(self, epoch):
+        """
+        Injection function for final loss. Replaces n_injected lowest weighted edges in PR-BCD search space with
+        edges from the injection groups. PR-BCD continues normally after injection.
+        """
 
         if self.injection_epoch is None:
             return
@@ -871,7 +895,7 @@ class PRBCD(SparseAttack):
         )
 
         n_injected = injection_ids.numel()
-        # Positions of the n lowest-weight current candidates
+        # Positions of the n_injected lowest weighted edges
         lowest_idx = torch.argsort(self.perturbed_edge_weight)[:n_injected]
 
         removed_ids = self.current_search_space[lowest_idx].detach().clone()
@@ -884,7 +908,6 @@ class PRBCD(SparseAttack):
             injected_pairs = PRBCD.linear_to_triu_idx(self.n, injection_ids)
         else:
             injected_pairs = PRBCD.linear_to_full_idx(self.n, injection_ids)
-
         self.modified_edge_index[:, lowest_idx] = injected_pairs
 
         # Replace lowest weights with epsilon
@@ -898,6 +921,17 @@ class PRBCD(SparseAttack):
         }
 
     def _run_loss_probes(self, epoch, n_perturbations):
+        """
+        Function that obtains the one-step replacement loss effect for the injection experiment.
+        for each injected edge at an injection checkpoint. It follows this logic:
+        1. Save original space PR-BCD space.
+        2. Performs one "fake" PR-BCD update step (Algorithm 2 Lines 7-9).
+        3. Removes lowest weighted edge from the block and injects one group edge.
+        4. Performs another "fake" PR-BCD update step (Algorithm 3 Lines 7-9).
+        5. Restores original state and then repeat 3. and 4. for the next injected edge.
+        6. Restores original state so PR-BCD can continue.
+        """
+        # Skip probing for non chackpoint epochs
         if epoch not in self.probe_checkpoint_epochs or not self.probe_ids:
             return
 
@@ -920,7 +954,7 @@ class PRBCD(SparseAttack):
         one_step_epoch = epoch + 1
 
         def restore_checkpoint():
-
+            # Restores the original state so PR-BCD can continue normally after injections.
             self.current_search_space = original_space.clone()
             self.modified_edge_index = original_edge_index.clone()
             self.perturbed_edge_weight = original_weights.clone().requires_grad_(original_requires_grad)
@@ -930,38 +964,48 @@ class PRBCD(SparseAttack):
                 self.attacked_model.release_cache()
 
         def detached_prbcd_step():
+            """
+            Helper function that performs one "fake" PR-BCD update step
+            Pre Step Loss -> Gradient -> Weight Update -> Projection -> Post Step Loss
+            Post Step Loss with and without edge replaced is subsequently compared and gives the
+            One-step replacement loss effect.
+            """
 
             # Fresh independent gradient tensor
             self.perturbed_edge_weight = self.perturbed_edge_weight.detach().clone().requires_grad_(True)
             with torch.enable_grad():
+                # Pre Step loss and Gradient
                 edge_index, edge_weight = self.get_modified_adj()
                 logits = self._get_logits(self.attr, edge_index, edge_weight)
                 pre_step_loss = self.calculate_loss(logits[self.idx_attack],self.labels[self.idx_attack])
                 gradient = utils.grad_with_checkpoint(pre_step_loss, self.perturbed_edge_weight)[0]
 
             with torch.no_grad():
+                # Weight update
                 self.update_edge_weights(n_perturbations, one_step_epoch, gradient)
                 self.perturbed_edge_weight = (
                     Attack.project(n_perturbations, self.perturbed_edge_weight, self.eps).detach()
                 )
 
-                # If the victim model has a preprocessed adjacency release it
+                # If the victim model has a preprocessed adjacency release it. Suggested by ChatGPT 5.1.
                 if hasattr(self.attacked_model, "release_cache"):
                     self.attacked_model.release_cache()
 
-                # Calculate the loss for every edge including the replaced edge
+                # Post step loss
                 edge_index, edge_weight = self.get_modified_adj()
                 logits = self._get_logits(self.attr,edge_index,edge_weight)
                 post_step_loss = self.calculate_loss(logits[self.idx_attack],self.labels[self.idx_attack])
 
             return pre_step_loss.detach().item(), post_step_loss.detach().item(), gradient.detach().clone()
         try:
-            # Restore the checkpoint before probing a new edge
+            # Restore checkpoint for safety
             restore_checkpoint()
+            # Fake PR-BCD step for baseline loss
             (checkpoint_loss, baseline_loss, _,) = detached_prbcd_step()
 
             for candidate_id, group in zip(self.probe_ids,self.probe_groups):
 
+                # Restore the checkpoint before probing a new edge
                 restore_checkpoint()
 
                 candidate_tensor = torch.tensor(
@@ -982,7 +1026,7 @@ class PRBCD(SparseAttack):
                 # Initialize its weight at epsilon
                 self.perturbed_edge_weight[lowest_idx] = self.eps
 
-                # Perform one detached "hypothetical" PR-BCD step to potentially accumulate edge weight
+                # Perform one detached "fake" PR-BCD step to potentially accumulate edge weight
                 (candidate_pre_loss, probe_loss, gradient) = detached_prbcd_step()
                 candidate_gradient = gradient[lowest_idx].item()
 
@@ -1003,9 +1047,10 @@ class PRBCD(SparseAttack):
                 })
 
         finally:
-            # Restores all PR-BCD optimization parameters to the original state
+            # Restores all PR-BCD optimization parameters to the original state so PR-BCD can continue
             restore_checkpoint()
 
+    # Helper from original PR-BCD
     @staticmethod
     def linear_to_triu_idx(n: int, lin_idx: torch.Tensor) -> torch.Tensor:
         row_idx = (
@@ -1021,12 +1066,14 @@ class PRBCD(SparseAttack):
         )
         return torch.stack((row_idx, col_idx))
 
+    # Helper from original PR-BCD
     @staticmethod
     def linear_to_full_idx(n: int, lin_idx: torch.Tensor) -> torch.Tensor:
         row_idx = lin_idx // n
         col_idx = lin_idx % n
         return torch.stack((row_idx, col_idx))
 
+    # Helper from original PR-BCD
     @staticmethod
     def full_to_linear_idx(n: int, full_idx: torch.Tensor) -> torch.Tensor:
         # this function made errors in the undirected case, maybe this will be useful for the directed case
@@ -1034,6 +1081,7 @@ class PRBCD(SparseAttack):
         lin_idx = row_idx * n + col_idx
         return lin_idx
 
+    # Helper from original PR-BCD
     @staticmethod
     def triu_idx_to_linear_idx(n: int, full_idx: torch.Tensor) -> torch.Tensor:
         # if im correct in the undirected case, the indexing of the block matrix is different to the directed case (see my note: (1) )
@@ -1041,6 +1089,7 @@ class PRBCD(SparseAttack):
         lin_idx = (n * row_idx - row_idx * (row_idx + 1) // 2) + (col_idx - row_idx - 1)
         return lin_idx
 
+    # Helper from original PR-BCD adapted to return
     def _append_attack_statistics(
             self,
             loss,
@@ -1066,7 +1115,7 @@ class PRBCD(SparseAttack):
             float(probability_mass_projected)
         )
 
-        # Nothing else required
+        # Nothing else required without block diagnostics
         if not self.block_diagnostics_enabled:
             return
 
@@ -1079,7 +1128,7 @@ class PRBCD(SparseAttack):
             if epoch is None:
                 diagnostics["initial_block"] = current_ids
             else:
-                diagnostics["epoch_blocks"][int(epoch)] = current_ids
+                diagnostics["epoch_blocks"][epoch] = current_ids
 
             diagnostics["max_weight"][current_ids] = torch.maximum(
                 diagnostics["max_weight"][current_ids],
@@ -1122,6 +1171,7 @@ class PRBCD(SparseAttack):
 
         return X, edge_index_struct
 
+    # Helper from original PR-BCD
     @staticmethod
     def cut_matrix_idx_to_triu_idx(matrix: torch.tensor) -> torch.Tensor:
         # cut all entries of matrix where the entry (x,y) holds x >= y
@@ -1131,6 +1181,7 @@ class PRBCD(SparseAttack):
         #returns undirected triu matrix
         return matrix[:, mask]
 
+    # Helper from original PR-BCD
     @staticmethod
     def pairs_to_linear_uppertri(pairs: torch.Tensor, N: int, *, drop_self_loops: bool = True) -> torch.Tensor:
         """
@@ -1179,6 +1230,7 @@ class PRBCD(SparseAttack):
         lin = uu * (2 * N - uu - 1) // 2 + (vv - uu - 1)
         return lin
 
+    # Helper from original PR-BCD
     @staticmethod
     def flip_matrix_idx_to_triu_idx(matrix: torch.tensor) -> torch.tensor:
         matrix = PRBCD.cut_diagonal_entries(matrix)
@@ -1191,6 +1243,7 @@ class PRBCD(SparseAttack):
         row_idx[mask] = temp
         return matrix
 
+    # Helper from original PR-BCD
     @staticmethod
     def cut_diagonal_entries(matrix: torch.tensor) -> torch.Tensor:
         row_idx = matrix[0]
@@ -1199,6 +1252,7 @@ class PRBCD(SparseAttack):
         # returns directed matrix (diagonal is cut)
         return matrix[:, mask]
 
+    # Loads parameters used by the selector for guided sampling/resampling in PSG-BCD
     def _load_selector_params(self, selector_params: dict):
         selector_params = selector_params or {}
 
