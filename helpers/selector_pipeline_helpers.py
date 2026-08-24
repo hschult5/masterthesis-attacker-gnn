@@ -66,12 +66,19 @@ def train_selector(
     # ---- train / validation split ----
     split_ratios: tuple[float, float, float] = (0.7, 0.15, 0.15),
 ):
-    """Train the selector GNN on hard or soft edge targets in [0, 1].
+    """Train the selector GNN on hard endpoint or soft subset_accuracy_drop edge labels in [0, 1].
 
-    The training function deliberately does only what is needed for fitting:
-    train/validation splitting, BCE training, validation-loss early stopping,
-    and best-checkpoint restoration. Exhaustive selector statistics belong in
-    the later test-set evaluation.
+    - Splits labeled candidates into test, val and train sets.
+    - Applies label smoothing for endpoint labels.
+    - Calculates the positive class weight.
+    - Encodes the selector with the clean graph.
+    - Does one optimizer step.
+    - Calculates the loss.
+    - Fits selector weights using the gradient.
+    - Repeatedly step -> loss -> gradient fit.
+    - Stops after min_epochs_before_early_stop for subset_subset_drop on val-loss and for endpoint on val_ap.
+    - Logs training stats.
+    - Returns model.
     """
 
     # Prepare inputs
@@ -399,6 +406,15 @@ def _mine_subset_accuracy_drop(
     seed: int,
 ) -> dict[str, Any]:
 
+    """
+    Mining function for subset accuracy drop labels.
+
+    - It repeatedly scores a subset of the candidate set by flipping all edges on the clean
+    graph and evaluates the resulting accuracy drop on the vitim model
+    - It adds the raw accuracy drop as scores to the candidate edges that caused them
+    - It min-max normalizes the accumulated scores.
+    """
+
     device = adj_orig.device
     n_cands = int(cand_src.numel())
     subset_size = subset_fraction * n_cands
@@ -491,6 +507,15 @@ def _mine_endpoint_flips(
     clean_correct,
     clean_accuracy,
 ):
+    """
+    Mining function for endpoint labels.
+
+    - For each edge in the candidate set it flips its representation in the clean adjacency
+    - It determines whether one of the endpoints of the flipped edge changed predicted class from correct to incorrect.
+    - It assignes the candidate edge a label of 1 that caused this.
+    - All other candidates get a label of 0.
+    """
+
     device = adj_orig.device
 
     model.eval()
